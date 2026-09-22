@@ -37,11 +37,15 @@ from tkinter import messagebox, scrolledtext, ttk
 
 
 APP_NAME = "CueRelay"
-APP_VERSION = "1.2.0"
+APP_VERSION = "1.2.1"
 BASE_DIR = Path(__file__).resolve().parent
 DATA_PATH = BASE_DIR / "cuerelay_data.json"
 LOG_PATH = BASE_DIR / "cuerelay.log"
 CRASH_PATH = BASE_DIR / "cuerelay_crash.log"
+
+# 调度线程偶尔会因系统时间校准、短暂休眠或系统负载跳过某个轮询点。
+# 只在很短的窗口内补执行，避免多年以前的旧任务在启动时突然执行。
+SCHEDULE_CATCH_UP_SECONDS = 5 * 60
 
 
 # ---------------------------------------------------------------------------
@@ -79,6 +83,41 @@ def format_datetime(value: Any) -> str:
 def friendly_error(exc: BaseException) -> str:
     text = str(exc).strip()
     return text or exc.__class__.__name__
+
+
+def missed_schedule_message() -> str:
+    return f"错过执行时间超过 {SCHEDULE_CATCH_UP_SECONDS // 60} 分钟，已跳过本次执行。"
+
+
+def advance_next_run_past_now(task: dict[str, Any], now: _dt.datetime) -> Optional[_dt.datetime]:
+    """把重复任务推进到 now 之后，跳过已经过期的执行点。"""
+
+    candidate = parse_datetime(task.get("next_run"))
+    if candidate is None:
+        return None
+
+    schedule = task.get("schedule")
+    if schedule == "daily":
+        days = max(1, (now.date() - candidate.date()).days)
+        candidate += _dt.timedelta(days=days)
+        while candidate <= now:
+            candidate += _dt.timedelta(days=1)
+        return candidate
+
+    if schedule == "interval":
+        try:
+            interval_minutes = max(1, int(task.get("interval_minutes", 60) or 60))
+        except (TypeError, ValueError):
+            interval_minutes = 60
+        interval = _dt.timedelta(minutes=interval_minutes)
+        if candidate <= now:
+            steps = int((now - candidate).total_seconds() // interval.total_seconds()) + 1
+            candidate += interval * max(1, steps)
+        while candidate <= now:
+            candidate += interval
+        return candidate
+
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -868,17 +907,32 @@ class TaskStore:
                 "settings": {**DEFAULT_DATA["settings"], **settings},
                 "tasks": [self._normalize_task(item) for item in tasks if isinstance(item, dict)],
             }
-            # 每日任务启动时不补发已经错过的历史时刻，滚到下一个未来日期。
+            # 启动时只补执行很短窗口内的到期任务；太久以前的任务不再补发。
             changed = False
             now = now_local()
             for task in self.data["tasks"]:
-                if task.get("schedule") == "daily" and task.get("enabled"):
-                    next_run = parse_datetime(task.get("next_run"))
-                    if next_run is not None and next_run <= now:
-                        while next_run <= now:
-                            next_run += _dt.timedelta(days=1)
-                        task["next_run"] = iso_datetime(next_run)
-                        changed = True
+                if not task.get("enabled"):
+                    continue
+                next_run = parse_datetime(task.get("next_run"))
+                if next_run is None or next_run > now:
+                    continue
+                late_seconds = (now - next_run).total_seconds()
+                if late_seconds <= SCHEDULE_CATCH_UP_SECONDS:
+                    continue
+
+                message = missed_schedule_message()
+                if task.get("schedule") == "once":
+                    task["enabled"] = False
+                    task["next_run"] = None
+                    task["status"] = "已过期"
+                else:
+                    future_run = advance_next_run_past_now(task, now)
+                    if future_run is None:
+                        continue
+                    task["next_run"] = iso_datetime(future_run)
+                    task["status"] = "等待中"
+                task["last_error"] = message
+                changed = True
             if changed:
                 self._save_locked()
 
@@ -988,6 +1042,8 @@ def task_status_label(task: dict[str, Any]) -> str:
         return "运行中"
     if task.get("status") == "失败":
         return "失败"
+    if task.get("status") == "已过期":
+        return "已过期"
     if task.get("schedule") == "once" and not task.get("enabled") and task.get("last_run"):
         return "已完成"
     if not task.get("enabled"):
@@ -996,6 +1052,8 @@ def task_status_label(task: dict[str, Any]) -> str:
 
 
 def task_next_label(task: dict[str, Any]) -> str:
+    if task.get("status") == "已过期":
+        return "已跳过"
     if not task.get("enabled") and task.get("schedule") != "once":
         return "已暂停"
     if task.get("schedule") == "once" and not task.get("enabled") and task.get("last_run"):
@@ -1173,6 +1231,52 @@ class AutomationService:
         worker.start()
         return True
 
+    def _skip_overdue(self, task_id: str, now: _dt.datetime) -> bool:
+        """标记超出补执行窗口的计划，避免旧任务在未来突然执行。"""
+
+        with self.running_lock:
+            if task_id in self.running_ids:
+                return False
+            # 临时占位，防止手动运行与过期处理同时操作同一个任务。
+            self.running_ids.add(task_id)
+
+        try:
+            task = self.store.get(task_id)
+            if not task or not task.get("enabled"):
+                return False
+            next_run = parse_datetime(task.get("next_run"))
+            if next_run is None or next_run > now:
+                return False
+            if (now - next_run).total_seconds() <= SCHEDULE_CATCH_UP_SECONDS:
+                return False
+
+            message = missed_schedule_message()
+            if task.get("schedule") == "once":
+                self.store.update_task(
+                    task_id,
+                    enabled=False,
+                    next_run=None,
+                    status="已过期",
+                    last_error=message,
+                )
+            else:
+                future_run = advance_next_run_past_now(task, now)
+                if future_run is None:
+                    return False
+                self.store.update_task(
+                    task_id,
+                    next_run=iso_datetime(future_run),
+                    status="等待中",
+                    last_error=message,
+                )
+
+            self.emit("log", ("warning", f"任务已跳过：{task.get('name') or '未命名提示词'}（{message}）"))
+            self.emit("refresh", None)
+            return True
+        finally:
+            with self.running_lock:
+                self.running_ids.discard(task_id)
+
     def _scheduler_loop(self) -> None:
         while not self.stop_event.is_set():
             now = now_local()
@@ -1181,7 +1285,11 @@ class AutomationService:
                     continue
                 next_run = parse_datetime(task.get("next_run"))
                 if next_run is not None and next_run <= now:
-                    self.trigger(str(task.get("id")), "schedule")
+                    task_id = str(task.get("id"))
+                    if (now - next_run).total_seconds() > SCHEDULE_CATCH_UP_SECONDS:
+                        self._skip_overdue(task_id, now)
+                    else:
+                        self.trigger(task_id, "schedule")
             self.wakeup_event.wait(0.25)
             self.wakeup_event.clear()
 
