@@ -1,0 +1,9 @@
+__pycache__/
+*.py[cod]
+
+# Local task data and runtime logs may contain personal prompts and window details.
+cuerelay_data.json
+cuerelay.log
+cuerelay_crash.log
+*.broken-*
+*.tmp
