@@ -324,17 +324,36 @@ class Runner:
         title: str,
         scrolls: int = 40,
     ) -> tuple[locator.Frame, Optional[ocr.OcrLine]]:
-        """在侧边栏列表里找到标题对应的那一行，必要时滚动列表。
+        """在侧边栏列表里找到标题对应的那一行。
 
-        三层，从便宜到贵：
+        四层，从便宜到贵：
           1. 当前这一屏里就有；
           2. 回到顶部，再一屏一屏往下翻，直到列表不再变化（翻到底了）；
-          3. 交给调用方去用搜索框。
+          3. 列表里有「Show more」就点开，新露出来的对话再找一遍；
+          4. 交给调用方去用搜索框。
 
-        第 2 层不写死"翻几屏就放弃"——历史长的账号一屏一屏数根本数不完，
-        固定屏数等于给"能不能找到"设了个跟账号内容有关的赌注。这里只在列表
-        真的滚不动时停，另外留一个安全上限防止卡死。
+        第 2 层不写死"翻几屏就放弃"——历史长的账号一屏一屏数根本数不完。
+        第 3 层是因为这个列表是按项目分组的，一个项目下超过五条就折成一行
+        「Show more」：折叠着的那部分根本不在列表里，只滚不点永远找不到。
         """
+
+        frame: locator.Frame = self._frame(hwnd)
+        for _ in range(3):
+            frame, row = self._scroll_and_find(hwnd, composer, title, scrolls)
+            if row is not None:
+                return frame, row
+            if not self._click_show_more(hwnd):
+                break
+        return frame, None
+
+    def _scroll_and_find(
+        self,
+        hwnd: int,
+        composer: Optional[Rect],
+        title: str,
+        scrolls: int,
+    ) -> tuple[locator.Frame, Optional[ocr.OcrLine]]:
+        """先回到顶部，再一屏一屏往下翻，边翻边找。"""
 
         frame = self._frame(hwnd)
         rows = self._list_rows(frame, composer)
@@ -379,6 +398,34 @@ class Runner:
                 # 列表很长时翻起来要一会儿，得让人看见还在动。
                 self.log("info", f"列表里暂时没有「{title}」，已往下翻 {index} 屏。")
         return frame, None
+
+    # 侧边栏里"折叠着更多"的那一行，不同版本叫法不一样。
+    SHOW_MORE_KEYS = frozenset(
+        ocr.normalize(item)
+        for item in ("show more", "show less", "see more", "see all", "显示更多", "查看更多", "展开更多")
+    )
+
+    def _click_show_more(self, hwnd: int) -> bool:
+        """点开列表里的「Show more」，点到了就返回 True。
+
+        一个项目下超过五条对话就会折成这一行。折叠着的那部分不在列表里，
+        只滚不点，永远也找不到。
+        """
+
+        frame, composer, rows = self._rows_once(hwnd)
+        for row in rows:
+            stripped, _ = conversations.strip_icon(row.text)
+            if ocr.normalize(stripped) not in self.SHOW_MORE_KEYS:
+                continue
+            if winapi.foreground_window() != int(hwnd):
+                self.log("warning", "目标窗口不在前台，没有点「Show more」。")
+                return False
+            winapi.click(frame.point_to_screen(row.center))
+            time.sleep(min(self._delay(), 1.2))
+            self.log("info", f"点开了「{stripped}」，继续找。")
+            return True
+        return False
+
 
     def _open_search(self, hwnd: int, frame: locator.Frame, composer: Optional[Rect]) -> bool:
         """尝试唤出搜索框。先按快捷键，再点记录下来的放大镜位置。
