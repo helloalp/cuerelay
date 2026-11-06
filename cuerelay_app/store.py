@@ -32,6 +32,15 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "target_title": "",
     "target_process": "",
     "target_geometry": None,
+    # 锁定的目标窗口。填了 hwnd 就只认那一个窗口，不看关键词；标题是它的
+    # 备份——窗口关了再开，句柄会变，但标题还在。
+    "target_window_hwnd": 0,
+    "target_window_title": "",
+    # 执行前把目标窗口摆成固定大小。窗口可以是任意大小，识别会跟着走；
+    # 但"先摆成已知形状"比"什么都能适应"更稳，尤其是定时任务。
+    "force_window_size": False,
+    # 空或 "max" 表示最大化，"1600x1000" 表示普通窗口 + 指定尺寸。
+    "target_window_size": "",
     "anchor_composer": None,
     "anchor_send": None,
     "anchor_search": None,
@@ -82,6 +91,7 @@ BOOL_SETTINGS = (
     "auto_launch_target",
     "launch_v2ray_first",
     "show_overlay",
+    "force_window_size",
     "global_hotkey",
     "tray_enabled",
     "minimize_to_tray",

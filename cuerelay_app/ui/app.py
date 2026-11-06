@@ -17,10 +17,9 @@ from tkinter import messagebox, ttk
 from typing import Any, Callable, Optional
 
 from .. import apps as apps_module
-from .. import config, locator, store as store_module, templates, winapi
+from .. import codexdb, config, locator, store as store_module, templates, winapi
 from ..automation import AutomationError
 from ..config import friendly_error, iso_datetime, now_local, parse_datetime
-from ..conversations import Conversation
 from ..hotkey import DEFAULT_LABEL as HOTKEY_LABEL
 from ..hotkey import GlobalHotkey, VirtualCapture
 from ..scheduler import Scheduler
@@ -41,6 +40,7 @@ from ..store import (
 from ..toolbox import Toolbox, ToolboxError
 from ..tray import Tray
 from .calibrate import CalibrationDialog
+from .chats import ChatBrowser
 from .overlay import Overlay, apply_event
 from .palette import Command, CommandPalette
 from .theme import Theme
@@ -58,9 +58,6 @@ LOG_MODE_OPTIONS = (("log", "运行日志"), ("history", "执行记录"))
 # 分组默认展开状态。失败要立刻看到，"已停止"往往是几十条历史，默认收起，
 # 否则一打开就是一大片同名的旧任务。
 GROUP_DEFAULT_OPEN = {"active": True, "failed": True, "idle": False}
-
-# 对话页的分区小标题。侧边栏里的分区名照抄，用户一眼能对上。
-_SECTION_TITLES = {"pinned": "置顶", "projects": "项目", "chats": "对话"}
 
 
 def _clip(text: str, limit: int) -> str:
@@ -103,6 +100,12 @@ class App:
         self.draft = _empty_draft()
         self._baseline: Optional[tuple] = None
         self._row_widgets: dict[str, dict[str, Any]] = {}
+        # 任务列表的控件池。以前每刷新一次就把整列控件销毁重建，Tk 在 Windows
+        # 上不做双缓冲，重建过程中会露出底色——就是那一下频闪。改成建一次、
+        # 之后只改文字和颜色，列表再长也不会闪。
+        self._task_rows: list[dict[str, Any]] = []
+        self._task_heads: list[dict[str, Any]] = []
+        self._task_empty: Optional[dict[str, Any]] = None
         self._list_signature: Optional[tuple] = None
         self._group_open: dict[str, bool] = {}
         self._log_lines: list[tuple[str, str]] = []
@@ -113,12 +116,16 @@ class App:
         self.selected_snippet_id: Optional[str] = None
         self._snippet_baseline: Optional[tuple] = None
         self._snippet_rows: dict[str, dict[str, Any]] = {}
+        # 片段列表也用控件池：搜索框每敲一个字都会重刷，销毁重建就是一路闪。
+        self._snippet_pool: list[dict[str, Any]] = []
+        self._snippet_empty: Optional[dict[str, Any]] = None
 
-        # 对话列表是"扫描一次、手动刷新"的：每次扫描要滚动侧边栏、跑好几次 OCR，
-        # 不可能像应用状态那样每两秒刷一遍。
-        self._conversations: list[Conversation] = []
+        # 对话列表读的是 Codex 的本地库，不是截屏。一次读完全部记录只要几十毫秒，
+        # 所以它是"进页面自动读一次 + 手动刷新"，不需要定时轮询。
+        self._library: Optional[codexdb.Library] = None
+        self._conversations: list[codexdb.ThreadRecord] = []
         self._conversation_scanning = False
-        self._conversation_rows: list[dict[str, Any]] = []
+        self._chats_loaded = False
 
         self._palette: Optional[CommandPalette] = None
         self._apps_poll_id: Optional[str] = None
@@ -207,6 +214,9 @@ class App:
         self.strict_var = tk.BooleanVar(value=bool(settings.get("strict_conversation", True)))
         self.overlay_var = tk.BooleanVar(value=bool(settings.get("show_overlay", True)))
         self.keywords_var = tk.StringVar(value=str(settings.get("target_keywords") or ""))
+        self.lock_window_var = tk.StringVar(value=self._lock_window_text(settings))
+        self.force_size_var = tk.BooleanVar(value=bool(settings.get("force_window_size", False)))
+        self.window_size_var = tk.StringVar(value=str(settings.get("target_window_size") or ""))
         self.auto_launch_var = tk.BooleanVar(value=bool(settings.get("auto_launch_target", True)))
         self.v2ray_path_var = tk.StringVar(value=str(settings.get("v2ray_path") or ""))
         self.launch_v2ray_var = tk.BooleanVar(value=bool(settings.get("launch_v2ray_first", True)))
@@ -299,6 +309,12 @@ class App:
         theme = self.theme
         self.root.configure(bg=theme.c("bg"))
         self._row_widgets.clear()
+        # 主题重建会把控件全部换掉，池子里的引用也跟着失效，必须一起清空。
+        self._task_rows.clear()
+        self._task_heads.clear()
+        self._task_empty = None
+        self._snippet_pool.clear()
+        self._snippet_empty = None
         self._build_style()
 
         # 根窗口统一使用 grid，避免 pack 的 expand 抢占状态栏空间。
@@ -547,6 +563,9 @@ class App:
         self.list_scroll = ScrollArea(list_wrap, theme, "bg")
         self.list_scroll.pack(fill="both", expand=True)
         self.list_body = self.list_scroll.body
+        # 用 grid 而不是 pack：池子里的行要能按"第几行"直接摆位置，
+        # pack 只能按顺序重排，重排就得先摘下来再挂上去，又是一次重绘。
+        self.list_body.grid_columnconfigure(0, weight=1)
 
         right = tk.Frame(body, bg=theme.c("bg"))
         right.pack(side="left", fill="both", expand=True, padx=(theme.px(20), 0))
@@ -636,6 +655,8 @@ class App:
         self.snippet_scroll = ScrollArea(wrap, theme, "bg")
         self.snippet_scroll.pack(fill="both", expand=True)
         self.snippet_list_body = self.snippet_scroll.body
+        # 和任务列表同一个道理：按行号摆位置，切筛选时不重排整列。
+        self.snippet_list_body.grid_columnconfigure(0, weight=1)
 
         right = tk.Frame(split, bg=theme.c("bg"))
         right.pack(side="left", fill="both", expand=True, padx=(theme.px(20), 0))
@@ -699,31 +720,76 @@ class App:
             return
         self._snippet_signature = signature
 
-        for child in self.snippet_list_body.winfo_children():
-            child.destroy()
-        self._snippet_rows.clear()
-
-        if not items:
-            self._empty_state(
-                self.snippet_list_body, "没有匹配的片段" if keyword else "还没有片段"
-            )
-        for item in items:
-            self._render_snippet_row(item)
+        self._paint_snippet_list(items, keyword)
 
         self.snippet_count_var.set(f"{total} 个片段")
         self._paint_snippets()
 
-    def _render_snippet_row(self, snippet: dict[str, Any]) -> None:
+    def _paint_snippet_list(self, items: list[dict[str, Any]], keyword: str) -> None:
+        theme = self.theme
+        self._snippet_rows.clear()
+        used: list[tk.Widget] = []
+        position = 0
+        slot = 0
+
+        if not items:
+            empty = self._snippet_empty_parts()
+            empty["label"].configure(
+                text="没有匹配的片段" if keyword else "还没有片段",
+                bg=theme.c("bg"),
+                fg=theme.c("text_3"),
+            )
+            empty["frame"].configure(bg=theme.c("bg"))
+            empty["frame"].grid(row=0, column=0, sticky="nsew", pady=theme.px(48))
+        else:
+            for item in items:
+                parts = self._snippet_row(slot)
+                slot += 1
+                self._update_snippet_row(parts, item)
+                parts["frame"].grid(row=position, column=0, sticky="ew", pady=(0, theme.px(2)))
+                used.append(parts["frame"])
+                position += 1
+                self._snippet_rows[str(item["id"])] = parts
+
+        self._recycle(self._snippet_pool, used)
+        if items and self._snippet_empty is not None:
+            try:
+                self._snippet_empty["frame"].grid_remove()
+            except tk.TclError:
+                pass
+
+    def _snippet_empty_parts(self) -> dict[str, Any]:
+        if self._snippet_empty is None:
+            theme = self.theme
+            frame = tk.Frame(self.snippet_list_body, bg=theme.c("bg"))
+            label = tk.Label(
+                frame,
+                text="",
+                bg=theme.c("bg"),
+                fg=theme.c("text_3"),
+                font=theme.font("small"),
+                anchor="center",
+                justify="center",
+            )
+            label.pack(fill="x")
+            self._snippet_empty = {"frame": frame, "label": label}
+        return self._snippet_empty
+
+    def _snippet_row(self, index: int) -> dict[str, Any]:
+        while index >= len(self._snippet_pool):
+            self._snippet_pool.append(self._create_snippet_row())
+        return self._snippet_pool[index]
+
+    def _create_snippet_row(self) -> dict[str, Any]:
         theme = self.theme
         row = tk.Frame(self.snippet_list_body, bg=theme.c("bg"), cursor="hand2")
-        row.pack(fill="x", pady=(0, theme.px(2)))
 
         inner = tk.Frame(row, bg=theme.c("bg"))
         inner.pack(fill="x", padx=theme.px(10), pady=theme.px(7))
 
         name = tk.Label(
             inner,
-            text=str(snippet.get("name") or ""),
+            text="",
             bg=theme.c("bg"),
             fg=theme.c("text"),
             font=theme.font("body"),
@@ -732,14 +798,9 @@ class App:
         )
         name.pack(fill="x")
 
-        used = int(snippet.get("use_count") or 0)
-        preview = " ".join(str(snippet.get("content") or "").split())
-        if len(preview) > 40:
-            preview = preview[:39] + "…"
-        meta = f"用过 {used} 次 · {preview}" if used else preview
         detail = tk.Label(
             inner,
-            text=meta,
+            text="",
             bg=theme.c("bg"),
             fg=theme.c("text_3"),
             font=theme.font("tiny"),
@@ -748,26 +809,48 @@ class App:
         )
         detail.pack(fill="x", pady=(theme.px(3), 0))
 
+        parts: dict[str, Any] = {
+            "frame": row,
+            "inner": inner,
+            "name": name,
+            "detail": detail,
+            "snippet_id": None,
+        }
         for widget in (row, inner, name, detail):
-            widget.bind("<Button-1>", lambda _event, i=snippet["id"]: self.select_snippet(i))
-        self._snippet_rows[str(snippet["id"])] = {"frame": row, "inner": inner, "name": name, "detail": detail}
+            widget.bind("<Button-1>", lambda _event, p=parts: self._activate_snippet(p))
+        return parts
+
+    def _update_snippet_row(self, parts: dict[str, Any], snippet: dict[str, Any]) -> None:
+        theme = self.theme
+        parts["snippet_id"] = str(snippet["id"])
+        parts["name"].configure(text=str(snippet.get("name") or ""), font=theme.font("body"))
+        used = int(snippet.get("use_count") or 0)
+        preview = " ".join(str(snippet.get("content") or "").split())
+        if len(preview) > 40:
+            preview = preview[:39] + "…"
+        parts["detail"].configure(text=f"用过 {used} 次 · {preview}" if used else preview)
+        self._paint_snippet_parts(parts)
+
+    def _activate_snippet(self, parts: dict[str, Any]) -> None:
+        snippet_id = parts.get("snippet_id")
+        if snippet_id:
+            self.select_snippet(snippet_id)
+
+    def _paint_snippet_parts(self, parts: dict[str, Any]) -> None:
+        theme = self.theme
+        active = parts.get("snippet_id") is not None and parts["snippet_id"] == self.selected_snippet_id
+        fill = theme.c("accent_soft") if active else theme.c("bg")
+        for key in ("frame", "inner", "name", "detail"):
+            try:
+                parts[key].configure(bg=fill)
+            except tk.TclError:
+                pass
+        parts["name"].configure(fg=theme.c("accent_label") if active else theme.c("text"))
+        parts["detail"].configure(fg=theme.c("accent_label") if active else theme.c("text_3"))
 
     def _paint_snippets(self) -> None:
-        theme = self.theme
-        for snippet_id, widgets in self._snippet_rows.items():
-            active = snippet_id == self.selected_snippet_id
-            fill = theme.c("accent_soft") if active else theme.c("bg")
-            for widget in widgets.values():
-                try:
-                    widget.configure(bg=fill)
-                except tk.TclError:
-                    pass
-            if active:
-                widgets["name"].configure(fg=theme.c("accent_label"))
-                widgets["detail"].configure(fg=theme.c("accent_label"))
-            else:
-                widgets["name"].configure(fg=theme.c("text"))
-                widgets["detail"].configure(fg=theme.c("text_3"))
+        for parts in self._snippet_rows.values():
+            self._paint_snippet_parts(parts)
 
     def _snippet_signature_now(self) -> tuple:
         return (self.snippet_name_var.get().strip(), self.snippet_area.get())
@@ -900,104 +983,88 @@ class App:
             ),
         )
 
-        outer, inner = card(parent, theme, "surface")
-        outer.pack(fill="both", expand=True)
-        self.chat_scroll = ScrollArea(inner, theme, "surface")
-        self.chat_scroll.pack(fill="both", expand=True, padx=theme.px(6), pady=theme.px(6))
-        self.chat_list_body = self.chat_scroll.body
-        self._render_chats()
+        self.chat_browser = ChatBrowser(
+            parent,
+            theme,
+            on_open=self._open_record,
+            on_new=self.new_conversation,
+            on_refresh=self.scan_conversations,
+            on_status=self.chat_status_var.set,
+        )
+        self.chat_browser.pack(fill="both", expand=True)
 
-    def _render_chats(self) -> None:
-        if not hasattr(self, "chat_list_body"):
-            return
-        theme = self.theme
-        for child in self.chat_list_body.winfo_children():
-            child.destroy()
-        self._conversation_rows.clear()
-
-        if self._conversation_scanning:
-            tk.Label(
-                self.chat_list_body,
-                text="正在读取侧边栏…",
-                bg=theme.c("surface"),
-                fg=theme.c("text_3"),
-                font=theme.font("small"),
-                anchor="w",
-            ).pack(fill="x", padx=theme.px(12), pady=theme.px(14))
-            return
-
-        if not self._conversations:
-            self._empty_state(self.chat_list_body, "还没有对话", bg_key="surface")
-            return
-
-        section = ""
-        for index, item in enumerate(self._conversations):
-            if item.section != section:
-                section = item.section
-                tk.Label(
-                    self.chat_list_body,
-                    text=_SECTION_TITLES.get(section, "对话"),
-                    bg=theme.c("surface"),
-                    fg=theme.c("text_3"),
-                    font=theme.font("small_strong"),
-                    anchor="w",
-                ).pack(fill="x", padx=theme.px(12), pady=(theme.px(10), theme.px(2)))
-
-            row = tk.Frame(self.chat_list_body, bg=theme.c("surface"), cursor="hand2")
-            row.pack(fill="x")
-            label = tk.Label(
-                row,
-                text=item.title,
-                bg=theme.c("surface"),
-                fg=theme.c("text"),
-                font=theme.font("body"),
-                anchor="w",
-                padx=theme.px(12),
-                pady=theme.px(7),
-                justify="left",
-            )
-            label.pack(fill="x")
-            for widget in (row, label):
-                widget.bind("<Button-1>", lambda _event, title=item.title: self.open_conversation(title))
-                widget.bind("<Enter>", lambda _event, r=row, l=label: self._hover_chat(r, l, True))
-                widget.bind("<Leave>", lambda _event, r=row, l=label: self._hover_chat(r, l, False))
-            self._conversation_rows.append({"frame": row, "label": label, "title": item.title})
-
-    def _hover_chat(self, row: tk.Frame, label: tk.Label, hover: bool) -> None:
-        theme = self.theme
-        fill = theme.c("surface_3") if hover else theme.c("surface")
-        try:
-            row.configure(bg=fill)
-            label.configure(bg=fill)
-        except tk.TclError:
-            pass
+        # 切主题会把整页重建一次。重建后把已有的扫描结果直接放回去，
+        # 不然换一次深浅色就要重新读一遍库，列表还会跳回顶部。
+        if self._library is not None:
+            self.chat_browser.show_library(self._library, animate=False)
+        elif self._conversation_scanning:
+            self.chat_browser.show_loading()
 
     def scan_conversations(self) -> None:
+        """读 Codex 的本地库。
+
+        这里**不**走调度器的窗口锁，也不隐藏主窗口：它只读文件，不碰鼠标键盘，
+        和"往输入框里发消息"不是一类事。以前把它塞进窗口锁里，结果一是要先把
+        自己藏起来（屏幕闪一下），二是那段代码签名对不上、一按就抛异常，
+        界面上只剩一句"正在读取…"永远不动。
+        """
+
         if self._conversation_scanning:
             return
         self._conversation_scanning = True
-        self.chat_status_var.set("正在读取…")
-        self._render_chats()
+        self.chat_status_var.set("正在读取 Codex 本地库…")
+        if hasattr(self, "chat_browser"):
+            self.chat_browser.show_loading()
+        emit = self.emit
 
-        def work(toolbox: Toolbox) -> str:
+        def work() -> None:
             try:
-                items = toolbox.conversations()
-            except Exception as exc:
-                self.emit("chats", exc)
-                raise
-            self.emit("chats", items)
-            return f"扫描到 {len(items)} 个对话"
+                library = codexdb.scan()
+            except Exception as exc:  # noqa: BLE001 - 任何失败都要在界面上说清楚
+                emit("chats", exc)
+                return
+            emit("chats", library)
 
-        self.scheduler.run_exclusive(work, "扫描对话")
+        threading.Thread(target=work, name="cuerelay-chats", daemon=True).start()
 
     def _apply_conversations(self, payload: Any) -> None:
         self._conversation_scanning = False
         if isinstance(payload, Exception):
-            self.chat_status_var.set("扫描失败")
-        else:
-            self._conversations = list(payload)
-            self.chat_status_var.set(f"{len(self._conversations)} 个对话")
-        self._render_chats()
+            message = friendly_error(payload)
+            self.chat_status_var.set(f"读取失败：{_clip(message, 40)}")
+            if hasattr(self, "chat_browser"):
+                self.chat_browser.show_error(message)
+            self.log("error", f"读取对话失败：{message}")
+            return
+
+        library = payload if isinstance(payload, codexdb.Library) else None
+        if library is None:
+            self.chat_status_var.set("读取结果无效")
+            return
+
+        self._library = library
+        self._conversations = list(library.threads)
+        self._chats_loaded = True
+        if hasattr(self, "chat_browser"):
+            self.chat_browser.show_library(library)
+        counts = library.counts()
+        self.log(
+            "info",
+            f"对话库：{counts['active']} 条（{counts['projects']} 个项目 / "
+            f"{counts['loose']} 条无项目 / {counts['subagents']} 条子代理），"
+            f"耗时 {library.elapsed_ms} ms",
+        )
+        for warning in library.warnings:
+            self.log("warning", warning)
+
+    def _open_record(self, record: codexdb.ThreadRecord) -> None:
+        """在 Codex 里打开这条对话。
+
+        仍然走已经验证过的那条链路：搜索标题 → 点结果 → 核对标题栏。
+        本地库只负责"告诉我们要找哪一个"，不负责"怎么点"。
+        """
+
+        self.open_conversation(record.title)
 
     def open_conversation(self, title: str) -> None:
         def work(toolbox: Toolbox) -> str:
@@ -2043,6 +2110,58 @@ class App:
                 anchor="w", pady=(0, theme.px(6))
             )
 
+        # 目标窗口
+        card_body = self._settings_card(body, "目标窗口")
+        inner = tk.Frame(card_body, bg=theme.c("surface"))
+        inner.pack(fill="x", padx=theme.px(20), pady=(0, theme.px(18)))
+        tk.Label(
+            inner,
+            text="窗口可以是任意大小，识别会跟着走；锁定之后只操作这一个窗口。",
+            bg=theme.c("surface"),
+            fg=theme.c("text_3"),
+            font=theme.font("tiny"),
+            anchor="w",
+            justify="left",
+            wraplength=theme.px(620),
+        ).pack(fill="x")
+        tk.Label(
+            inner,
+            textvariable=self.lock_window_var,
+            bg=theme.c("surface"),
+            fg=theme.c("text_2"),
+            font=theme.font("small"),
+            anchor="w",
+            justify="left",
+            wraplength=theme.px(620),
+        ).pack(fill="x", pady=(theme.px(10), theme.px(8)))
+        lock_row = tk.Frame(inner, bg=theme.c("surface"))
+        lock_row.pack(fill="x")
+        Button(
+            lock_row, theme, "锁定当前窗口", self._lock_target_window, kind="subtle", size="sm"
+        ).pack(side="left")
+        Button(
+            lock_row, theme, "取消锁定", self._clear_target_window, kind="ghost", size="sm"
+        ).pack(side="left", padx=(theme.px(8), 0))
+        Switch(
+            inner,
+            theme,
+            "执行前把窗口调成固定大小",
+            self.force_size_var,
+            command=self._save_window_policy,
+            bg_key="surface",
+        ).pack(anchor="w", pady=(theme.px(14), theme.px(8)))
+        size_field = Field(
+            inner,
+            theme,
+            "尺寸",
+            self.window_size_var,
+            hint="1600x1000；留空或 max 表示最大化",
+            placeholder="1600x1000",
+        )
+        size_field.pack(fill="x")
+        size_field.entry.bind("<Return>", lambda _event: self._save_window_policy())
+        size_field.entry.bind("<FocusOut>", lambda _event: self._save_window_policy())
+
         # 执行
         card_body = self._settings_card(body, "执行")
         inner = tk.Frame(card_body, bg=theme.c("surface"))
@@ -2160,6 +2279,14 @@ class App:
             self._refresh_apps()
         elif self.view == "snippets":
             self.refresh_snippets()
+        elif self.view == "chats":
+            # 进页面就确保列表是新的：没读过就读，库变过就重读。
+            # 读库是几十毫秒的本地 IO，让用户先看到一个空列表再自己去点"扫描"，
+            # 只是把等待转嫁给了他。
+            if not self._conversation_scanning and (
+                not self._chats_loaded or codexdb.is_stale(self._library)
+            ):
+                self.scan_conversations()
         elif self.view == "log":
             self._render_log()
 
@@ -2213,27 +2340,105 @@ class App:
             return
         self._list_signature = signature
 
-        for child in self.list_body.winfo_children():
-            child.destroy()
-        self._row_widgets.clear()
-
-        if not tasks:
-            self._empty_state(self.list_body, "没有匹配的任务" if keyword else "还没有任务")
-        for key, items in grouped:
-            expanded = self._group_open_state(key)
-            # 选中的任务不能藏在收起的分组里，否则看起来像被删掉了。
-            if not expanded and any(str(task.get("id")) == self.selected_id for task in items):
-                expanded = True
-            self._render_group_head(key, len(items), expanded)
-            if expanded:
-                for task in items:
-                    self._render_row(task)
+        self._paint_tasks(grouped, keyword)
 
         total = len(self.store.tasks())
         self.count_var.set(f"{total} 个任务")
         self._apply_selection()
         # 任务数量变了，托盘提示跟着变。内容没变时 _update_tray_tip 自己会跳过。
         self._update_tray_tip()
+
+    def _paint_tasks(self, grouped: list[tuple[str, list[dict[str, Any]]]], keyword: str) -> None:
+        """把分组摆进控件池。
+
+        池子里的控件只改文字和颜色，绝不销毁——这是"操作一下闪一下"的根治点。
+        没用到的行 `grid_remove()` 摘掉布局，控件还留着，下次直接复用。
+        """
+
+        theme = self.theme
+        self._row_widgets.clear()
+        position = 0
+        head_slot = 0
+        row_slot = 0
+        used_heads: list[tk.Widget] = []
+        used_rows: list[tk.Widget] = []
+        empty_shown = False
+
+        if not grouped:
+            empty = self._task_empty_parts()
+            empty["label"].configure(
+                text="没有匹配的任务" if keyword else "还没有任务",
+                fg=theme.c("text_3"),
+                bg=theme.c("bg"),
+            )
+            empty["frame"].configure(bg=theme.c("bg"))
+            empty["frame"].grid(row=0, column=0, sticky="nsew", pady=theme.px(48))
+            empty_shown = True
+
+        for key, items in grouped:
+            expanded = self._group_open_state(key)
+            # 选中的任务不能藏在收起的分组里，否则看起来像被删掉了。
+            if not expanded and any(str(task.get("id")) == self.selected_id for task in items):
+                expanded = True
+
+            head = self._group_head(head_slot)
+            head_slot += 1
+            self._update_group_head(head, key, len(items), expanded)
+            head["frame"].grid(
+                row=position, column=0, sticky="ew",
+                padx=theme.px(4), pady=(theme.px(10), theme.px(4)),
+            )
+            used_heads.append(head["frame"])
+            position += 1
+
+            if not expanded:
+                continue
+            for task in items:
+                parts = self._task_row(row_slot)
+                row_slot += 1
+                self._update_task_row(parts, task)
+                parts["frame"].grid(row=position, column=0, sticky="ew", pady=(0, theme.px(1)))
+                used_rows.append(parts["frame"])
+                position += 1
+                self._row_widgets[str(task.get("id"))] = parts
+
+        self._recycle(self._task_heads, used_heads)
+        self._recycle(self._task_rows, used_rows)
+        if not empty_shown and self._task_empty is not None:
+            try:
+                self._task_empty["frame"].grid_remove()
+            except tk.TclError:
+                pass
+
+    @staticmethod
+    def _recycle(pool: list[dict[str, Any]], used: list[tk.Widget]) -> None:
+        """把这一轮没用到的槽位摘掉布局，但留着控件本身。"""
+
+        active = {id(widget) for widget in used}
+        for parts in pool:
+            widget = parts["frame"]
+            if id(widget) not in active:
+                try:
+                    widget.grid_remove()
+                except tk.TclError:
+                    pass
+
+    def _task_empty_parts(self) -> dict[str, Any]:
+        if self._task_empty is None:
+            theme = self.theme
+            frame = tk.Frame(self.list_body, bg=theme.c("bg"))
+            label = tk.Label(
+                frame,
+                text="",
+                bg=theme.c("bg"),
+                fg=theme.c("text_3"),
+                font=theme.font("small"),
+                anchor="center",
+                justify="center",
+            )
+            label.pack(fill="x")
+            self._task_empty = {"frame": frame, "label": label}
+        return self._task_empty
 
     def _select_initial_task(self) -> bool:
         """打开窗口就落在第一个真实任务上。
@@ -2273,14 +2478,18 @@ class App:
             if buckets.get(key)
         ]
 
-    def _render_group_head(self, key: str, count: int, expanded: bool = True) -> None:
+    def _group_head(self, index: int) -> dict[str, Any]:
+        while index >= len(self._task_heads):
+            self._task_heads.append(self._create_group_head())
+        return self._task_heads[index]
+
+    def _create_group_head(self) -> dict[str, Any]:
         theme = self.theme
-        head = tk.Frame(self.list_body, bg=theme.c("bg"), cursor="hand2")
-        head.pack(fill="x", padx=theme.px(4), pady=(theme.px(10), theme.px(4)))
+        frame = tk.Frame(self.list_body, bg=theme.c("bg"), cursor="hand2")
 
         # 收起画向右的三角，展开画向下的三角：一个符号说清可点，不用再加说明文字。
         caret = tk.Canvas(
-            head,
+            frame,
             width=theme.px(9),
             height=theme.px(9),
             bg=theme.c("bg"),
@@ -2288,21 +2497,13 @@ class App:
             bd=0,
             cursor="hand2",
         )
-        if expanded:
-            caret.create_polygon(
-                1, 2, theme.px(7), 2, theme.px(4), theme.px(7),
-                fill=theme.c("text_3"), outline="",
-            )
-        else:
-            caret.create_polygon(
-                2, 1, 2, theme.px(7), theme.px(7), theme.px(4),
-                fill=theme.c("text_3"), outline="",
-            )
         caret.pack(side="left", pady=(theme.px(4), 0))
+        # 两种朝向都是三点多边形，只改坐标不重建图形，切分组时画布上不会闪。
+        arrow = caret.create_polygon(0, 0, 0, 0, 0, 0, fill=theme.c("text_3"), outline="")
 
         label = tk.Label(
-            head,
-            text=store_module.group_label(key),
+            frame,
+            text="",
             bg=theme.c("bg"),
             fg=theme.c("text_2"),
             font=theme.font("small_strong"),
@@ -2312,8 +2513,8 @@ class App:
         label.pack(side="left", padx=(theme.px(5), 0))
 
         count_label = tk.Label(
-            head,
-            text=str(count),
+            frame,
+            text="",
             bg=theme.c("bg"),
             fg=theme.c("text_3"),
             font=theme.font("tiny"),
@@ -2322,8 +2523,44 @@ class App:
         )
         count_label.pack(side="right")
 
-        for widget in (head, caret, label, count_label):
-            widget.bind("<Button-1>", lambda _event, k=key: self._toggle_group(k))
+        parts: dict[str, Any] = {
+            "frame": frame,
+            "caret": caret,
+            "arrow": arrow,
+            "label": label,
+            "count": count_label,
+            "key": "",
+        }
+        for widget in (frame, caret, label, count_label):
+            widget.bind("<Button-1>", lambda _event, p=parts: self._toggle_group(p["key"]))
+        return parts
+
+    def _update_group_head(self, parts: dict[str, Any], key: str, count: int, expanded: bool) -> None:
+        theme = self.theme
+        parts["key"] = key
+        background = theme.c("bg")
+        parts["frame"].configure(bg=background)
+        parts["label"].configure(
+            text=store_module.group_label(key),
+            bg=background,
+            fg=theme.c("text_2"),
+            font=theme.font("small_strong"),
+        )
+        parts["count"].configure(text=str(count), bg=background, fg=theme.c("text_3"))
+
+        caret = parts["caret"]
+        caret.configure(bg=background)
+        if expanded:
+            caret.coords(
+                parts["arrow"],
+                1, 2, theme.px(7), 2, theme.px(4), theme.px(7),
+            )
+        else:
+            caret.coords(
+                parts["arrow"],
+                2, 1, 2, theme.px(7), theme.px(7), theme.px(4),
+            )
+        caret.itemconfigure(parts["arrow"], fill=theme.c("text_3"))
 
     @staticmethod
     def _sort_key(task: dict[str, Any]) -> tuple:
@@ -2345,21 +2582,26 @@ class App:
             return config.format_short_datetime(stamp) if stamp is not None else "失败"
         return next_run_text(task)
 
-    def _render_row(self, task: dict[str, Any]) -> None:
-        theme = self.theme
-        task_id = str(task.get("id"))
-        row = tk.Frame(self.list_body, bg=theme.c("bg"), cursor="hand2")
-        row.pack(fill="x", pady=(0, theme.px(1)))
+    def _task_row(self, index: int) -> dict[str, Any]:
+        while index >= len(self._task_rows):
+            self._task_rows.append(self._create_task_row())
+        return self._task_rows[index]
 
-        bar = tk.Frame(row, bg=theme.c("bg"), width=theme.px(3))
+    def _create_task_row(self) -> dict[str, Any]:
+        theme = self.theme
+        frame = tk.Frame(self.list_body, bg=theme.c("bg"), cursor="hand2")
+
+        bar = tk.Frame(frame, bg=theme.c("bg"), width=theme.px(3))
         bar.pack(side="left", fill="y")
 
-        content = tk.Frame(row, bg=theme.c("bg"))
-        content.pack(side="left", fill="both", expand=True, padx=(theme.px(11), theme.px(6)), pady=theme.px(8))
+        content = tk.Frame(frame, bg=theme.c("bg"))
+        content.pack(
+            side="left", fill="both", expand=True,
+            padx=(theme.px(11), theme.px(6)), pady=theme.px(8),
+        )
 
         name_row = tk.Frame(content, bg=theme.c("bg"))
         name_row.pack(fill="x")
-        state = task_state(task)
         dot = tk.Canvas(
             name_row,
             width=theme.px(7),
@@ -2368,11 +2610,14 @@ class App:
             highlightthickness=0,
             bd=0,
         )
-        dot.create_oval(0, 0, theme.px(6), theme.px(6), fill=theme.tone(store_module.STATE_TONE[state]), outline="")
+        oval = dot.create_oval(
+            0, 0, theme.px(6), theme.px(6), fill=theme.c("text_3"), outline="",
+        )
         dot.pack(side="left", pady=(theme.px(5), 0))
+
         name_label = tk.Label(
             name_row,
-            text=str(task.get("name") or "未命名任务"),
+            text="",
             bg=theme.c("bg"),
             fg=theme.c("text"),
             font=theme.font("strong"),
@@ -2382,7 +2627,7 @@ class App:
 
         meta_label = tk.Label(
             name_row,
-            text=self._row_meta(task),
+            text="",
             bg=theme.c("bg"),
             fg=theme.c("text_3"),
             font=theme.font("tiny"),
@@ -2392,7 +2637,7 @@ class App:
 
         snippet_label = tk.Label(
             content,
-            text=content_snippet(task, 40),
+            text="",
             bg=theme.c("bg"),
             fg=theme.c("text_2"),
             font=theme.font("small"),
@@ -2400,15 +2645,8 @@ class App:
         )
         snippet_label.pack(fill="x", padx=(theme.px(14), 0), pady=(theme.px(3), 0))
 
-        widgets = (row, content, name_row, name_label, snippet_label, meta_label)
-        for widget in widgets:
-            widget.bind("<Button-1>", lambda _event, tid=task_id: self.select_task(tid))
-            widget.bind("<Button-3>", lambda event, tid=task_id: self._open_row_menu(event, tid))
-            widget.bind("<Enter>", lambda _event, tid=task_id: self._hover_row(tid, True))
-            widget.bind("<Leave>", lambda _event, tid=task_id: self._hover_row(tid, False))
-
-        self._row_widgets[task_id] = {
-            "row": row,
+        parts: dict[str, Any] = {
+            "frame": frame,
             "bar": bar,
             "content": content,
             "name_row": name_row,
@@ -2416,22 +2654,70 @@ class App:
             "snippet": snippet_label,
             "meta_label": meta_label,
             "dot": dot,
+            "oval": oval,
             "hover": False,
+            "task_id": None,
         }
+        # 绑定只做一次，回调里现取 parts["task_id"]：这一格换给另一条任务时
+        # 不用重新绑定，也就不会有"绑一半"的中间状态。
+        for widget in (frame, content, name_row, name_label, snippet_label, meta_label):
+            widget.bind("<Button-1>", lambda _event, p=parts: self._activate_row(p))
+            widget.bind("<Button-3>", lambda event, p=parts: self._open_row_menu_for(event, p))
+            widget.bind("<Enter>", lambda _event, p=parts: self._hover_parts(p, True))
+            widget.bind("<Leave>", lambda _event, p=parts: self._hover_parts(p, False))
+        return parts
+
+    def _update_task_row(self, parts: dict[str, Any], task: dict[str, Any]) -> None:
+        theme = self.theme
+        parts["task_id"] = str(task.get("id"))
+        # 这一格可能是从上一条任务手上接过来的，悬停状态必须归零，
+        # 否则鼠标早就不在上面了，行还亮着。
+        parts["hover"] = False
+        state = task_state(task)
+        parts["name"].configure(
+            text=str(task.get("name") or "未命名任务"),
+            font=theme.font("strong"),
+        )
+        parts["meta_label"].configure(text=self._row_meta(task))
+        parts["snippet"].configure(text=content_snippet(task, 40))
+        try:
+            parts["dot"].itemconfigure(
+                parts["oval"], fill=theme.tone(store_module.STATE_TONE[state])
+            )
+        except tk.TclError:
+            pass
+        self._paint_parts(parts)
+
+    def _activate_row(self, parts: dict[str, Any]) -> None:
+        task_id = parts.get("task_id")
+        if task_id:
+            self.select_task(task_id)
+
+    def _open_row_menu_for(self, event, parts: dict[str, Any]) -> None:
+        task_id = parts.get("task_id")
+        if task_id:
+            self._open_row_menu(event, task_id)
+
+    def _hover_parts(self, parts: dict[str, Any], hover: bool) -> None:
+        parts["hover"] = hover
+        self._paint_parts(parts)
 
     def _hover_row(self, task_id: str, hover: bool) -> None:
         parts = self._row_widgets.get(task_id)
         if not parts:
             return
         parts["hover"] = hover
-        self._paint_row(task_id)
+        self._paint_parts(parts)
 
     def _paint_row(self, task_id: str) -> None:
         parts = self._row_widgets.get(task_id)
         if not parts:
             return
+        self._paint_parts(parts)
+
+    def _paint_parts(self, parts: dict[str, Any]) -> None:
         theme = self.theme
-        selected = task_id == self.selected_id
+        selected = parts.get("task_id") is not None and parts["task_id"] == self.selected_id
         if selected:
             background = theme.c("accent_soft")
         elif parts["hover"]:
@@ -2439,10 +2725,13 @@ class App:
         else:
             background = theme.c("bg")
         try:
-            parts["row"].configure(bg=background)
+            parts["frame"].configure(bg=background)
             parts["content"].configure(bg=background)
             parts["name_row"].configure(bg=background)
-            parts["name"].configure(bg=background, fg=theme.c("accent_label") if selected else theme.c("text"))
+            parts["name"].configure(
+                bg=background,
+                fg=theme.c("accent_label") if selected else theme.c("text"),
+            )
             parts["snippet"].configure(bg=background)
             parts["meta_label"].configure(bg=background)
             parts["dot"].configure(bg=background)
@@ -2993,6 +3282,66 @@ class App:
         )
         self._set_status("识别设置已保存")
 
+    # -- 目标窗口 ------------------------------------------------------
+
+    @staticmethod
+    def _lock_window_text(settings: dict) -> str:
+        hwnd = int(settings.get("target_window_hwnd") or 0)
+        title = str(settings.get("target_window_title") or "").strip()
+        if hwnd:
+            info = winapi.window_by_hwnd(hwnd)
+            name = str((info or {}).get("title") or title or "").strip()
+            if info is None:
+                return f"锁定的窗口已经不在了（句柄 {hwnd}），改回按关键词找"
+            return f"已锁定：{name or '未命名窗口'}"
+        if title:
+            return f"按标题锁定：{title}"
+        return "没有锁定，按关键词找"
+
+    def _lock_target_window(self) -> None:
+        """把当前前台窗口记下来，之后只操作它。
+
+        有些程序同时开着好几个同进程的窗口（主窗口、浮窗、预览窗），按关键词
+        挑总会挑错。锁定之后就不再猜了——窗口关掉会自动退回关键词。
+        """
+
+        hwnd = winapi.foreground_window()
+        if not hwnd:
+            self._set_status("没有拿到前台窗口")
+            return
+        if winapi.is_tool_window(hwnd):
+            self._set_status("前台是一个辅助窗口，先点一下主窗口再锁定")
+            return
+        info = winapi.window_info(hwnd)
+        title = str(info.get("title") or "").strip()
+        if not title:
+            self._set_status("前台窗口没有标题，没法锁定")
+            return
+        self.store.update_settings(target_window_hwnd=int(hwnd), target_window_title=title)
+        self.lock_window_var.set(self._lock_window_text(self.store.settings))
+        self._set_status(f"已锁定窗口：{title}")
+
+    def _clear_target_window(self) -> None:
+        self.store.update_settings(target_window_hwnd=0, target_window_title="")
+        self.lock_window_var.set(self._lock_window_text(self.store.settings))
+        self._set_status("已取消窗口锁定")
+
+    def _save_window_policy(self) -> None:
+        size = str(self.window_size_var.get() or "").strip()
+        self.store.update_settings(
+            force_window_size=bool(self.force_size_var.get()),
+            target_window_size=size,
+        )
+        if not bool(self.force_size_var.get()):
+            self._set_status("执行前不改窗口大小")
+            return
+        parsed = winapi.parse_window_size(size)
+        if size and parsed is None:
+            self._set_status("尺寸格式不认识，用 1600x1000 或 max")
+            return
+        self._set_status(f"执行前把目标窗口调成 {f'{parsed[0]}x{parsed[1]}' if parsed else '最大化'}")
+
+
     def _save_delay(self) -> None:
         try:
             value = float(self.delay_var.get())
@@ -3382,14 +3731,21 @@ class App:
                 f"{name} edit",
             )
 
-        for item in self._conversations:
+        # 命令面板里只放"人开的对话"，而且只放最近的一批。
+        # 900 多条全塞进去，面板一打开就是一整屏同名条目，搜索反而更难用。
+        recent = [
+            item
+            for item in self._conversations
+            if not item.archived and not item.is_subagent
+        ][:80]
+        for item in recent:
             title = item.title
             add(
                 f"切换对话：{title}",
                 lambda t=title: self.open_conversation(t),
                 "对话",
-                "切换",
-                title,
+                item.project or "无项目",
+                f"{title} {item.project} {item.cwd}",
             )
 
         return items
@@ -3523,10 +3879,13 @@ class App:
                         pass
                 elif event == "action_done":
                     if self._conversation_scanning:
+                        # 读库走的是独立线程，正常情况下不会卡在这里；真卡住了
+                        # （比如磁盘掉线）也要把"正在读取"复位，不能一直转。
                         self._conversation_scanning = False
-                        self.chat_status_var.set("扫描没有完成")
+                        self.chat_status_var.set("读取没有完成")
                         try:
-                            self._render_chats()
+                            if hasattr(self, "chat_browser"):
+                                self.chat_browser.show_error("读取没有完成，请重试。")
                         except tk.TclError:
                             pass
                 elif event == "history":

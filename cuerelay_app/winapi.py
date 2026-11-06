@@ -46,6 +46,22 @@ if IS_WINDOWS:  # pragma: no branch - 只在 Windows 上真正执行
             ("bottom", wintypes.LONG),
         ]
 
+    class WINDOWPLACEMENT(ctypes.Structure):
+        """最小化窗口的"还原后"矩形就存在这里。
+
+        最小化时 GetWindowRect 返回的是 -32000 那一小块，按尺寸过滤会把窗口
+        整个丢掉——表现是"明明在任务栏里，程序却说没找到窗口，于是又启动一次"。
+        """
+
+        _fields_ = [
+            ("length", wintypes.UINT),
+            ("flags", wintypes.UINT),
+            ("showCmd", wintypes.UINT),
+            ("ptMinPosition", POINT),
+            ("ptMaxPosition", POINT),
+            ("rcNormalPosition", RECT),
+        ]
+
     class BITMAPINFOHEADER(ctypes.Structure):
         _fields_ = [
             ("biSize", wintypes.DWORD),
@@ -83,6 +99,8 @@ if IS_WINDOWS:  # pragma: no branch - 只在 Windows 上真正执行
     user32.GetCursorPos.restype = wintypes.BOOL
     user32.WindowFromPoint.argtypes = [POINT]
     user32.WindowFromPoint.restype = HWND
+    user32.GetWindowPlacement.argtypes = [HWND, ctypes.POINTER(WINDOWPLACEMENT)]
+    user32.GetWindowPlacement.restype = wintypes.BOOL
     user32.GetAncestor.argtypes = [HWND, wintypes.UINT]
     user32.GetAncestor.restype = HWND
     user32.GetForegroundWindow.argtypes = []
@@ -552,13 +570,19 @@ def windows_for_process(
                 return True
             if not get_window_title(hwnd):
                 return True
+            minimized = bool(user32.IsIconic(HWND(hwnd)))
             rect = get_window_rect(hwnd)
+            if minimized:
+                # 最小化时那块 237x39 的矩形没有任何意义，用它做尺寸过滤会把
+                # "收在任务栏里的应用"整个丢掉，于是程序以为它没开、又启动一次。
+                rect = normal_rect(hwnd) or rect
             if rect is None or rect["width"] < 320 or rect["height"] < 240:
                 return True
             info = window_info(hwnd)
             info["rect"] = rect
-            info["visible"] = bool(visible and not cloaked)
+            info["visible"] = bool(visible and not cloaked and not minimized)
             info["cloaked"] = bool(cloaked)
+            info["minimized"] = minimized
             found.append(info)
         except Exception:
             pass
@@ -644,6 +668,80 @@ def is_minimized(hwnd: int) -> bool:
 
 def is_maximized(hwnd: int) -> bool:
     return is_window(hwnd) and bool(user32.IsZoomed(HWND(hwnd)))
+
+
+def normal_rect(hwnd: int) -> Optional[dict[str, int]]:
+    """窗口"还原之后"会占的那块矩形。
+
+    最小化的窗口 GetWindowRect 只给 -32000 那一小块，按尺寸过滤就会把它当成
+    "没有窗口"。而它恰恰是最常见的一种状态：应用收在任务栏里。所以判断大小
+    之前先问一次还原矩形，窗口就不会凭空消失。
+    """
+
+    if not is_window(hwnd):
+        return None
+    try:
+        placement = WINDOWPLACEMENT()
+        placement.length = ctypes.sizeof(WINDOWPLACEMENT)
+        if not user32.GetWindowPlacement(HWND(int(hwnd)), ctypes.byref(placement)):
+            return None
+        rect = placement.rcNormalPosition
+        width = int(rect.right) - int(rect.left)
+        height = int(rect.bottom) - int(rect.top)
+        if width <= 0 or height <= 0:
+            return None
+        return {
+            "left": int(rect.left),
+            "top": int(rect.top),
+            "right": int(rect.right),
+            "bottom": int(rect.bottom),
+            "width": width,
+            "height": height,
+        }
+    except Exception:
+        return None
+
+
+def exposed_ratio(hwnd: int, samples: int = 9) -> float:
+    """窗口有多少比例"真的露在屏幕上"。
+
+    只看前台是不够的：有些窗口（无边框浮层、读屏工具、录屏叠加层）不接收
+    焦点，却盖在目标窗口上面。这时候目标窗口仍然是"前台窗口"，但屏幕上画的
+    是别人的像素——截图截到别人的界面，OCR 出来的是别人的对话，点下去点到
+    别人身上。
+
+    做法是在窗口里取几个采样点，问系统"这个点上最上面是谁"。返回命中的比例，
+    1.0 表示完全露着，0 表示完全被盖住。
+    """
+
+    if not is_window(hwnd):
+        return 0.0
+    rect = get_window_rect(hwnd)
+    if not rect or rect["width"] <= 4 or rect["height"] <= 4:
+        return 0.0
+    if is_minimized(hwnd) or is_cloaked(hwnd):
+        return 0.0
+    target = root_window(int(hwnd))
+    # 取窗口内侧的点：边框、圆角、阴影上点到的往往是窗口自己之外的东西。
+    inset_x = max(4, int(rect["width"] * 0.08))
+    inset_y = max(4, int(rect["height"] * 0.08))
+    left = int(rect["left"]) + inset_x
+    right = int(rect["right"]) - inset_x
+    top = int(rect["top"]) + inset_y
+    bottom = int(rect["bottom"]) - inset_y
+    if right <= left or bottom <= top:
+        return 0.0
+    side = 3 if samples >= 9 else 2
+    hits = 0
+    total = 0
+    for row in range(side):
+        for column in range(side):
+            x = left + (right - left) * column // max(1, side - 1)
+            y = top + (bottom - top) * row // max(1, side - 1)
+            total += 1
+            if point_to_root_window(x, y) == target:
+                hits += 1
+    return hits / total if total else 0.0
 
 
 # DwmGetWindowAttribute 的 DWMWA_CLOAKED。
@@ -771,8 +869,13 @@ def find_target_window(
     exclude_hwnd: int = 0,
     title_hint: str = "",
     process_hint: str = "",
+    windows: Optional[list[dict[str, Any]]] = None,
 ) -> Optional[dict[str, Any]]:
-    """按关键词、进程名和当前前台状态打分，返回最可能的目标窗口。"""
+    """按关键词、进程名和当前前台状态打分，返回最可能的目标窗口。
+
+    windows 只在自检里用：把一份假的窗口列表喂进来，就能验证"辅助窗口不
+    会被选成目标"这类判断，不用真的开一个窗口。
+    """
 
     _require()
     keywords = [kw for kw in (keywords or []) if kw]
@@ -784,13 +887,25 @@ def find_target_window(
     process_hint = (process_hint or "").strip().lower()
     candidates: list[tuple[int, dict[str, Any]]] = []
 
-    for info in enumerate_windows():
+    for info in (windows if windows is not None else enumerate_windows()):
         hwnd = info["hwnd"]
         if not hwnd or hwnd == exclude_hwnd or _looks_like_self(info):
             continue
         # 被 DWM 遮蔽的窗口在屏幕上不存在，截屏只会截到壁纸。它仍然算
         # "进程在跑"，但绝不能当成可操作的目标。
-        if is_cloaked(hwnd):
+        cloaked = info.get("cloaked")
+        if cloaked is None:
+            cloaked = is_cloaked(hwnd)
+        if cloaked:
+            continue
+        # 辅助窗口永远不是用户正在用的那个窗口。Codex 就常驻一个 1225x2115、
+        # 有标题、比主窗口还大的 TOOLWINDOW：它没有内容、用户点不进去，但按
+        # 关键词打分能排到第一。以前只扣 60 分，主窗口收在任务栏里时它就成了
+        # 唯一候选，于是整条流水线对着一个空窗口识别、点击，全部落空。
+        tool = info.get("tool")
+        if tool is None:
+            tool = is_tool_window(hwnd)
+        if tool:
             continue
         title = str(info.get("title") or "").lower()
         process = str(info.get("process_name") or "").lower()
@@ -809,10 +924,6 @@ def find_target_window(
             score += 45
         if hwnd == active:
             score += 30
-        # 工具窗口通常是应用自己开的辅助面板（浮窗、取词条之类），不是
-        # 用户正在用的那个窗口。同分时它应该排在后面。
-        if is_tool_window(hwnd):
-            score -= 60
         candidates.append((score, info))
 
     if not candidates:
@@ -824,6 +935,99 @@ def find_target_window(
 # ---------------------------------------------------------------------------
 # 窗口激活与几何
 # ---------------------------------------------------------------------------
+
+
+def parse_window_size(text: str) -> Optional[tuple[int, int]]:
+    """把 "1600x1000" / "1600 1000" / "1600×1000" 读成 (宽, 高)。
+
+    返回 None 表示"没指定"，交给调用方决定是最大化还是不动。
+    """
+
+    raw = (text or "").strip().lower().replace("×", "x").replace(",", " ").replace("*", "x")
+    if not raw or raw in ("max", "maximize", "最大化", "最大"):
+        return None
+    parts = [part for part in raw.replace(" ", "x").split("x") if part.strip()]
+    if len(parts) < 2:
+        return None
+    try:
+        width = int(float(parts[0]))
+        height = int(float(parts[1]))
+    except ValueError:
+        return None
+    if width < 320 or height < 240:
+        return None
+    return (width, height)
+
+
+def force_window_size(hwnd: int, spec: str) -> bool:
+    """把目标窗口调成指定尺寸，或者最大化。
+
+    窗口大小是会变的：用户随手拖一下，坐标全变；不同缩放比例下同一个
+    比例算出来的位置也对不上。与其让识别算法去适应任意大小，不如在动手
+    之前先把窗口摆成已知的形状——"看得见、量得准"比"什么都能适应"可靠。
+
+    spec 为空或 "max" 时最大化；"1600x1000" 时恢复成普通窗口再改尺寸，
+    位置保持在原来的左上角（不把用户的桌面布局改掉）。
+    """
+
+    if not is_window(hwnd):
+        return False
+    size = parse_window_size(spec)
+    if size is None:
+        user32.ShowWindow(HWND(int(hwnd)), SW_MAXIMIZE)
+        time.sleep(0.25)
+        return is_maximized(hwnd)
+    width, height = size
+    if is_maximized(hwnd):
+        user32.ShowWindow(HWND(int(hwnd)), SW_RESTORE)
+        time.sleep(0.15)
+    rect = get_window_rect(hwnd) or {"left": 80, "top": 80}
+    left = max(0, int(rect["left"]))
+    top = max(0, int(rect["top"]))
+    user32.SetWindowPos(
+        HWND(int(hwnd)),
+        HWND(0),
+        left,
+        top,
+        width,
+        height,
+        SWP_NOZORDER | SWP_NOACTIVATE | SWP_SHOWWINDOW,
+    )
+    time.sleep(0.25)
+    now = get_window_rect(hwnd)
+    if not now:
+        return False
+    return abs(now["width"] - width) <= 24 and abs(now["height"] - height) <= 24
+
+
+def window_by_hwnd(hwnd: int) -> Optional[dict[str, Any]]:
+    """把一个句柄还原成"窗口信息"，顺便确认它还活着、还没被收进托盘。"""
+
+    if not is_window(hwnd) or is_cloaked(hwnd):
+        return None
+    rect = get_window_rect(hwnd)
+    if rect is None:
+        return None
+    info = window_info(hwnd)
+    info["rect"] = rect
+    info["visible"] = bool(is_window_visible(hwnd) and not is_minimized(hwnd))
+    info["minimized"] = is_minimized(hwnd)
+    return info
+
+
+def find_window_by_title(text: str, exclude_hwnd: int = 0) -> Optional[dict[str, Any]]:
+    """按标题里的一段文字找窗口，用于"锁定某个窗口"。"""
+
+    wanted = (text or "").strip().lower()
+    if not wanted:
+        return None
+    for info in enumerate_windows():
+        hwnd = int(info["hwnd"])
+        if hwnd == exclude_hwnd or _looks_like_self(info) or is_tool_window(hwnd):
+            continue
+        if wanted in str(info.get("title") or "").lower():
+            return info
+    return None
 
 
 def capture_window_geometry(hwnd: int) -> Optional[dict[str, Any]]:

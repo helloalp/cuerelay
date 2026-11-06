@@ -8,3 +8,7 @@ cuerelay.log
 cuerelay_crash.log
 *.broken-*
 *.tmp
+
+# 探针输出（tools/probe_overlay_*.py 生成）
+/demo/
+/live/

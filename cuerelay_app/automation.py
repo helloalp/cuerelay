@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+import re
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -33,6 +34,12 @@ class Runner:
     # 框画出来之后停一下再点。框和点击几乎是同时发生的，不停这一下，
     # 用户只看到窗口闪了一下，看不到"它认的是哪一个元素"。
     BOX_DWELL = 0.3
+    # 浮层的落定动画（收拢 0.24 秒 + 闪 0.34 秒）走完，画面才算静止。
+    # 取像素基线之前必须等这么久，否则基线里拍的是动画中间的一帧。
+    OVERLAY_SETTLE = 0.64
+    # 点击涟漪的存活时间（对齐 ui.overlay.PULSE_SECONDS）。点击之后立刻
+    # 比对，看到的是自己画的那圈涟漪，不是应用的响应。
+    OVERLAY_PULSE = 0.5
 
     def __init__(
         self,
@@ -51,17 +58,18 @@ class Runner:
 
     # -- 浮层 ----------------------------------------------------------
 
-    def _overlay(self, action: str, **payload: Any) -> None:
-        """浮层只是给人看的，任何异常都不能影响执行。"""
+    def _overlay(self, action: str, **payload: Any) -> bool:
+        """浮层只是给人看的，任何异常都不能影响执行。返回有没有真的发出去。"""
 
         if self.emit is None:
-            return
+            return False
         if not self.settings.get("show_overlay", True):
-            return
+            return False
         try:
             self.emit("overlay", {"action": action, **payload})
+            return True
         except Exception:
-            pass
+            return False
 
     def _overlay_hide(self) -> None:
         self._overlay("hide")
@@ -72,8 +80,49 @@ class Runner:
     def _overlay_box(self, rect: Rect, kind: str, label: str = "") -> None:
         self._overlay("box", rect=rect.as_dict(), kind=kind, label=label)
 
-    def _overlay_progress(self, index: int, total: int, text: str, tone: str = "accent") -> None:
-        self._overlay("progress", index=index, total=total, text=text, tone=tone)
+    def _overlay_progress(
+        self, index: int, total: int, text: str, tone: str = "accent", detail: str = ""
+    ) -> bool:
+        return self._overlay(
+            "progress", index=index, total=total, text=text, tone=tone, detail=detail
+        )
+
+    def _overlay_scan(self, rect: Rect, label: str = "识别中", tone: str = "warning") -> None:
+        """标出"正在这一块里找"。
+
+        识别一次要几百毫秒到几秒。这段时间里如果浮层什么都不画，用户看到的是
+        一个静止的窗口，分不清"在算"还是"已经死了"。先给一块扫描区域，认出
+        来之后再换成实框——找和找到是两件事，视觉上也要是两件事。
+        """
+
+        self._overlay("scan", rect=rect.as_dict(), label=label, tone=tone)
+
+    def _overlay_quiet(self, seconds: float) -> None:
+        """等浮层安静下来，再做像素比对。
+
+        浮层画在目标窗口上方，截屏会把它一起截进来：角标收拢、落定那一下的
+        闪、点击的涟漪，每一个都会让"这块像素变了"成立——哪怕应用本身什么都
+        没做。以前这会让"粘贴校验"和"发送校验"把自己的动画当成应用的响应，
+        明明没发出去也可能判成发了。所以取基线之前、开始比对之前，都先等这
+        一段时间过去。没开浮层就没有这个问题，也就不必等。
+        """
+
+        if seconds <= 0:
+            return
+        if not self.settings.get("show_overlay", True):
+            return
+        time.sleep(seconds)
+
+    def _overlay_pulse(self, point: tuple[int, int]) -> None:
+        """点击的位置画一圈涟漪。点下去的那一下要看得见。"""
+
+        self._overlay("pulse", point=(int(point[0]), int(point[1])))
+
+    def _click(self, point: tuple[int, int]) -> None:
+        """点一个屏幕坐标，顺手在浮层上留个回执。"""
+
+        winapi.click(point)
+        self._overlay_pulse(point)
 
     # -- 基础 ----------------------------------------------------------
 
@@ -90,7 +139,20 @@ class Runner:
     def _frame(self, hwnd: int) -> locator.Frame:
         frame = locator.grab(hwnd)
         if frame is None:
-            raise AutomationError("无法读取目标窗口画面，请确认窗口没有被最小化。")
+            # 拿不到画面的时候，原因比"读不到"重要得多：窗口被最小化、被别的
+            # 程序整个盖住、还是已经关掉了，对应三种完全不同的处理方式。
+            # 以前一律报"确认窗口没有被最小化"，用户照着做也没用。
+            if not winapi.is_window(hwnd):
+                raise AutomationError("目标窗口已经关闭。")
+            if winapi.is_minimized(hwnd):
+                raise AutomationError("目标窗口被最小化了，请先从任务栏把它恢复。")
+            ratio = winapi.exposed_ratio(hwnd)
+            if ratio < 0.5:
+                raise AutomationError(
+                    f"目标窗口被别的窗口挡住了（只露出 {int(ratio * 100)}%），"
+                    "没有拿它的画面——挡住它的那个程序正在被截进来。"
+                )
+            raise AutomationError("无法读取目标窗口画面，请确认它没有停在一个空白页上。")
         return frame
 
     @staticmethod
@@ -136,7 +198,20 @@ class Runner:
         return previous
 
     def _locate_target(self) -> Optional[dict[str, Any]]:
-        """按关键词找当前可见的目标窗口。"""
+        """按"锁定的窗口 → 锁定的标题 → 关键词"的顺序找目标。"""
+
+        locked = int(self.settings.get("target_window_hwnd") or 0)
+        if locked:
+            info = winapi.window_by_hwnd(locked)
+            if info is not None:
+                return info
+            self.log("warning", "锁定的目标窗口已经不在了，改回按关键词找。")
+        title_lock = str(self.settings.get("target_window_title") or "").strip()
+        if title_lock:
+            info = winapi.find_window_by_title(title_lock, exclude_hwnd=self.exclude_hwnd)
+            if info is not None:
+                return info
+            self.log("warning", f"没有标题含「{title_lock}」的窗口，改回按关键词找。")
 
         keywords = winapi.parse_keywords(str(self.settings.get("target_keywords") or ""))
         return winapi.find_target_window(
@@ -196,10 +271,27 @@ class Runner:
             geometry = self.settings.get("target_geometry")
         if not winapi.ensure_foreground(hwnd, geometry):
             raise AutomationError("无法把目标窗口切到前台，已停止以避免误输入。")
+        # 窗口大小是活的：用户随手拖一下，所有坐标都变。与其让识别算法去
+        # 适应任意大小，不如在动手之前先把窗口摆成已知的形状。
+        if self.settings.get("force_window_size", False):
+            spec = str(self.settings.get("target_window_size") or "")
+            if winapi.force_window_size(hwnd, spec):
+                self.log("info", f"目标窗口已调成 {spec or '最大化'}。")
+            else:
+                self.log("warning", f"没能把目标窗口调成 {spec or '最大化'}，按当前大小继续。")
+            if not winapi.ensure_foreground(hwnd):
+                raise AutomationError("调整窗口大小之后没能把它留在前台。")
         return hwnd
 
     def _resolve_composer(self, hwnd: int) -> tuple[locator.Frame, Rect, str]:
         frame = self._frame(hwnd)
+        # 先点亮浮层再去找：没亮的时候 scan()/box() 都是空操作，下面的过程
+        # 就一点都看不见了。
+        self._overlay_show(frame)
+        self._overlay_scan(
+            frame.to_screen(Rect(0, int(frame.height * 0.5), frame.width, frame.height)),
+            "扫描输入框",
+        )
         composer, source = self._locator().composer(frame)
         if composer is None:
             # 生成回答时输入框会被"停止"按钮顶掉，这时候报"重新识别目标"
@@ -253,10 +345,16 @@ class Runner:
         return rows
 
     def _chat_title_lines(self, frame: locator.Frame) -> list[ocr.OcrLine]:
-        """消息区顶部显示的当前对话名。"""
+        """消息区顶部显示的当前对话名。
+
+        顶部这一条的高度跟着窗口走：小窗口里标题就在 140 像素上下，大窗口里
+        也差不多，但高 DPI 下会整体下移。所以取"窗口高度的 18%，最少 180"，
+        两边都能覆盖，又不会把下面的正文读进来。
+        """
 
         edge = self._sidebar_right(frame, None)
-        region = Rect(edge + 2, 0, min(frame.width, edge + 1200), 170)
+        height = int(min(frame.height, max(180, frame.height * 0.18)))
+        region = Rect(edge + 2, 0, min(frame.width, edge + 1200), height)
         crop = frame.bitmap.crop(region.left, region.top, region.right, region.bottom)
         lines = [line for line in ocr.recognize(crop) if line.width >= 40]
         return [
@@ -268,7 +366,12 @@ class Runner:
         if not title:
             return True
         lines = self._chat_title_lines(frame)
-        return ocr.find_line(lines, title, 0.9, strict=True) is not None
+        if ocr.find_line(lines, title, 0.9, strict=True) is not None:
+            return True
+        # 标题栏里那几个中文也可能被 OCR 整段丢掉（`PDF 渲染与 DOCX 处理`
+        # 读成 `PDF DOCX`）。核对是只读的，放宽一点没有风险：认不出中文就
+        # 按剩下的字认，总比把一次成功的切换判成失败、再点一次强。
+        return any(self._dropped_match(line.text, title) >= 0.62 for line in lines)
 
     def _verify_conversation(self, hwnd: int, title: str, timeout: float) -> bool:
         deadline = time.monotonic() + max(0.5, timeout)
@@ -293,6 +396,39 @@ class Runner:
             return self._locator().composer_is_empty(frame, composer)
         except Exception:
             return None
+
+    def _composer_holds(self, hwnd: int, composer: Rect, content: str) -> bool:
+        """输入框里是不是还留着刚粘进去的那段字。
+
+        `composer_is_empty` 只认"占位符回来了"，而占位符是灰的，OCR 经常整个
+        读不到——读不到就返回 False（还有内容），于是一条已经发出去的消息被
+        判成失败，还会再补按一次 Enter。
+
+        这里换个方向问：我们知道自己粘了什么。那段字还在框里，就说明真没发
+        出去；不在了，就说明发出去了。短内容不做这个判断（几个字太容易撞上
+        界面别处的文字），按"还有内容"处理，宁可保守。
+        """
+
+        key = ocr.normalize(content)
+        if len(key) < 8:
+            return True
+        probe = key[: min(len(key), 24)]
+        try:
+            frame = self._frame(hwnd)
+        except AutomationError:
+            return True
+        region = Rect(composer.left, composer.top, composer.right, composer.bottom)
+        if region.height < 40 or region.width < 120:
+            return True
+        try:
+            crop = frame.bitmap.crop(region.left, region.top, region.right, region.bottom)
+            lines = ocr.recognize(crop)
+        except Exception:
+            return True
+        if not lines:
+            return True
+        text = ocr.normalize(" ".join(line.text for line in lines))
+        return self._ordered_overlap(probe, text) >= 0.6
 
     def _wait_send_ready(
         self,
@@ -321,114 +457,15 @@ class Runner:
             slot, kind = self._locator().send_slot(frame, composer)
         return frame, composer, slot, kind
 
-    def _locate_row(
-        self,
-        hwnd: int,
-        composer: Optional[Rect],
-        title: str,
-        scrolls: int = 40,
-    ) -> tuple[locator.Frame, Optional[ocr.OcrLine]]:
-        """在侧边栏列表里找到标题对应的那一行。
+    # 这里以前有一条"在侧边栏里翻列表找对话"的路径：回顶、逐屏下翻、点开
+    # 「Show more」再翻。2.10 把它整条删掉了。
+    #
+    # 理由不是它慢，而是它永远不可能可靠：列表按项目分组、超过五条就折叠、
+    # 历史长了要翻几十屏，而且每翻一屏都要重新截图识别——翻的过程中用户
+    # 一动鼠标，列表就滚到别处去了。搜索不受这些影响：不依赖当前停在哪个
+    # 对话上，也不改变列表的滚动位置。切对话只有这一条链路。
 
-        四层，从便宜到贵：
-          1. 当前这一屏里就有；
-          2. 回到顶部，再一屏一屏往下翻，直到列表不再变化（翻到底了）；
-          3. 列表里有「Show more」就点开，新露出来的对话再找一遍；
-          4. 交给调用方去用搜索框。
-
-        第 2 层不写死"翻几屏就放弃"——历史长的账号一屏一屏数根本数不完。
-        第 3 层是因为这个列表是按项目分组的，一个项目下超过五条就折成一行
-        「Show more」：折叠着的那部分根本不在列表里，只滚不点永远找不到。
-        """
-
-        frame: locator.Frame = self._frame(hwnd)
-        for _ in range(3):
-            frame, row = self._scroll_and_find(hwnd, composer, title, scrolls)
-            if row is not None:
-                return frame, row
-            if not self._click_show_more(hwnd):
-                break
-        return frame, None
-
-    def _scroll_and_find(
-        self,
-        hwnd: int,
-        composer: Optional[Rect],
-        title: str,
-        scrolls: int,
-    ) -> tuple[locator.Frame, Optional[ocr.OcrLine]]:
-        """先回到顶部，再一屏一屏往下翻，边翻边找。"""
-
-        frame = self._frame(hwnd)
-        rows = self._list_rows(frame, composer)
-        row = ocr.find_line(rows, title, 0.9, strict=True)
-        if row is not None:
-            return frame, row
-
-        region = self._list_region(frame, composer)
-        point = frame.point_to_screen(region.center)
-        signature = tuple(item.text for item in rows)
-
-        # 回到顶部：连续上滚，直到列表内容不再变化
-        for _ in range(12):
-            winapi.scroll(point, -10)
-            time.sleep(0.35)
-            frame = self._frame(hwnd)
-            rows = self._list_rows(frame, composer)
-            row = ocr.find_line(rows, title, 0.9, strict=True)
-            if row is not None:
-                return frame, row
-            current = tuple(item.text for item in rows)
-            if current == signature:
-                break
-            signature = current
-
-        # 逐屏向下找，一直翻到列表不动为止
-        limit = max(1, int(scrolls))
-        for index in range(1, limit + 1):
-            winapi.scroll(point, 6)
-            time.sleep(0.4)
-            frame = self._frame(hwnd)
-            rows = self._list_rows(frame, composer)
-            row = ocr.find_line(rows, title, 0.9, strict=True)
-            if row is not None:
-                return frame, row
-            current = tuple(item.text for item in rows)
-            if current == signature:
-                self.log("info", f"已翻到列表底部，没有「{title}」。")
-                break
-            signature = current
-            if index % 5 == 0:
-                # 列表很长时翻起来要一会儿，得让人看见还在动。
-                self.log("info", f"列表里暂时没有「{title}」，已往下翻 {index} 屏。")
-        return frame, None
-
-    # 侧边栏里"折叠着更多"的那一行，不同版本叫法不一样。
-    SHOW_MORE_KEYS = frozenset(
-        ocr.normalize(item)
-        for item in ("show more", "show less", "see more", "see all", "显示更多", "查看更多", "展开更多")
-    )
-
-    def _click_show_more(self, hwnd: int) -> bool:
-        """点开列表里的「Show more」，点到了就返回 True。
-
-        一个项目下超过五条对话就会折成这一行。折叠着的那部分不在列表里，
-        只滚不点，永远也找不到。
-        """
-
-        frame, composer, rows = self._rows_once(hwnd)
-        for row in rows:
-            stripped, _ = conversations.strip_icon(row.text)
-            if ocr.normalize(stripped) not in self.SHOW_MORE_KEYS:
-                continue
-            if winapi.foreground_window() != int(hwnd):
-                self.log("warning", "目标窗口不在前台，没有点「Show more」。")
-                return False
-            winapi.click(frame.point_to_screen(row.center))
-            time.sleep(min(self._delay(), 1.2))
-            self.log("info", f"点开了「{stripped}」，继续找。")
-            return True
-        return False    # 搜索面板是**分组**的：命令在「Quick actions」下，对话在「Chats」下，
+    # 搜索面板是**分组**的：命令在「Quick actions」下，对话在「Chats」下，
     # 文件在「Recent files」下。搜一个词往往三边都有结果，所以"认出一行字
     # 像目标标题"远远不够——必须先确定这一行属于哪个分组。
     SEARCH_HEADERS = frozenset(
@@ -466,12 +503,47 @@ class Runner:
         )
     )
 
-    # 面板浮在窗口水平方向的正中，左边那一窄条是原来的对话列表。只在这个
-    # 范围里找，侧边栏里同名的行就不会被当成面板的一部分。
-    PANEL_SPAN = (0.22, 0.78)
+    # 面板宽度不能写死成窗口的某个比例。1920 宽的窗口上面板就有 1130 宽
+    # （59%），比例卡在 0.22~0.78 时左边那条 20 像素正好把输入框和「All」
+    # 挡在外面——面板明明开着，却被认成"没开"，于是又去点放大镜，把它关掉。
+    #
+    # 面板宽度是**有上限**的（约 1130 像素），所以窗口越窄，它的左边缘越靠左：
+    # 1200 宽的窗口上面板从 72 像素开始，只占 6%。范围必须放得比这更宽，
+    # 具体是哪一列交给"分组标题"和"筛选标签"去定，不靠比例猜。
+    PANEL_SPAN = (0.02, 0.98)
+
+    # 窗口最上面这一条是菜单栏和标题栏（File / Edit / View / Help）。
+    # 它们的左边缘和面板内容一样是对齐的，不排掉的话「Help」会被当成搜索框，
+    # 点下去点在菜单上。
+    SEARCH_CHROME_BOTTOM = 56
 
     def _panel_span(self, frame: locator.Frame) -> tuple[float, float]:
         return frame.width * self.PANEL_SPAN[0], frame.width * self.PANEL_SPAN[1]
+
+    def _panel_left(self, frame: locator.Frame) -> float:
+        """面板左边缘不可能比这条线更左。
+
+        两个来源，取更靠右的那个：
+
+          · 认出来的侧边栏右边界。面板开在内容区上，一定在侧边栏右边；
+          · 窗口宽度的 5%。面板是居中的，再窄的窗口也不会让面板压到最左边
+            那条图标栏上（1200 宽时面板从 73 开始，占 6%）。
+
+        侧边栏边界只在"它确实像侧边栏"时才用：面板打开后整个背景被压暗，
+        `detect_panels` 会认不出侧边栏，反而把窗口右边框当成它（实测 1600 宽
+        时返回 1595）。所以边界超过窗口宽度 30% 就当没认出来。1600 宽时侧边
+        栏是 586（36.6%），刚好落在这一条外面——而那一档面板从 244 开始，用
+        5% 的兜底正好，不会把面板自己排除掉。
+        """
+
+        low = self._panel_span(frame)[0]
+        try:
+            edge = vision.detect_sidebar_right(frame.bitmap) or 0
+        except Exception:
+            edge = 0
+        if 120 < edge <= frame.width * 0.3:
+            return max(low, edge + 8.0)
+        return max(low, frame.width * 0.05)
 
     @staticmethod
     def _is_title(text: str, titles: frozenset[str]) -> bool:
@@ -517,9 +589,12 @@ class Runner:
         """
 
         low, high = self._panel_span(frame)
+        low = self._panel_left(frame)
         ceiling = frame.height * 0.55
         inside = [
-            line for line in lines if 40 < line.top < ceiling and low < line.left < high
+            line
+            for line in lines
+            if self.SEARCH_CHROME_BOTTOM < line.top < ceiling and low < line.left < high
         ]
         inside.sort(key=lambda line: line.top)
         for line in inside:
@@ -576,28 +651,62 @@ class Runner:
     def _filter_row(self, lines: list[ocr.OcrLine], frame: locator.Frame) -> list[ocr.OcrLine]:
         """面板底部那排筛选标签，从左到右。
 
-        只认"同一行上至少三个标签"的组合：单独一个「Chats」可能只是分组
-        标题，三个以上挨着排开才说明这是那排标签。
+        只认"同一行上至少三个标签、而且彼此挨着"的组合：单独一个「Chats」
+        可能只是分组标题，三个以上横向排开才说明这是那排标签。
+
+        按词算，不按行算。OCR 经常把挨得近的两个标签并成一段
+        （`Files Text` 读成一行），按行匹配的话这一段既不是 Files 也不是
+        Text，一排五个标签只剩两个能对上，整排就被丢掉了——面板于是被认成
+        "没打开"。拆成词再比，合并与否都不影响。
+
+        还要按"挨着"串成一串，不能只看纵向位置。范围放宽到 2% 之后，窗口
+        右边那片对话正文里也可能有同一高度的行（实测 1600 宽时，正文里
+        `codex-clipboard-28716eb8...` 那一行就和标签同高），只按 top 归组会
+        把它拉进来，面板右边缘于是被算到 1532——框一下横跨整个窗口。
+        标签之间只隔三十几像素，正文离得远，按间距一断就分开了。
         """
 
         low, high = self._panel_span(frame)
-        candidates = [
-            line for line in lines if low < line.left < high and ocr.normalize(line.text) in self.FILTER_LABELS
-        ]
-        groups: list[list[ocr.OcrLine]] = []
-        for line in candidates:
-            for group in groups:
-                if abs(line.top - group[0].top) <= 8:
-                    group.append(line)
+        candidates: list[tuple[ocr.OcrLine, int]] = []
+        for line in lines:
+            if not (low < line.left < high):
+                continue
+            tokens = [ocr.normalize(part) for part in line.text.split() if part.strip()]
+            matched = [token for token in tokens if token in self.FILTER_LABELS]
+            if matched:
+                candidates.append((line, len(matched)))
+        if not candidates:
+            return []
+
+        same_row: list[list[tuple[ocr.OcrLine, int]]] = []
+        for item in sorted(candidates, key=lambda pair: pair[0].top):
+            for group in same_row:
+                if abs(item[0].top - group[0][0].top) <= 8:
+                    group.append(item)
                     break
             else:
-                groups.append([line])
-        if not groups:
+                same_row.append([item])
+
+        best: list[tuple[ocr.OcrLine, int]] = []
+        best_score = 0
+        for group in same_row:
+            group.sort(key=lambda pair: pair[0].left)
+            chain: list[tuple[ocr.OcrLine, int]] = []
+            for item in group:
+                if chain and item[0].left - chain[-1][0].right > 120:
+                    # 断开：这不是同一排标签，中间隔着一大片空白。
+                    score = sum(count for _, count in chain)
+                    if score > best_score:
+                        best, best_score = chain, score
+                    chain = []
+                chain.append(item)
+            score = sum(count for _, count in chain)
+            if score > best_score:
+                best, best_score = chain, score
+
+        if best_score < 3:
             return []
-        best = max(groups, key=len)
-        if len(best) < 3:
-            return []
-        return sorted(best, key=lambda item: item.left)
+        return [line for line, _ in best]
 
     def _panel_column(
         self, lines: list[ocr.OcrLine], frame: locator.Frame
@@ -607,6 +716,11 @@ class Runner:
         底部那排筛选标签最可靠：面板一打开它就在，加载中、没结果时都在，
         五个标签的第一个就贴着面板的左边缘。分组标题只在有结果时才有，
         拿它当备选。
+
+        两个都没有就是"没开"。这里以前还有第三招——数哪一列最常被当作行的
+        起点——但那招在侧边栏上永远成立（会话标题从上到下都对齐），于是
+        面板关着也被认成开着，接着把侧边栏里的会话标题当搜索框，把词粘进了
+        对话输入框。宁可说"没开"，让上层去按 Ctrl+K。
         """
 
         row = self._filter_row(lines, frame)
@@ -626,8 +740,17 @@ class Runner:
         不靠占位文字认输入框：搜过一次之后词会留在框里，占位文字就没了，
         按"Search ChatGPT"去找会一直找不到——明明面板就在眼前。
 
-        面板是居中的，所以右边缘可以按"和左边缘对称"算出来，比拿某一行的
-        右端去量准：面板右边还压着对话正文，正文里那些长行会把框拉出去。
+        面板是居中的，所以右边缘按"和左边缘对称"算出来，比拿某一行的右端
+        去量准：面板右边还压着对话正文，正文里那些长行会把框拉出去；底部
+        那排标签也只铺到 "Text" 为止，量出来比面板窄一大截。
+
+        实测（1600x1000）：面板左 244、右 1364，中心 804，正好是客户区中心。
+        按左边缘镜像出来 1361，差 3 个像素。
+
+        纵向先按排版**推**一个框，再拿识别到的字去**校**。反过来不行：输入框
+        里那个词是高亮的蓝底白字，OCR 经常整个读不到，而下面第一行结果一定
+        读得到。只看"这一列最靠上的一行"，认出来的就是结果行，框会整体掉到
+        输入框下面去（实测掉到 248，真正的输入框在 144~200）。
         """
 
         frame = self._frame(hwnd)
@@ -638,17 +761,96 @@ class Runner:
 
         row = self._filter_row(lines, frame)
         floor = row[0].top - 40 if row else frame.height
+        left_edge = column - 10
+        right_edge = min(
+            frame.width - 8,
+            max(frame.width - left_edge, column + 320),
+        )
+
+        band = self._panel_box_guess(lines, frame, left_edge, right_edge, floor)
         column_lines = [
-            line for line in lines if column - 20 <= line.left <= column + 40 and line.top < floor
+            line
+            for line in lines
+            if column - 24 <= line.left <= column + 48
+            and self.SEARCH_CHROME_BOTTOM < line.top < floor
+            # 分组标题（Chats / Quick actions）也贴着这一列，但它不是输入框。
+            and not self._is_title(line.text, self.SEARCH_HEADERS | self.OTHER_SECTIONS)
         ]
-        if not column_lines:
-            return frame, None
-        first = min(column_lines, key=lambda line: line.top)
+        if band is not None:
+            column_lines = [
+                line
+                for line in column_lines
+                if band.top - 8 <= line.top <= band.bottom + 8
+            ]
+
+        if column_lines:
+            first = min(column_lines, key=lambda line: line.top)
+            return frame, Rect(
+                left_edge + 12,
+                max(0, first.top - 12),
+                right_edge - 12,
+                first.bottom + 12,
+            )
+
+        # 面板认出来了，但输入框那一行没认出来（字太小、光标在闪、或者刚清空）。
+        # 这时候不该说"面板没开"——面板就开在那儿。按分组标题往上退一行，
+        # 给一个够用的矩形：点它的左侧仍然会落进输入框。
+        return frame, band
+
+    def _panel_box_guess(
+        self,
+        lines: list[ocr.OcrLine],
+        frame: locator.Frame,
+        left_edge: float,
+        right_edge: float,
+        floor: float,
+    ) -> Optional[Rect]:
+        """没有输入框文字时，按分组标题的位置反推输入框那一行。
+
+        面板的排版是固定的：输入框在最上面，往下隔一小段是第一个分组标题。
+        所以"第一个标题再往上一段"就是输入框。这段距离是界面上固定的间距，
+        跟着缩放走、不跟窗口大小走，所以按标题自己的高度算。
+
+        从**底边**往上量，不从顶边往下量。底边（标题上方约一个标题高）在
+        1200 和 1600 两个尺寸上都量得准，而输入框的高度会随窗口大小变（1600
+        宽时 56 像素，1200 宽时 72），从顶边往下量总会差一截：实测 1200 宽
+        时框的顶边掉到 89，真正的输入框从 58 就开始了。
+
+        连标题都没有（还在加载）就按"面板垂直居中"反推：底部那排标签的位置
+        就是面板的底边，把窗口高度减掉它，就是面板顶边。
+        """
 
         low, high = self._panel_span(frame)
-        left_edge = max(low, min(column - 30, high - 200))
-        right_edge = min(high, max(frame.width - left_edge, left_edge + 200))
-        return frame, Rect(left_edge + 12, max(0, first.top - 12), right_edge - 12, first.bottom + 12)
+        low = self._panel_left(frame)
+        headers = [
+            line
+            for line in lines
+            if low < line.left < high
+            and self.SEARCH_CHROME_BOTTOM < line.top < min(floor, frame.height * 0.7)
+            and self._is_title(line.text, self.SEARCH_HEADERS)
+        ]
+        if headers:
+            head = min(headers, key=lambda line: line.top)
+            bottom = max(40.0, head.top - head.height)
+            top = max(0.0, bottom - max(46.0, head.height * 3.7))
+            return Rect(left_edge + 12, top, right_edge - 12, bottom)
+
+        row = self._filter_row(lines, frame)
+        if row:
+            panel_bottom = row[0].top + row[0].height * 3
+            top = max(0.0, frame.height - panel_bottom)
+            return Rect(left_edge + 12, top, right_edge - 12, top + 56)
+        if not lines:
+            return None
+        top = max(0, min(frame.height * 0.08, 160))
+        return Rect(left_edge + 12, top, right_edge - 12, top + 56)
+
+    def _panel_open(self, hwnd: int) -> tuple[locator.Frame, bool]:
+        """面板此刻开没开。判据是面板自己的东西在不在，而不是"输入框认没认出来"。"""
+
+        frame = self._frame(hwnd)
+        lines = ocr.recognize(frame.bitmap)
+        return frame, self._panel_column(lines, frame) is not None
 
     # 标题栏那一行（「Codex ⌄」+ 铃铛 + 放大镜）的垂直位置。窗口大小变了、
     # 缩放比例变了它都不动，所以先按这个固定范围扫，扫不到再用 OCR 认「Codex」。
@@ -677,26 +879,58 @@ class Runner:
         return None
 
     def _header_bands(self, frame: locator.Frame, right: int) -> list[tuple[int, int]]:
-        """先给固定范围，再给一个用 OCR 算出来的范围。"""
+        """标题栏那一行的几条候选横带，最准的排在最前面。
 
-        bands = [self.HEADER_BAND]
-        try:
-            strip = frame.bitmap.crop(0, 0, min(frame.width, right), min(frame.height, 220))
-            head = ocr.find_text(ocr.recognize(strip), "Codex", 0.8)
-        except Exception:
-            head = None
+        不能只给一个固定像素范围：窗口可以是任意大小，同一个界面在 125% 和
+        200% 缩放下标题栏的高度也不一样。所以三条路一起给：
+
+          1. OCR 认出「Codex」——它和放大镜在同一行，认出来就直接对上了；
+          2. 一个够宽的固定范围（覆盖常见的标题栏高度）；
+          3. 按窗口高度取一条比例带，兜住特别大或特别小的窗口。
+        """
+
+        bands: list[tuple[int, int]] = []
+        head = self._codex_row(frame, right)
         if head is not None:
-            bands.insert(0, (max(0, head.top - 6), min(frame.height, head.bottom + 6)))
+            bands.append((max(0, head.top - 10), min(frame.height, head.bottom + 10)))
+        top, bottom = self.HEADER_BAND
+        bands.append((max(0, min(top, frame.height - 20)), min(bottom, frame.height)))
+        proportional = (
+            max(0, int(frame.height * 0.03)),
+            min(frame.height, max(56, int(frame.height * 0.11))),
+        )
+        if proportional not in bands:
+            bands.append(proportional)
         return bands
+
+    def _codex_row(self, frame: locator.Frame, right: int) -> Optional[ocr.OcrLine]:
+        """侧边栏标题栏里「Codex」那一行在哪。
+
+        它的高度就是标题栏的高度，和窗口总高无关——窗口拉高十倍，它也不动。
+        所以用它的位置当横带，比按比例算准。
+        """
+
+        try:
+            height = min(frame.height, max(160, int(frame.height * 0.16)))
+            strip = frame.bitmap.crop(0, 0, min(frame.width, max(120, right)), height)
+            return ocr.find_text(ocr.recognize(strip), "Codex", 0.8)
+        except Exception:
+            return None
 
     @staticmethod
     def _icon_in_band(
         frame: locator.Frame, right: int, top: int, bottom: int
     ) -> Optional[tuple[int, int]]:
-        """在一条横带里找图标大小的墨迹块，取最右边那个。"""
+        """在一条横带里找图标大小的墨迹块，取最右边那个。
+
+        宽度范围按"图标"来定，不按窗口比例：窗口拉到 3840 宽，标题栏里那个
+        放大镜还是 18 像素——跟着窗口宽度放大的是内容，不是图标。范围取
+        8~44，100% 到 200% 缩放都能覆盖。
+        """
 
         if bottom <= top + 4:
             return None
+        narrow, wide = 8, 44
         runs: list[tuple[int, int]] = []
         start = None
         for x in range(40, max(41, right - 6)):
@@ -708,7 +942,7 @@ class Runner:
                 start = None
         if start is not None:
             runs.append((start, max(41, right - 6)))
-        icons = [item for item in runs if 10 <= item[1] - item[0] <= 30]
+        icons = [item for item in runs if narrow <= (item[1] - item[0]) <= wide]
         if not icons:
             return None
         left, end = icons[-1]
@@ -748,7 +982,12 @@ class Runner:
         return rows
 
     def _best_row(
-        self, rows: list[list[ocr.OcrLine]], title: str
+        self,
+        rows: list[list[ocr.OcrLine]],
+        title: str,
+        threshold: float = 0.75,
+        reject_files: bool = True,
+        dropped: bool = False,
     ) -> Optional[ocr.OcrLine]:
         """挑出最像目标标题的那一行，返回能点的那一块。
 
@@ -757,8 +996,16 @@ class Runner:
         前几段"逐个比，取最好的那个，不做整行硬拼。
 
         不要求一模一样：结果行前面常带着一个图标，OCR 会把它读成 "0" 或者
-        一个字母（`0 20261021 18`）。阈值放在 0.75——低于这个就宁可认成没
-        找到，也不乱点一条别的对话。
+        一个字母（`0 20261021 18`）。阈值默认 0.75——低于这个就宁可认成没
+        找到，也不乱点一条别的对话。调用方可以在"严格那档没找到"之后放宽到
+        0.62 再试一次，这时候必须同时排除文件名：搜 `20261107` 时面板里既
+        有对话也有 `2026-11-07-liquid-glass-c52.md`，两者的字面几乎一样，
+        点错就打开了文件。
+
+        `dropped=True` 是第三档，专门对付"OCR 把中文整段丢掉"：`PDF 渲染与
+        DOCX 处理` 在结果行里读回来只有 `PDF DOCX`，按字面比永远对不上，
+        而它明明就是目标。这一档只认"认出来的字能按顺序在标题里找到、而且
+        一个都不多余"——反过来不成立就不算，避免点到别的对话上。
         """
 
         best: Optional[ocr.OcrLine] = None
@@ -767,7 +1014,13 @@ class Runner:
             for take in range(1, len(row) + 1):
                 head = row[:take]
                 text = " ".join(item.text for item in head)
-                value = ocr.title_similarity(text, title)
+                if reject_files and self._looks_like_file(text, title):
+                    continue
+                value = (
+                    self._dropped_match(text, title)
+                    if dropped
+                    else ocr.title_similarity(text, title)
+                )
                 if value <= score:
                     continue
                 left = min(item.left for item in head)
@@ -776,8 +1029,50 @@ class Runner:
                 bottom = max(item.bottom for item in head)
                 best = ocr.OcrLine(text, left, top, right - left, bottom - top)
                 score = value
-        return best if score >= 0.75 else None
+        return best if score >= threshold else None
 
+    def _dropped_match(self, text: str, title: str) -> float:
+        """OCR 掉字之后还能不能认出这是同一个标题，返回 0 或 0.62~0.9 的分数。"""
+
+        key = ocr.normalize(title)
+        flat = ocr.normalize(text)
+        if not key or not flat:
+            return 0.0
+        shared = self._ordered_overlap(flat, key) * len(flat)
+        # 认出来的字里最多容忍两个对不上的：结果行前面那个对话气泡图标会被
+        # OCR 读成 "0" 或者一个字母（`O PDF DOCX`）。多出更多字，说明这是
+        # 另一个标题，不是掉字。
+        if len(flat) - shared > 2:
+            return 0.0
+        # 标题里有多少字被认出来了。掉一半以上就不认——太少了不足以确定身份。
+        covered = shared / len(key)
+        if covered < 0.5:
+            return 0.0
+        return 0.62 + 0.28 * covered
+
+    # 结果行末尾带这些后缀的，是文件不是对话。
+    FILE_SUFFIXES = (
+        ".md", ".txt", ".json", ".py", ".ts", ".tsx", ".js", ".log", ".csv",
+        ".pdf", ".png", ".jpg", ".jpeg", ".html", ".css", ".yaml", ".yml",
+        ".sh", ".ps1", ".sql", ".zip", ".docx", ".xlsx", ".pptx", ".toml",
+    )
+
+    @classmethod
+    def _looks_like_file(cls, text: str, title: str) -> bool:
+        """这段文字像不像一个文件名。
+
+        只有在标题本身也带同样的后缀时才不排除——真有一个对话就叫
+        `notes.md` 的话，它仍然是对话。
+        """
+
+        body = text.strip().lower()
+        if not body:
+            return False
+        wanted = title.strip().lower()
+        for suffix in cls.FILE_SUFFIXES:
+            if body.endswith(suffix):
+                return not wanted.endswith(suffix)
+        return False
 
     def _search_result(
         self, hwnd: int, title: str, timeout: float = 4.0
@@ -790,10 +1085,25 @@ class Runner:
         分组要等结果出来才有，所以"没看到分组"不等于"没有结果"：可能还在
         加载。给它几秒，最后仍然没有「Chats」分组，才下结论说这个词在对话里
         没有结果。
+
+        匹配分两档：先用 0.75 找"很像的"，找不到再放宽到 0.62 但排除文件名。
+        放宽的那一档会写一行日志——用户看得见"这次是靠放宽才认出来的"，
+        而不是以为一切如常。
         """
 
         deadline = time.monotonic() + max(1.0, timeout)
         frame = self._frame(hwnd)
+        # 结果就在面板下半部分。先扫这一块，再逐轮读——否则用户看到的是一段
+        # 完全静止的等待。
+        self._overlay_show(frame)
+        self._overlay_scan(
+            frame.to_screen(
+                Rect(0, int(frame.height * 0.08), frame.width, int(frame.height * 0.75))
+            ),
+            "匹配搜索结果",
+        )
+        chat: Optional[ocr.OcrLine] = None
+        relaxed = False
         while True:
             frame = self._frame(hwnd)
             lines = ocr.recognize(frame.bitmap)
@@ -803,8 +1113,21 @@ class Runner:
                 row = self._filter_row(lines, frame)
                 floor = row[0].top - 40 if row else 0
                 top, bottom = self._section_bounds(lines, chat, column, floor)
-                hit = self._best_row(self._section_rows(lines, top, bottom, column), title)
+                rows = self._section_rows(lines, top, bottom, column)
+                hit = self._best_row(rows, title, threshold=0.75)
                 if hit is not None:
+                    return frame, hit
+                hit = self._best_row(rows, title, threshold=0.62, reject_files=True)
+                if hit is not None:
+                    if not relaxed:
+                        relaxed = True
+                        self.log("info", f"「{title}」是按放宽的相似度认出来的：{hit.text}")
+                    return frame, hit
+                hit = self._best_row(
+                    rows, title, threshold=0.62, reject_files=True, dropped=True
+                )
+                if hit is not None:
+                    self.log("info", f"「{title}」的中文被 OCR 丢掉了，按剩下的字认出来：{hit.text}")
                     return frame, hit
             if time.monotonic() >= deadline:
                 break
@@ -838,51 +1161,117 @@ class Runner:
     def _open_search(
         self, hwnd: int, frame: locator.Frame, note: Optional[Callable[[str], None]] = None
     ) -> tuple[Optional[locator.Frame], Optional[Rect]]:
-        """点放大镜打开搜索面板，返回面板所在画面和输入框的矩形。
+        """把搜索面板弄到"开着"的状态，返回面板所在画面和输入框的矩形。
 
-        只走放大镜这一条路：标题栏里那个图标点下去，面板浮到窗口正中。
-        开没开不看像素变化，看画面上有没有面板自己的东西——分组标题或者
-        底部那排筛选标签，有一样在就说明面板在。
+        四条路，从便宜到贵，每条都以"面板自己的东西出现了"为准：
+
+          1. 先看它是不是本来就开着（放大镜是开关，再点一下会把它关掉）；
+          2. 点标题栏里的放大镜；
+          3. 按 Ctrl+K——桌面版认这个键，而且面板打开后焦点直接在输入框里；
+          4. 按几何位置点：侧边栏右边缘往左一点、标题栏那一行。
+
+        以前只有第 2 条，而且"没认出输入框"就等于"面板没开"，于是连着点三次
+        放大镜——第一下打开，第二下关掉，第三下又打开，最后报"面板没出现"。
+        现在"面板开没开"和"输入框认没认出来"是两件事，分开判断。
         """
 
         if winapi.foreground_window() != int(hwnd):
-            self.log("warning", "目标窗口不在前台，没有去点放大镜。")
-            return None, None
+            if not winapi.ensure_foreground(hwnd):
+                self.log("warning", "目标窗口不在前台，没有去点放大镜。")
+                return None, None
+            frame = self._frame(hwnd)
 
-        point = self._magnifier_point(frame)
-        if point is None:
-            self.log("warning", "标题栏里没找到放大镜。")
-            return None, None
-        self._overlay_box(
-            frame.to_screen(Rect(point[0] - 14, point[1] - 14, point[0] + 14, point[1] + 14)),
-            "search",
-            "放大镜",
+        # 面板在标题栏那一带，先标出"在找它"，再开始认。
+        self._overlay_show(frame)
+        self._overlay_scan(
+            frame.to_screen(Rect(0, 0, frame.width, int(frame.height * 0.62))), "查找搜索框"
         )
-        if note is not None:
-            note("打开搜索")
 
-        # 面板可能已经开着（上一次留下的，或者上一次点了没关掉）。开着就直接
-        # 用——放大镜是开关，再点一下反而会把它关掉。
         fresh, box = self._search_input(hwnd)
         if box is not None:
             self._overlay_box(fresh.to_screen(box), "search", "搜索框")
             self.log("info", "搜索面板本来就开着。")
             return fresh, box
 
-        # 第一次点击有时只是把窗口激活，面板不弹。点两三次都算正常，
-        # 每次都以"画面上有没有分组标题"为准，没出来就再点一次。
-        for attempt in range(3):
-            winapi.click(frame.point_to_screen(point))
-            time.sleep(0.9)
-            fresh, box = self._search_input(hwnd)
+        if note is not None:
+            note("打开搜索")
+
+        point = self._magnifier_point(frame)
+        if point is not None:
+            self._overlay_box(
+                frame.to_screen(Rect(point[0] - 14, point[1] - 14, point[0] + 14, point[1] + 14)),
+                "search",
+                "放大镜",
+            )
+            self._click(frame.point_to_screen(point))
+            fresh, box = self._wait_panel(hwnd)
             if box is not None:
                 self._overlay_box(fresh.to_screen(box), "search", "搜索框")
                 self.log("info", "搜索面板已打开。")
                 return fresh, box
-            if attempt < 2:
-                self.log("info", "还没看到搜索面板，再点一次放大镜。")
-        self.log("warning", "点了放大镜，但画面上没有出现搜索面板。")
+            self.log("info", "点了放大镜，画面上还没看到面板。")
+        else:
+            self.log("warning", "标题栏里没找到放大镜。")
+
+        # 键盘兜底。不依赖任何图标位置，窗口怎么改版都不影响。
+        winapi.ctrl_k()
+        fresh, box = self._wait_panel(hwnd, 1.4)
+        if box is not None:
+            self._overlay_box(fresh.to_screen(box), "search", "搜索框")
+            self.log("info", "搜索面板已打开（Ctrl+K）。")
+            return fresh, box
+
+        # 再点一次：第一次点击有时只是把窗口激活，面板并不弹。
+        if point is not None:
+            self._click(frame.point_to_screen(point))
+            fresh, box = self._wait_panel(hwnd)
+            if box is not None:
+                self._overlay_box(fresh.to_screen(box), "search", "搜索框")
+                self.log("info", "搜索面板已打开（第二次点击）。")
+                return fresh, box
+
+        # 最后一招：按几何位置点。图标挪了位置、OCR 认不出来时还能试一次。
+        guess = self._magnifier_guess(frame)
+        if guess is not None and guess != point:
+            self.log("info", "按几何位置再点一次放大镜。")
+            self._click(frame.point_to_screen(guess))
+            fresh, box = self._wait_panel(hwnd)
+            if box is not None:
+                self._overlay_box(fresh.to_screen(box), "search", "搜索框")
+                return fresh, box
+
+        self.log("warning", "四条路都试过了，搜索面板没有出现。")
         return None, None
+
+    def _wait_panel(
+        self, hwnd: int, timeout: float = 1.8
+    ) -> tuple[Optional[locator.Frame], Optional[Rect]]:
+        """等面板出现。以"面板自己的东西"为准，不等固定时间。"""
+
+        deadline = time.monotonic() + max(0.4, timeout)
+        frame: Optional[locator.Frame] = None
+        while True:
+            try:
+                frame, box = self._search_input(hwnd)
+            except AutomationError:
+                return frame, None
+            if box is not None:
+                return frame, box
+            if time.monotonic() >= deadline:
+                return frame, None
+            time.sleep(0.25)
+
+    def _magnifier_guess(self, frame: locator.Frame) -> Optional[tuple[int, int]]:
+        """放大镜大概在哪：侧边栏右边缘往左一点，标题栏那一行。
+
+        只在图标真的认不出来时用。位置是相对的——跟着侧边栏走，不写死像素。
+        """
+
+        right = vision.detect_sidebar_right(frame.bitmap) or int(frame.width * 0.3)
+        if right < 160:
+            return None
+        top, bottom = self.HEADER_BAND
+        return (max(60, right - 46), (top + bottom) // 2)
 
     def _switch_conversation(
         self,
@@ -890,9 +1279,16 @@ class Runner:
         title: str,
         step: Optional[Callable[..., None]] = None,
     ) -> None:
+        """切到一个对话。
+
+        只走搜索这一条链路：点放大镜 → 输标题 → 在「Chats」分组里点结果 →
+        核对标题栏。不去滚侧边栏列表——列表会折叠、会分组、会随历史增长而
+        无限变长，翻列表既慢又永远翻不完；搜索是唯一的正解，而且它不依赖
+        应用当前停在哪个对话上。
+        """
+
         strict = bool(self.settings.get("strict_conversation", True))
         frame = self._frame(hwnd)
-        composer, _ = self._locator().composer(frame)
         self.log("info", f"切换对话：{title}")
 
         def note(text: str, tone: str = "accent") -> None:
@@ -910,81 +1306,171 @@ class Runner:
         self._overlay_show(frame)
         note("切换对话")
 
-        # 侧边栏收着的时候列表区里只有图标，翻也翻不出标题。先展开；展不开
-        # 就别在图标上白翻，直接走搜索。
-        if not self.ensure_sidebar(hwnd):
-            self.log("warning", "侧边栏收着，列表里看不到对话，改用搜索框。")
+        fresh, box = self._open_search(hwnd, frame, note)
+        if box is None or fresh is None:
+            self._conversation_failed(hwnd, title, strict, "搜索面板打不开")
+            return
 
-        # 首选路径：侧边栏列表里本来就有这个对话，直接点它。
-        # 这条路不依赖搜索框，也不用关心应用当前停在哪个对话上。
-        frame, row = self._locate_row(hwnd, composer, title)
-        if row is not None:
+        note("输入关键词")
+        self._overlay_box(fresh.to_screen(box), "search", "搜索框")
+        time.sleep(self.BOX_DWELL)
+        # 点输入框靠左的位置，不点正中：面板右边还压着对话正文，框量得
+        # 宽一点窄一点都可能，但贴着左边缘的这一段一定在输入框里。
+        self._click(fresh.point_to_screen((box.left + 120, box.center[1])))
+        time.sleep(0.3)
+        winapi.ctrl_a()
+        winapi.set_clipboard_text(title)
+        winapi.ctrl_v()
+        time.sleep(min(self._delay(), 1.2))
+        if not self._input_has_title(hwnd, title, box):
+            # 没粘进去就再粘一次。以前这里直接往下走，结果是"搜了个空"，
+            # 然后报"搜索结果里没有这个对话"——把焦点问题说成了不存在。
+            self.log("warning", "搜索框里没看到刚输入的关键词，重新粘贴一次。")
+            winapi.ctrl_a()
+            winapi.ctrl_v()
+            time.sleep(min(self._delay(), 1.0))
+            if not self._input_has_title(hwnd, title, box):
+                # 两次都没进去，说明刚才认的那个"搜索框"不是搜索框。
+                # 这时候绝不能往下点——点下去可能把关键词发到对话里。
+                winapi.press_escape()
+                self._conversation_failed(hwnd, title, strict, "关键词没有进入搜索框")
+                return
+        self.log("info", f"已把「{title}」输入搜索框。")
+
+        # 结果就在输入框下面。认出哪一行是目标，框住它，再点——
+        # 比按回车稳：回车落在"当前高亮的那一条"，而高亮在哪并不确定。
+        note("选中结果")
+        frame, hit = self._search_result(hwnd, title)
+        if hit is not None:
+            shown = self._result_label(hit.text, title)
             self._overlay_box(
-                frame.to_screen(Rect(row.left, row.top, row.right, row.bottom)),
+                frame.to_screen(Rect(hit.left - 8, hit.top - 8, hit.right + 8, hit.bottom + 8)),
                 "search",
-                f"对话 · {row.text}",
+                f"搜索结果 · {shown}",
             )
+            self.log("info", f"搜索结果里认出了「{shown}」，点它。")
             time.sleep(self.BOX_DWELL)
-            winapi.click(frame.point_to_screen(row.center))
+            self._click(frame.point_to_screen(hit.center))
             time.sleep(min(self._delay(), 1.2))
             if self._verify_conversation(hwnd, title, 6.0):
                 self.log("info", f"已切换到：{title}")
                 return
-            self.log("warning", f"点了「{row.text}」，但标题栏没有变成「{title}」。")
+            self.log("warning", f"点了搜索结果「{shown}」，标题栏没有变成「{title}」。")
+        else:
+            self.log("warning", f"搜索结果里没认出「{title}」这一条。")
 
-        # 兜底路径：列表里没有（可能折在项目分组里，也可能滚不到底），改用搜索。
-        fresh, box = self._open_search(hwnd, frame, note)
-        if box is not None and fresh is not None:
-            note("输入关键词")
-            time.sleep(self.BOX_DWELL)
-            # 点输入框靠左的位置，不点正中：面板右边还压着对话正文，框量得
-            # 宽一点窄一点都可能，但贴着左边缘的这一段一定在输入框里。
-            winapi.click(fresh.point_to_screen((box.left + 120, box.center[1])))
-            time.sleep(0.3)
-            winapi.ctrl_a()
-            winapi.set_clipboard_text(title)
-            winapi.ctrl_v()
-            time.sleep(min(self._delay(), 1.2))
-            self.log("info", f"已把「{title}」输入搜索框。")
+        # 认不出结果时还有一条路：面板里第一条通常已经是高亮的，回车打开它，
+        # 再用标题栏核对。核对不上就退回来，不会停在别的对话上。
+        note("回车打开第一条", "warning")
+        winapi.press_enter()
+        time.sleep(min(self._delay(), 1.2))
+        if self._verify_conversation(hwnd, title, 5.0):
+            self.log("info", f"已切换到：{title}（回车打开第一条结果）")
+            return
+        self.log("warning", "回车打开的不是目标对话。")
+        winapi.press_escape()
+        self._conversation_failed(hwnd, title, strict, "搜索结果里没有这一条")
 
-            # 结果就在输入框下面。认出哪一行是目标，框住它，再点——
-            # 比按回车稳：回车落在"当前高亮的那一条"，而高亮在哪并不确定。
-            note("选中结果")
-            frame, hit = self._search_result(hwnd, title)
-            if hit is not None:
-                shown = self._result_label(hit.text, title)
-                self._overlay_box(
-                    frame.to_screen(
-                        Rect(hit.left - 8, hit.top - 8, hit.right + 8, hit.bottom + 8)
-                    ),
-                    "search",
-                    f"搜索结果 · {shown}",
-                )
-                self.log("info", f"搜索结果里认出了「{shown}」，点它。")
-                time.sleep(self.BOX_DWELL)
-                winapi.click(frame.point_to_screen(hit.center))
-                time.sleep(min(self._delay(), 1.2))
-                if self._verify_conversation(hwnd, title, 6.0):
-                    self.log("info", f"已切换到：{title}")
-                    return
-                self.log("warning", f"点了搜索结果「{shown}」，标题栏没有变成「{title}」。")
-            else:
-                self.log("warning", f"搜索结果里没认出「{title}」这一条。")
-                winapi.press_escape()
-
-        message = f"没能切换到「{title}」，消息会发到当前对话。"
+    def _conversation_failed(self, hwnd: int, title: str, strict: bool, reason: str) -> None:
         if strict:
-            raise AutomationError(f"找不到对话「{title}」，已停止发送。")
-        self.log("warning", message)
+            raise AutomationError(f"找不到对话「{title}」（{reason}），已停止发送。")
+        self.log("warning", f"没能切换到「{title}」（{reason}），消息会发到当前对话。")
+
+    def _input_has_title(
+        self, hwnd: int, title: str, band: Optional[Rect] = None
+    ) -> bool:
+        """搜索框里是不是真的有这个关键词。
+
+        比对按"按顺序能对上多少个字"算，不按整串相等：OCR 会读错一两个字符，
+        更常见的是**把中文整段丢掉**。实测搜「PDF 渲染与 DOCX 处理」，输入框
+        里读回来的是 `PDF DOCX`——词确实进去了，结果列表也出来了，但按"前
+        八个字符"去比永远对不上，于是被当成"没粘进去"，重试一次再放弃。
+
+        按顺序对上的比例够一半就算进去：`pdf渲染与docx处理` 和 `pdfdocx`
+        有 7 个字符能按顺序对上，7/12 过线；而输错的关键词（上一次搜索留下
+        的 `clarify say`）对上不到十分之一，过不了。
+
+        认不出来时返回 True——宁可放过，也不要因为 OCR 抖动把一次正常的输入
+        当成失败重来一遍。
+        """
+
+        try:
+            frame = self._frame(hwnd)
+        except AutomationError:
+            return True
+        lines = ocr.recognize(frame.bitmap)
+        if not lines:
+            return True
+        key = ocr.normalize(title)
+        if not key:
+            return True
+
+        # 只看输入框那一条横带。搜索结果的标题和关键词长得一样，不限制范围
+        # 的话，上一次搜索留下的结果就能让"没粘进去"看起来像粘进去了。
+        top = 0.0
+        bottom = frame.height * 0.5
+        if band is not None:
+            top = max(0.0, band.top - 40)
+            bottom = band.bottom + 40
+        text = ocr.normalize(
+            " ".join(line.text for line in lines if top <= line.top <= bottom)
+        )
+        if not text:
+            return False
+        if len(key) < 4:
+            return key in text
+        # 有拉丁词就先按词算：OCR 读拉丁字母很稳，中文经常整段丢掉。
+        # `CueRelay 工具箱自检，这一段稍后会被清空` 里只有 `cuerelay` 会被读
+        # 出来，按整串算比例只有三成，永远过不了线。
+        words = [word for word in re.findall(r"[a-z0-9]{3,}", key)]
+        if words:
+            hits = sum(1 for word in words if word in text)
+            if hits * 2 >= len(words):
+                return True
+        return self._ordered_overlap(key, text) >= 0.5
+
+    @staticmethod
+    def _ordered_overlap(key: str, text: str) -> float:
+        """key 里有多少字符能按顺序在 text 里找到（最长公共子序列的比例）。"""
+
+        if not key:
+            return 0.0
+        previous = [0] * (len(text) + 1)
+        for left in key:
+            current = [0]
+            for index, right in enumerate(text, start=1):
+                if left == right:
+                    current.append(previous[index - 1] + 1)
+                else:
+                    current.append(max(current[index - 1], previous[index]))
+            previous = current
+        return previous[-1] / len(key)
 
     # -- 粘贴 ----------------------------------------------------------
 
+    @staticmethod
+    def _text_point(composer: Rect) -> tuple[int, int]:
+        """输入框里"肯定落在文字区"的那个点。
+
+        不能用正中：输入框这个矩形把底下那排控件（模型选择、麦克风、发送）
+        一起框进来了，正中正好落在控件那一行上。点在那儿既不会让文字区拿到
+        焦点，还可能点中麦克风——实测点出过「Voice chat couldn't start」，
+        清空时也因为焦点不在文字区而失败。
+
+        文字区在矩形的上半截，靠左四成：那里离所有控件都远。
+        """
+
+        return (
+            composer.left + int(composer.width * 0.4),
+            composer.top + int(composer.height * 0.28),
+        )
+
     def _paste(self, hwnd: int, frame: locator.Frame, composer: Rect, retry: bool = False) -> None:
+        point = self._text_point(composer)
         if retry:
-            point = (composer.center[0], composer.top + int(composer.height * 0.72))
-        else:
-            point = composer.center
-        winapi.click(frame.point_to_screen(point))
+            # 再往左下挪一点：第一次点可能只是把窗口激活，光标没进去。
+            point = (point[0], min(composer.bottom - 8, point[1] + 12))
+        self._click(frame.point_to_screen(point))
         time.sleep(min(self._delay(), 0.5))
         if winapi.foreground_window() != hwnd and not winapi.ensure_foreground(hwnd):
             raise AutomationError("目标窗口在粘贴前失去焦点。")
@@ -1048,13 +1534,15 @@ class Runner:
             steps += 1
         step_index = 0
 
-        def advance(text: str, tone: str = "accent", bump: bool = True) -> None:
+        def advance(
+            text: str, tone: str = "accent", bump: bool = True, detail: str = ""
+        ) -> None:
             """推进一格进度。bump=False 只改文案，不占新的格数。"""
 
             nonlocal step_index
             if bump:
                 step_index += 1
-            self._overlay_progress(step_index, steps, text, tone)
+            self._overlay_progress(step_index, steps, text, tone, detail)
 
         old_clipboard = winapi.get_clipboard_text()
         try:
@@ -1070,10 +1558,10 @@ class Runner:
             time.sleep(min(self._delay(), 0.6))
 
             if conversation:
-                advance("切换对话")
+                advance("切换对话", detail=f"搜索「{conversation}」")
                 self._switch_conversation(hwnd, conversation, advance)
 
-            advance("定位输入框")
+            advance("定位输入框", detail="扫描窗口")
             frame, composer, source = self._resolve_composer(hwnd)
             self.log("info", f"输入框定位：{source}")
             self._overlay_show(frame)
@@ -1082,6 +1570,7 @@ class Runner:
                 "composer",
                 f"输入框 · {source} · {composer.width}×{composer.height}",
             )
+            advance("定位输入框", detail=f"已锁定 · {source}", bump=False)
             locator.remember_composer(self.settings, frame, composer)
 
             screen_composer = frame.to_screen(composer)
@@ -1090,20 +1579,24 @@ class Runner:
             content = templates.expand(content, clipboard=old_clipboard or "")
             winapi.set_clipboard_text(content)
 
-            advance("粘贴提示词")
-            # 基线要在浮层画完之后取：浮层同样会被截进画面，
-            # 否则"输入框是否变化"会被自己的框线骗成"已经变化"。
+            advance("粘贴提示词", detail=f"{len(content)} 字")
+            # 基线要在浮层静止之后取：浮层同样会被截进画面，框还在收拢、
+            # 还在闪的时候拍下来，后面就会把自己的动画当成"输入框变了"。
+            self._overlay_quiet(self.OVERLAY_SETTLE)
             baseline = self._capture(screen_composer)
             if baseline is None:
                 raise AutomationError("无法读取输入框画面，请确认目标窗口没有被遮挡。")
             self._paste(hwnd, frame, composer)
+            # 点击的涟漪正好落在输入框里，等它散掉再比对。
+            self._overlay_quiet(self.OVERLAY_PULSE)
             verify_paste = bool(self.settings.get("verify_paste", True))
             if verify_paste:
-                advance("校验粘贴")
+                advance("校验粘贴", detail="比对输入框画面")
                 changed, _ = self._wait_change(screen_composer, baseline, 4.0)
                 if not changed:
                     self.log("warning", "输入框没有变化，重试粘贴。")
                     self._paste(hwnd, frame, composer, retry=True)
+                    self._overlay_quiet(self.OVERLAY_PULSE)
                     changed, _ = self._wait_change(screen_composer, baseline, 4.0)
                 if not changed:
                     raise AutomationError("粘贴后输入框没有变化，已停止发送。")
@@ -1135,6 +1628,12 @@ class Runner:
                     raise AutomationError(
                         "目标应用一直在生成回答，发送位置此刻是暂停键，已跳过这次发送。"
                     )
+                if slot_kind == vision.SEND_SLOT_MIC:
+                    # 输入框空着的时候这个位置画的是麦克风。它会变回麦克风，
+                    # 说明内容根本没进去——点下去会开语音通话，不是发送。
+                    raise AutomationError(
+                        "输入框里没有内容（发送位置还是麦克风），已停止发送。"
+                    )
                 if slot is not None:
                     send_point = slot.center
                 elif not self._locator().recognition_enabled:
@@ -1151,7 +1650,7 @@ class Runner:
             )
             send_region = fresh.to_screen(grown)
 
-            advance("发送")
+            advance("发送", detail="点击发送按钮" if send_point is not None else "按 Enter 发送")
             screen_send = None
             if send_point is not None:
                 screen_send = fresh.point_to_screen(send_point)
@@ -1166,12 +1665,14 @@ class Runner:
                     "send",
                     "发送按钮" if slot_kind != vision.SEND_SLOT_UNKNOWN else "发送位置",
                 )
-            # 发送按钮的框线可能压在输入框上，基线必须在画完框之后再取。
+            # 发送按钮的框线就画在输入框里，落定那一下的闪也在里面：
+            # 等它彻底静止再取基线，否则基线拍的是动画中间的一帧。
+            self._overlay_quiet(self.OVERLAY_SETTLE)
             before_send = self._capture(send_region)
             # 从这里开始内容就交出去了：重试可能让同一个提示词发两遍。
             self.sent = True
             if screen_send is not None:
-                winapi.click(screen_send)
+                self._click(screen_send)
             else:
                 if action == "click":
                     self.log("warning", "未识别到发送按钮，改用 Enter 发送。")
@@ -1179,19 +1680,30 @@ class Runner:
 
             verify_send = bool(self.settings.get("verify_send", True))
             if verify_send:
-                advance("校验发送")
+                advance("校验发送", detail="等待输入框清空")
+                self._overlay_quiet(self.OVERLAY_PULSE)
                 cleared, _ = self._wait_change(send_region, before_send, 6.0)
                 if not cleared:
                     self.log("warning", "输入框没有清空，补按一次 Enter。")
                     winapi.press_enter()
+                    self._overlay_quiet(self.OVERLAY_PULSE)
                     cleared, _ = self._wait_change(send_region, before_send, 4.0)
                 # 像素变化只能说明"输入框动了"，点中麦克风开始录音也算变化。
                 # 真正的判据是占位符回来——那才代表内容被送走了。
+                #
+                # 但占位符是灰色的，OCR 常常整个读不到。读不到时不能直接判成
+                # "还有内容"：实测消息明明发出去了、对话里也能看到，却因为
+                # 占位符没认出来被判成失败，接着又按一次 Enter。
+                # 这时候拿"我们刚粘进去的那段字还在不在"来判——它比占位符硬：
+                # 发出去了就一定不在了。
                 if self._composer_empty(hwnd, grown) is False:
-                    self.log("warning", "输入框里仍然有内容，补按一次 Enter。")
-                    winapi.press_enter()
-                    time.sleep(min(self._delay(), 1.2))
-                if self._composer_empty(hwnd, grown) is False:
+                    if self._composer_holds(hwnd, grown, content):
+                        self.log("warning", "输入框里仍然有内容，补按一次 Enter。")
+                        winapi.press_enter()
+                        time.sleep(min(self._delay(), 1.2))
+                    else:
+                        self.log("info", "占位符没认出来，但粘进去的内容已经不在输入框里了，按已发送处理。")
+                if self._composer_holds(hwnd, grown, content):
                     raise AutomationError(
                         "发送后输入框里仍有内容，消息没有发出去。"
                         "目标应用可能暂停了这个对话，或额度已经用尽。"
@@ -1202,9 +1714,18 @@ class Runner:
                 time.sleep(min(self._delay(), 1.0))
 
             elapsed = int((time.monotonic() - started) * 1000)
-            self._overlay_progress(step_index, steps, "已发送", "success")
+            self._overlay_progress(
+                steps, steps, "已发送", "success", detail=f"用时 {elapsed / 1000:.1f} 秒"
+            )
             self.log("success", f"已发送：{task.get('name') or '未命名任务'}")
             return RunOutcome(True, "已发送", elapsed)
+        except Exception as exc:
+            # 失败也要留个回执：卡片变红、写明为什么停，停一下再撤浮层。
+            # 否则浮层"啪"地消失，用户分不清是成功了、还是断在了哪一步。
+            reason = str(exc) or exc.__class__.__name__
+            if self._overlay_progress(step_index, steps, "已停止", "danger", detail=reason[:46]):
+                time.sleep(0.9)
+            raise
         finally:
             if old_clipboard is not None:
                 try:
@@ -1375,39 +1896,51 @@ class Runner:
     SIDEBAR_TOGGLE_HINT = (131, 27)
 
     def _sidebar_toggle_points(self, frame: locator.Frame) -> list[tuple[int, int]]:
-        """标题栏里那几个图标的位置，从左往右，第一个候选就是侧边栏开关。
+        """标题栏里那几个图标的位置，从左往右，第三个就是侧边栏开关。
 
         标题栏固定是：返回、前进、侧边栏开关，然后是 File/Edit/View 菜单。
-        所以数到第三个图标就是它。不写死坐标是因为窗口缩放比例不同时像素
-        位置会跟着变；万一图标没找到，退回量好的坐标。
+        不写死坐标：先按「Codex」那一行定位横带（窗口大小、缩放比例变了它
+        也跟着走），再在这一行里数图标。万一图标没找到，退回量好的坐标。
         """
 
-        top = 4
-        bottom = max(24, int(frame.height * 0.045))
-        if bottom - top < 10:
-            return [self.SIDEBAR_TOGGLE_HINT]
-        width = min(frame.width, 420)
-        inked = []
-        for x in range(0, width):
-            ratio = vision.ink_ratio(frame.bitmap, Rect(x, top, x + 1, bottom), step=1)
-            inked.append(ratio >= 0.06)
-
+        width = min(frame.width, max(320, int(frame.width * 0.22)))
+        inked: list[bool] = []
         groups: list[tuple[int, int]] = []
-        start = None
-        for x, filled in enumerate(inked):
-            if filled and start is None:
-                start = x
-            elif not filled and start is not None:
-                groups.append((start, x))
-                start = None
-        if start is not None:
-            groups.append((start, len(inked)))
-        # 太窄的是噪点，太宽的是菜单文字（File/Edit/View 一整个连成一片）。
-        icons = [item for item in groups if 8 <= item[1] - item[0] <= 44]
-        points = [((left + right) // 2, (top + bottom) // 2) for left, right in icons[:3]]
-        if len(points) >= 3:
-            return [points[2]]
-        return [self.SIDEBAR_TOGGLE_HINT] + points
+        band_top = 0
+        band_bottom = 0
+        for top, bottom in self._header_bands(frame, int(width)):
+            if bottom - top < 10:
+                continue
+            inked = []
+            for x in range(0, width):
+                ratio = vision.ink_ratio(frame.bitmap, Rect(x, top, x + 1, bottom), step=1)
+                inked.append(ratio >= 0.06)
+            groups = []
+            start = None
+            for x, filled in enumerate(inked):
+                if filled and start is None:
+                    start = x
+                elif not filled and start is not None:
+                    groups.append((start, x))
+                    start = None
+            if start is not None:
+                groups.append((start, len(inked)))
+            # 太窄的是噪点，太宽的是菜单文字（File/Edit/View 一整个连成一片）。
+            icons = [item for item in groups if 8 <= item[1] - item[0] <= 44]
+            if len(icons) >= 3:
+                band_top, band_bottom = top, bottom
+                points = [
+                    ((left + right) // 2, (top + bottom) // 2) for left, right in icons[:3]
+                ]
+                return [points[2]]
+        if groups:
+            points = [
+                ((left + right) // 2, (band_top + band_bottom) // 2)
+                for left, right in groups
+                if 8 <= right - left <= 44
+            ]
+            return [self.SIDEBAR_TOGGLE_HINT] + points
+        return [self.SIDEBAR_TOGGLE_HINT]
 
     def scan_conversations(self, hwnd: int, scrolls: int = 30) -> list[conversations.Conversation]:
         """把侧边栏里的对话标题读出来。
@@ -1425,7 +1958,22 @@ class Runner:
     def open_conversation(self, hwnd: int, title: str) -> None:
         """按标题切过去。找不到会按 strict_conversation 决定报错还是照发。"""
 
-        self._switch_conversation(hwnd, title)
+        def step(text: str, tone: str = "accent", bump: bool = False, detail: str = "") -> None:
+            """工具箱里的切换也要有进度：这条链路一样要点、要等、要认。"""
+
+            self._overlay_progress(2, 3, text, tone, detail)
+
+        try:
+            self._switch_conversation(hwnd, title, step)
+            self._overlay_progress(3, 3, "已切换", "success", detail=f"当前对话 · {title}")
+            time.sleep(0.8)
+        except Exception as exc:
+            if self._overlay_progress(2, 3, "已停止", "danger", detail=str(exc)[:46]):
+                time.sleep(0.9)
+            raise
+        finally:
+            # 工具箱里的按钮不经过 run_task，浮层得自己收，否则会一直挂在窗口上。
+            self._overlay_hide()
 
     def new_conversation(self, hwnd: int) -> bool:
         """点侧边栏里的「New chat」。
@@ -1451,16 +1999,26 @@ class Runner:
 
     def stop_generation(self, hwnd: int) -> bool:
         """停止生成。只在那个位置真的是暂停键时才点——空闲时它是发送箭头，
-        点下去会把输入框里没写完的内容发出去。"""
+        点下去会把输入框里没写完的内容发出去。
+
+        还要求输入框是**这一帧认出来的**，不能用上次存下的锚点：界面一变
+        （比如弹出对话框、切到语音通话），锚点落的地方可能是旁边那个麦克风，
+        点下去会开始录音——实测就踩过一次，界面上冒出「Voice chat couldn't
+        start」。认不准就什么都不点，宁可让用户自己按停止。
+        """
 
         frame = self._frame(hwnd)
-        composer, _ = self._locator().composer(frame)
-        if composer is None:
-            self.log("warning", "没认出输入框，无法定位暂停键。")
+        composer, source = self._locator().composer(frame)
+        if composer is None or source not in ("识别", "缓存"):
+            self.log("warning", f"没认出输入框（{source}），不敢点停止。")
             return False
         slot, kind = self._locator().send_slot(frame, composer)
         if slot is None or kind != vision.SEND_SLOT_PAUSE:
             self.log("info", "目标应用此刻没有在生成回答。")
+            return False
+        # 暂停键在输入框右下角。位置对不上说明认到的不是它。
+        if slot.center[0] < composer.left + composer.width * 0.6:
+            self.log("warning", "那个位置不像暂停键，没有去点。")
             return False
         winapi.click(frame.point_to_screen(slot.center))
         self.log("success", "已请求停止生成。")
@@ -1479,7 +2037,7 @@ class Runner:
                 return True
         except Exception:
             pass
-        winapi.click(frame.point_to_screen(composer.center))
+        winapi.click(frame.point_to_screen(self._text_point(composer)))
         time.sleep(0.15)
         winapi.select_all_and_delete()
         time.sleep(0.2)
@@ -1505,17 +2063,27 @@ class Runner:
             time.sleep(min(self._delay(), 0.6))
             frame, composer, source = self._resolve_composer(hwnd)
             locator.remember_composer(self.settings, frame, composer)
+            self._overlay_box(
+                frame.to_screen(composer),
+                "composer",
+                f"输入框 · {source} · {composer.width}×{composer.height}",
+            )
+            self._overlay_progress(1, 3, "定位输入框", "accent", detail=f"已锁定 · {source}")
 
             screen_composer = frame.to_screen(composer)
+            self._overlay_quiet(self.OVERLAY_SETTLE)
             baseline = self._capture(screen_composer)
             content = templates.expand(content, clipboard=old_clipboard or "")
             winapi.set_clipboard_text(content)
+            self._overlay_progress(2, 3, "粘贴提示词", "accent", detail=f"{len(content)} 字")
             self._paste(hwnd, frame, composer)
+            self._overlay_quiet(self.OVERLAY_PULSE)
             changed, _ = self._wait_change(screen_composer, baseline, 4.0)
             if not changed:
                 raise AutomationError("粘贴后输入框没有变化，请检查识别结果。")
 
             elapsed = int((time.monotonic() - started) * 1000)
+            self._overlay_progress(3, 3, "已粘贴", "success", detail=f"定位方式 · {source}")
             self.log("success", f"已粘贴到输入框（定位方式：{source}），未发送。")
             return RunOutcome(True, "已粘贴", elapsed)
         finally:
@@ -1529,3 +2097,4 @@ class Runner:
                     winapi.move_cursor(saved_cursor)
                 except Exception:
                     pass
+            self._overlay_hide()

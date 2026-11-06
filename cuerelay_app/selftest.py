@@ -12,6 +12,7 @@ import json
 import os
 import tempfile
 import threading
+import time
 from pathlib import Path
 from typing import Callable, List, Tuple
 
@@ -166,6 +167,25 @@ def test_send_slot_icon_state() -> None:
     composer = vision.detect_composer(mic)
     assert composer is not None, "麦克风用例的输入框没识别出来"
     assert vision.detect_send_slot(mic, composer) is None, "麦克风不能被当成发送按钮"
+
+    # 真实界面上的麦克风：外壳和暂停键一模一样，里面画的是"胶囊轮廓 + 两道弧"，
+    # 逐列统计出来正好是"中间空、两边实"，跟暂停双竖条分不开。实测把它认成
+    # 暂停键，点下去弹出了「Voice chat couldn't start」。
+    mic_in_square = build(
+        [
+            ((566, 463, 569, 476), glyph),   # 胶囊左竖边
+            ((577, 463, 580, 476), glyph),   # 胶囊右竖边
+            ((562, 466, 564, 473), glyph),   # 外面左边的弧
+            ((582, 466, 584, 473), glyph),   # 外面右边的弧
+        ]
+    )
+    composer = vision.detect_composer(mic_in_square)
+    assert composer is not None, "麦克风（方块外壳）用例的输入框没识别出来"
+    slot = vision.detect_send_slot(mic_in_square, composer)
+    assert slot is not None, "没有识别到麦克风方块"
+    assert vision.send_slot_kind(mic_in_square, slot) == vision.SEND_SLOT_MIC, (
+        f"麦克风被认成了 {vision.send_slot_kind(mic_in_square, slot)}"
+    )
 
 
 def test_change_detection() -> None:
@@ -518,11 +538,14 @@ class _RecordingOverlay:
     def box(self, rect: dict, kind: str, label: str) -> None:
         self.calls.append(("box", rect, kind, label))
 
+    def scan(self, rect: dict, label: str, tone: str) -> None:
+        self.calls.append(("scan", rect, label, tone))
+
     def clear_boxes(self) -> None:
         self.calls.append(("clear",))
 
-    def progress(self, index: int, total: int, text: str, tone: str) -> None:
-        self.calls.append(("progress", index, total, text, tone))
+    def progress(self, index: int, total: int, text: str, tone: str, detail: str = "") -> None:
+        self.calls.append(("progress", index, total, text, tone, detail))
 
 
 def test_overlay_events() -> None:
@@ -532,7 +555,9 @@ def test_overlay_events() -> None:
 
     sink = _RecordingOverlay()
     rect = {"left": 10, "top": 20, "width": 300, "height": 200}
+    scan = {"left": 0, "top": 0, "right": 300, "bottom": 150}
     apply_event(sink, {"action": "show", "rect": rect})
+    apply_event(sink, {"action": "scan", "rect": scan, "label": "扫描输入框"})
     apply_event(sink, {"action": "progress", "index": "2", "total": "5", "text": "校验粘贴", "tone": "success"})
     apply_event(
         sink,
@@ -548,12 +573,65 @@ def test_overlay_events() -> None:
     apply_event(sink, {"action": "不存在的动作"})
 
     assert sink.calls[0] == ("show", rect), sink.calls[0]
-    assert sink.calls[1] == ("progress", 2, 5, "校验粘贴", "success"), sink.calls[1]
-    assert sink.calls[2][0] == "box" and sink.calls[2][2] == "composer", sink.calls[2]
-    assert sink.calls[3] == ("clear",), sink.calls[3]
-    assert sink.calls[4] == ("hide",), sink.calls[4]
-    assert sink.calls[5] == ("progress", 0, 1, "", "accent"), sink.calls[5]
-    assert len(sink.calls) == 6, sink.calls
+    assert sink.calls[1] == ("scan", scan, "扫描输入框", "warning"), sink.calls[1]
+    assert sink.calls[2] == ("progress", 2, 5, "校验粘贴", "success", ""), sink.calls[2]
+    assert sink.calls[3][0] == "box" and sink.calls[3][2] == "composer", sink.calls[3]
+    assert sink.calls[4] == ("clear",), sink.calls[4]
+    assert sink.calls[5] == ("hide",), sink.calls[5]
+    assert sink.calls[6] == ("progress", 0, 1, "", "accent", ""), sink.calls[6]
+    assert len(sink.calls) == 7, sink.calls
+
+
+def test_overlay_card_placement() -> None:
+    """进度卡片要贴着当前那个框，而且不能跑到窗口外面去。
+
+    浮层是给人看的：卡片固定在顶上会和标题栏撞，固定在底下会压住输入框。
+    这里不碰 Tk，只验几何——贴边、不越界、不盖住自己指的那个框。
+    """
+
+    from .ui.overlay import Overlay, _Box
+    from .ui.theme import Theme
+
+    overlay = Overlay(None, Theme("dark", 96))
+    overlay._rect = {"left": 0, "top": 0, "width": 1200, "height": 800}
+
+    # 没有框的时候居中贴顶。
+    left, top = overlay._card_origin(300, 66)
+    assert left == (1200 - 300) // 2 and top == 8, (left, top)
+
+    # 输入框在底部：卡片放到它上面，不压住它。
+    composer = _Box({"left": 300, "top": 600, "right": 900, "bottom": 760}, "composer", "输入框")
+    overlay._boxes = [composer]
+    left, top = overlay._card_origin(300, 66)
+    assert left == 300, left
+    assert top + 66 <= 600 - 8, (top, 600)
+
+    # 元素在顶部：下面放得下就放下面。
+    header = _Box({"left": 40, "top": 30, "right": 240, "bottom": 70}, "search", "搜索框")
+    overlay._boxes = [header]
+    left, top = overlay._card_origin(300, 66)
+    assert left == 40 and top == 70 + 10, (left, top)
+
+    # 右边贴边的元素：卡片整体左移，不能越出窗口。
+    corner = _Box({"left": 1100, "top": 30, "right": 1195, "bottom": 70}, "send", "发送按钮")
+    overlay._boxes = [corner]
+    left, top = overlay._card_origin(300, 66)
+    assert left == 1200 - 300 - 8, left
+
+    # 窄窗口：卡片比窗口还宽时也得留在窗口里（允许贴边）。
+    overlay._rect = {"left": 0, "top": 0, "width": 240, "height": 500}
+    overlay._boxes = []
+    left, top = overlay._card_origin(300, 66)
+    assert left == 8, left
+
+    # 发送按钮套在输入框里：卡片跟着输入框走，不要被小方块挤到边角上去。
+    composer = _Box({"left": 300, "top": 520, "right": 960, "bottom": 610}, "composer", "输入框")
+    send = _Box({"left": 900, "top": 560, "right": 936, "bottom": 596}, "send", "发送按钮")
+    overlay._rect = {"left": 0, "top": 0, "width": 1000, "height": 640}
+    overlay._boxes = [composer, send]
+    left, top = overlay._card_origin(300, 80)
+    assert left == 300, left
+    assert top + 80 <= 520 - 8, (top, 520)
 
 
 def test_settings_bool_coercion() -> None:
@@ -669,6 +747,267 @@ def test_conversation_chrome_filter() -> None:
     assert conversations.strip_icon("Clarify say") == ("Clarify say", False)
     # 单字母开头的正常标题也会被剥掉图标，这条规则只影响显示，不影响跳转。
     assert conversations.strip_icon("A B") == ("A B", False)
+
+
+def test_codex_path_rules() -> None:
+    """Codex 存的路径有好几种写法，项目归属全靠这几条规则。
+
+    真实库里 cwd 是 `\\\\?\\E:\\aitools\\helloalp_web`，项目根是
+    `E:\\aitools\\helloalp_web`；不剥掉扩展长度前缀就永远匹配不上，
+    结果就是 900 多条对话全都掉进「无项目」。
+    """
+
+    from . import codexdb
+
+    assert codexdb.tidy_path("\\\\?\\E:\\aitools\\helloalp_web") == "E:\\aitools\\helloalp_web"
+    assert codexdb.tidy_path("//?/E:/aitools/x") == "E:\\aitools\\x"
+    assert codexdb.tidy_path(' "E:\\a\\b\\" ') == "E:\\a\\b"
+    assert codexdb.tidy_path("") == ""
+
+    assert codexdb.is_under("E:\\aitools\\helloalp_web\\src", "E:\\aitools\\helloalp_web")
+    assert codexdb.is_under("E:\\AITOOLS\\Helloalp_Web", "e:\\aitools\\helloalp_web")
+    assert not codexdb.is_under("E:\\aitools\\helloalp_web2", "E:\\aitools\\helloalp_web")
+    assert not codexdb.is_under("", "E:\\aitools")
+
+    roots = [
+        ("E:\\aitools\\helloalp_web", "helloalp_web"),
+        ("E:\\aitools", "aitools"),
+    ]
+    # 最长前缀优先：两个项目根互为父子时，不能把子项目算到父项目头上。
+    assert codexdb.project_of("\\\\?\\E:\\aitools\\helloalp_web\\src", roots) == "helloalp_web"
+    assert codexdb.project_of("E:\\aitools\\memedb", roots) == "aitools"
+    assert codexdb.project_of("D:\\other", roots) == ""
+
+    # 代理工作副本不在任何项目根下面，靠目录名认。
+    assert (
+        codexdb.project_of(r"C:\Users\x\.codex\worktrees\cfd3\helloalp_read", []) == "helloalp_read"
+    )
+
+
+def test_codex_kind_classification() -> None:
+    """子代理 / 分叉 / 代理创建 / 用户，四种来源不能混。
+
+    子代理占了本机 966 条里的 577 条，混进列表就等于把对话页变成日志页。
+    """
+
+    from . import codexdb
+
+    kind, agent, parent = codexdb._kind_of(
+        "subagent",
+        '{"subagent":{"thread_spawn":{"parent_thread_id":"p1","agent_nickname":"Turing"}}}',
+    )
+    assert kind == codexdb.KIND_SUBAGENT, kind
+    assert agent == "Turing", agent
+    assert parent == "p1", parent
+
+    assert codexdb._kind_of("user", "vscode")[0] == codexdb.KIND_USER
+    assert codexdb._kind_of("", "")[0] == codexdb.KIND_USER
+    assert codexdb._kind_of("agent_created_thread", "vscode")[0] == codexdb.KIND_AGENT
+    assert codexdb._kind_of("agent_forked_thread", "vscode")[0] == codexdb.KIND_FORK
+    # source 是一段坏 JSON 时不能炸，按用户对话处理。
+    assert codexdb._kind_of("user", "{not json")[0] == codexdb.KIND_USER
+
+
+def _write_codex_home(folder: Path) -> Path:
+    """造一个最小可用的 Codex 数据目录，字段刻意只给一部分。
+
+    真实的 state 库有 38 列，而且随版本变；只给用得上的那几列，顺带验证
+    "缺列就跳过"这条容错。
+    """
+
+    import sqlite3
+
+    home = folder / "codex"
+    home.mkdir()
+    con = sqlite3.connect(str(home / "state_5.sqlite"))
+    con.executescript(
+        """
+        create table projects (id text primary key, name text not null);
+        create table project_roots (project_id text, position integer, path text);
+        create table threads (
+            id text primary key,
+            title text not null default '',
+            name text,
+            cwd text not null default '',
+            created_at integer not null default 0,
+            updated_at integer not null default 0,
+            tokens_used integer not null default 0,
+            model text,
+            archived integer not null default 0,
+            is_pinned integer not null default 0,
+            source text not null default '',
+            thread_source text,
+            originator text,
+            first_user_message text not null default '',
+            preview text not null default '',
+            rollout_path text not null default ''
+        );
+        """
+    )
+    con.execute("insert into projects values ('p1', 'helloalp_web')")
+    con.execute("insert into projects values ('p2', 'aitools')")
+    con.execute("insert into project_roots values ('p1', 0, 'E:\\aitools\\helloalp_web')")
+    con.execute("insert into project_roots values ('p2', 0, 'E:\\aitools')")
+
+    rows = [
+        # 0: 正常对话，cwd 带扩展长度前缀，落在子项目里
+        ("t1", "", "Helloalp Resume 20261105 1", "\\\\?\\E:\\aitools\\helloalp_web\\src",
+         "目前的 resume 页面要重做", "", 1000, 2000, 75_000_000, "gpt-6.1-sol", 0, 1, "vscode", "user"),
+        # 1: 无项目：目录不在任何项目根下，标题只能从首条消息来
+        ("t2", "", None, "C:\\Users\\x\\Documents\\Codex\\2026-10-31\\wo",
+         "转换素材为 ProRes 4444", "", 900, 1800, 1200, "gpt-5.6", 0, 0, "vscode", "user"),
+        # 2: 子代理：没有标题，只有 spawn 信息
+        ("t3", "", None, "\\\\?\\E:\\aitools\\helloalp_web",
+         "", "", 800, 1700, 4000, "gpt-6.1-terra", 0, 0,
+         '{"subagent":{"thread_spawn":{"parent_thread_id":"t1","agent_nickname":"Turing"}}}', "subagent"),
+        # 3: 归档
+        ("t4", "旧对话", "旧对话", "E:\\aitools\\memedb", "旧对话内容", "", 700, 1600, 900, "gpt-5", 1, 0, "vscode", "user"),
+    ]
+    con.executemany(
+        "insert into threads (id, title, name, cwd, first_user_message, preview, created_at,"
+        " updated_at, tokens_used, model, archived, is_pinned, source, thread_source)"
+        " values (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        rows,
+    )
+    con.commit()
+    con.close()
+    return home
+
+
+def test_codex_scan_from_database() -> None:
+    """整条链路：读库 → 归项目 → 分类型 → 补标题 → 排序。"""
+
+    from . import codexdb
+
+    with tempfile.TemporaryDirectory() as folder:
+        home = _write_codex_home(Path(folder))
+        library = codexdb.scan(home)
+
+        assert library.source == "state_5.sqlite", library.source
+        assert len(library.threads) == 4, len(library.threads)
+        by_id = {item.id: item for item in library.threads}
+
+        # 扩展长度前缀要被剥掉，项目要按最长前缀命中子项目。
+        assert by_id["t1"].cwd == "E:\\aitools\\helloalp_web\\src", by_id["t1"].cwd
+        assert by_id["t1"].project == "helloalp_web", by_id["t1"].project
+        assert by_id["t4"].project == "aitools", by_id["t4"].project
+
+        # 无项目的对话不能凭空归到某个项目里。
+        assert by_id["t2"].project == "", by_id["t2"].project
+        assert by_id["t2"].title == "转换素材为 ProRes 4444", by_id["t2"].title
+
+        # 子代理要被认出来，空标题要有能读的占位。
+        assert by_id["t3"].is_subagent is True
+        assert by_id["t3"].project == "helloalp_web"
+        assert by_id["t3"].agent == "Turing"
+        assert by_id["t3"].title == "Turing · 子代理", by_id["t3"].title
+
+        counts = library.counts()
+        assert counts["total"] == 4, counts
+        assert counts["archived"] == 1, counts
+        assert counts["subagents"] == 1, counts
+        assert counts["loose"] == 1, counts
+        assert counts["projects"] == 1, counts
+
+        # 置顶在最前，其余按最近活跃。
+        assert [item.id for item in library.threads][0] == "t1", [item.id for item in library.threads]
+
+        # 详情里要展示"用户当初说了什么"，不是标题复读。
+        assert by_id["t1"].full_title == "目前的 resume 页面要重做", by_id["t1"].full_title
+
+
+def test_codex_search_ranking() -> None:
+    """标题命中要压过目录命中，而且每个词都得中。"""
+
+    from . import codexdb
+
+    with tempfile.TemporaryDirectory() as folder:
+        home = _write_codex_home(Path(folder))
+        library = codexdb.scan(home)
+        threads = library.threads
+
+        hits = codexdb.search(threads, "resume")
+        assert hits and hits[0].id == "t1", [item.id for item in hits]
+
+        # 目录命中排在标题命中后面。
+        ranked = codexdb.search(threads, "aitools")
+        assert [item.id for item in ranked][0] in ("t1", "t3", "t4"), [item.id for item in ranked]
+
+        assert codexdb.search(threads, "Resume 重做")[0].id == "t1"
+        assert codexdb.search(threads, "resume 完全不相干的词") == []
+        assert codexdb.search(threads, "") == threads
+
+        # ID 也能搜：日志里贴一个 id 就能定位。
+        assert codexdb.search(threads, "t3")[0].id == "t3"
+
+
+def test_codex_stale_check() -> None:
+    """库文件变过才算过期；stat 一次就知道，不必重读。"""
+
+    from . import codexdb
+
+    with tempfile.TemporaryDirectory() as folder:
+        home = _write_codex_home(Path(folder))
+        library = codexdb.scan(home)
+        assert codexdb.is_stale(library) is False
+        assert codexdb.is_stale(None) is True
+
+        os.utime(home / "state_5.sqlite", (time.time() + 10, time.time() + 10))
+        assert codexdb.is_stale(library) is True
+
+        # 库被删掉时也要说"过期"，不能当成最新。
+        (home / "state_5.sqlite").unlink()
+        assert codexdb.is_stale(library) is True
+
+
+def test_codex_sessions_fallback() -> None:
+    """没有 state 库（纯 CLI 用户）时，从 rollout 文件里也能读出来。"""
+
+    from . import codexdb
+
+    with tempfile.TemporaryDirectory() as folder:
+        home = Path(folder) / "codex"
+        folder_path = home / "sessions" / "2026" / "01" / "02"
+        folder_path.mkdir(parents=True)
+        lines = [
+            json.dumps(
+                {
+                    "type": "session_meta",
+                    "payload": {
+                        "id": "sess-1",
+                        "cwd": "E:\\aitools\\helloalp_web",
+                        "timestamp": "2026-01-02T03:04:05Z",
+                        "source": "cli",
+                        "thread_source": "user",
+                        "originator": "codex_cli",
+                    },
+                },
+                ensure_ascii=False,
+            ),
+            json.dumps(
+                {
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "把这个脚本改成异步的"}],
+                    },
+                },
+                ensure_ascii=False,
+            ),
+        ]
+        (folder_path / "rollout-2026-01-02T03-04-05-sess-1.jsonl").write_text(
+            "\n".join(lines) + "\n", encoding="utf-8"
+        )
+
+        library = codexdb.scan(home)
+        assert library.source == "sessions", library.source
+        assert len(library.threads) == 1, len(library.threads)
+        item = library.threads[0]
+        assert item.id == "sess-1", item.id
+        assert item.title == "把这个脚本改成异步的", item.title
+        assert item.cwd == "E:\\aitools\\helloalp_web", item.cwd
+        assert item.kind == codexdb.KIND_USER
 
 
 def test_snippet_store() -> None:
@@ -1199,6 +1538,151 @@ def test_magnifier_band() -> None:
 
 
 
+def test_panel_input_across_sizes() -> None:
+    """同一个面板在 1200 和 1600 宽下都要框得住输入框。
+
+    两档的真实识别结果都抄自实机（`tools/probe_panel.py` 打出来的原文）。
+    以前这里只按"这一列最靠上的一行"取框，而输入框里的词是高亮蓝底白字，
+    OCR 常常整个读不到，读到的第一行是分组标题或结果行——1200 宽时框的顶
+    边掉到 89，真正的输入框从 58 就开始了。
+
+    另外 1200 宽那档故意放了一行**同高度的正文**（x=982，`ChatGPT Alt+2`），
+    它以前会被并进筛选标签那一排，把面板右边缘算到 1532。
+    """
+
+    from . import automation, locator, ocr
+
+    runner = automation.Runner(
+        {"step_delay_seconds": 0.4, "recognition_enabled": True},
+        lambda level, message: None,
+    )
+
+    def frame_of(width: int, height: int) -> locator.Frame:
+        rect = {"left": 0, "top": 0, "right": width, "bottom": height,
+                "width": width, "height": height}
+        return locator.Frame(0, rect, make_bitmap(width, height, (24, 24, 24), []))
+
+    def line(text: str, left: int, top: int, width: int, height: int = 16) -> ocr.OcrLine:
+        return ocr.OcrLine(text, left, top, width, height)
+
+    # --- 1600x1000：面板左 244、右 1364，输入框 144~200 ---
+    wide = [
+        line("Chats", 248, 216, 48, 15),
+        line("O Clarify say", 249, 260, 127, 24),
+        line("ChatGPT Alt+2", 1207, 315, 139, 17),
+        line("All", 249, 840, 25, 16),
+        line("Actions Chats", 312, 840, 161, 16),
+        line("Files", 512, 840, 40, 16),
+        line("Text", 590, 841, 39, 15),
+    ]
+    frame = frame_of(1600, 1000)
+    assert [item.text for item in runner._filter_row(wide, frame)] == [
+        "All", "Actions Chats", "Files", "Text",
+    ], runner._filter_row(wide, frame)
+    assert runner._panel_column(wide, frame) == 249
+    box = runner._panel_box_guess(wide, frame, 239, 1361, 800)
+    assert box is not None
+    assert 140 <= box.top <= 150, f"输入框顶边应该在 144 附近，实际 {box.top}"
+    assert 195 <= box.bottom <= 205, f"输入框底边应该在 200 附近，实际 {box.bottom}"
+    assert 1340 <= box.right <= 1370, f"右边缘应该按面板居中镜像出来，实际 {box.right}"
+
+    # --- 1200x900：面板左 73、输入框 58~130 ---
+    narrow = [
+        line("lari Sa", 89, 101, 81, 18),      # 输入框里的词（只认出了后半段）
+        line("Chats", 72, 166, 48, 15),
+        line("O Clarify say", 72, 210, 127, 24),
+        line("ChatGPT Alt+2", 982, 264, 139, 17),   # 同高度的正文，不能并进标签排
+        line("All", 73, 789, 24, 16),
+        line("Actions Chats Files Text", 135, 789, 318, 16),
+        line("GPT-5.6 Luna Light", 856, 830, 163, 20),
+    ]
+    frame = frame_of(1200, 900)
+    row = runner._filter_row(narrow, frame)
+    assert [item.text for item in row] == ["All", "Actions Chats Files Text"], row
+    assert runner._panel_column(narrow, frame) == 73
+
+    band = runner._panel_box_guess(narrow, frame, 63, 1137, 749)
+    assert band is not None
+    # 推出来的带子必须把输入框里那行字包住，而且不能盖到分组标题上——盖到
+    # 标题上就意味着点下去点的是标题那一行。
+    assert band.top < 101 < band.bottom, f"带子没包住输入框里的字：{band}"
+    assert band.bottom < 166, f"带子盖到了分组标题上：{band}"
+
+    # 认出来的字落在推出来的带子里 → 收紧到那一行；落在带子外面（这里没有）
+    # 就不收紧。这一条保证"有字"不会把框带到结果行上去。
+    inside = [item for item in narrow if band.top - 8 <= item.top <= band.bottom + 8]
+    assert [item.text for item in inside] == ["lari Sa"], inside
+
+
+def test_panel_closed_is_not_open() -> None:
+    """面板关着的时候绝不能认成开着。
+
+    侧边栏里那一列会话标题（Pinned / Projects / helloalp_sms / henu_classroom）
+    从上到下都左对齐，比面板还整齐。以前 `_panel_column` 最后一招是"数哪一列
+    最常当行首"，这一招在侧边栏上永远成立：面板关着也判成开着，接着把侧边栏
+    里的会话标题当成搜索框，把关键词粘进了对话输入框。
+
+    现在只认两种硬证据：底部那排筛选标签、面板里的分组标题。两个都没有就是
+    没开，交给上层按 Ctrl+K。
+    """
+
+    from . import automation, locator, ocr
+
+    runner = automation.Runner(
+        {"step_delay_seconds": 0.4, "recognition_enabled": True},
+        lambda level, message: None,
+    )
+    rect = {"left": 0, "top": 0, "right": 1600, "bottom": 1000,
+            "width": 1600, "height": 1000}
+    frame = locator.Frame(0, rect, make_bitmap(1600, 1000, (24, 24, 24), []))
+
+    sidebar = [
+        ocr.OcrLine("Codex", 103, 95, 78, 20),
+        ocr.OcrLine("C New chat", 105, 158, 120, 18),
+        ocr.OcrLine("Pinned", 103, 222, 64, 16),
+        ocr.OcrLine("Clarify say", 102, 274, 94, 21),
+        ocr.OcrLine("Projects", 103, 342, 74, 18),
+        ocr.OcrLine("helloalp_sms", 139, 393, 87, 21),
+        ocr.OcrLine("henu classroom", 139, 440, 147, 16),
+        ocr.OcrLine("codex tools", 138, 486, 109, 16),
+    ]
+    assert runner._panel_column(sidebar, frame) is None, "侧边栏不算面板"
+    assert runner._filter_row(sidebar, frame) == []
+
+
+def test_dropped_cjk_match() -> None:
+    """OCR 把中文整段丢掉之后，仍然要认得出是同一个标题。
+
+    实测搜「PDF 渲染与 DOCX 处理」，输入框里读回来是 `PDF DOCX`，结果行也
+    是 `O PDF DOCX`。按字面比相似度是 0，但词确实进去了、结果也确实出来了。
+    """
+
+    from . import automation
+
+    runner = automation.Runner(
+        {"step_delay_seconds": 0.4, "recognition_enabled": True},
+        lambda level, message: None,
+    )
+    title = "PDF 渲染与 DOCX 处理"
+
+    assert runner._dropped_match("O PDF DOCX", title) >= 0.62
+    assert runner._dropped_match("PDF DOCX", title) >= 0.62
+    assert runner._dropped_match(title, title) >= 0.62
+    # 认出来的字超出标题：说明是另一个标题，不能认
+    assert runner._dropped_match("PDF 渲染 DOCX 导出 PDF", title) == 0.0
+    # 覆盖得太少：只剩一个词不足以确定身份
+    assert runner._dropped_match("PDF", title) == 0.0
+    # 完全不相干
+    assert runner._dropped_match("Clarify say", title) == 0.0
+
+    # 输入框核对：按顺序对上多少字，够一半就算粘进去了
+    assert runner._ordered_overlap("pdf渲染与docx处理", "pdfdocx") >= 0.5
+    assert runner._ordered_overlap("clarifysay", "clarifysay") == 1.0
+    assert runner._ordered_overlap("pdf渲染与docx处理", "clarifysay") < 0.2
+    # 掉几个字也还认得出
+    assert runner._ordered_overlap("如何回应学弟帮助请求", "如何回应学弟助请") >= 0.5
+
+
 TESTS: List[Tuple[str, Callable[[], None]]] = [
     ("颜色众数", test_modal_color),
     ("输入框识别", test_composer_detection),
@@ -1222,9 +1706,16 @@ TESTS: List[Tuple[str, Callable[[], None]]] = [
     ("批量删除", test_delete_many),
     ("预览图生成", test_png_preview),
     ("浮层事件翻译", test_overlay_events),
+    ("浮层卡片定位", test_overlay_card_placement),
     ("设置布尔纠正", test_settings_bool_coercion),
     ("MSIX 启动目标", test_msix_launch_target),
     ("任务类型纠正", test_task_kind_coercion),
+    ("Codex 路径规则", test_codex_path_rules),
+    ("Codex 对话分类", test_codex_kind_classification),
+    ("Codex 读库扫描", test_codex_scan_from_database),
+    ("Codex 搜索排序", test_codex_search_ranking),
+    ("Codex 过期判断", test_codex_stale_check),
+    ("Codex sessions 回退", test_codex_sessions_fallback),
     ("侧边栏对话解析", test_conversation_parse),
     ("侧边栏固定文案", test_conversation_chrome_filter),
     ("片段存储", test_snippet_store),
@@ -1244,6 +1735,9 @@ TESTS: List[Tuple[str, Callable[[], None]]] = [
     ("搜索面板定位", test_search_panel_anchor),
     ("搜索面板左边缘", test_search_panel_column),
     ("搜索结果分组", test_search_result_pick),
+    ("面板框任意尺寸", test_panel_input_across_sizes),
+    ("面板关着不算开着", test_panel_closed_is_not_open),
+    ("OCR 掉中文匹配", test_dropped_cjk_match),
     ("放大镜定位", test_magnifier_band),
     ("路径清理", test_tidy_path),
 ]

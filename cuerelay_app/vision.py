@@ -587,6 +587,7 @@ def detect_send_button(bitmap: Bitmap, composer: Rect) -> Optional[tuple[int, in
 
 SEND_SLOT_SEND = "send"
 SEND_SLOT_PAUSE = "pause"
+SEND_SLOT_MIC = "mic"
 SEND_SLOT_UNKNOWN = "unknown"
 
 
@@ -644,8 +645,55 @@ def send_slot_kind(bitmap: Bitmap, slot: Rect) -> str:
     if gap < 2:
         return SEND_SLOT_SEND
     if covered(0, left) and covered(right + 1, width):
+        # 暂停键和麦克风在这个位置上是同一个方块、同样是"中间一段空"：
+        # 麦克风画的是胶囊轮廓（左右两道竖边）+ 外面的两道弧，逐列统计出来
+        # 跟两根竖条一模一样。实测把麦克风认成暂停键，点下去弹出了
+        # 「Voice chat couldn't start」。
+        #
+        # 只能看**行**：暂停的两根竖条从上到下贯穿（所以靠下那一行还有墨迹），
+        # 麦克风的胶囊只占中间一段，上面和下面都是空的。
+        if _slot_rows_are_mic(bitmap, slot, fill, margin_x, margin_y):
+            return SEND_SLOT_MIC
         return SEND_SLOT_PAUSE
     return SEND_SLOT_SEND
+
+
+def _row_runs(bitmap: Bitmap, slot: Rect, fill: Color, margin_x: int, y: int) -> int:
+    """某一行上有几段连续的墨迹。"""
+
+    runs = 0
+    inside = False
+    for x in range(slot.left + margin_x, slot.right - margin_x):
+        inked = _dist(bitmap.rgb(x, y), fill) >= 60
+        if inked and not inside:
+            runs += 1
+            inside = True
+        elif not inked:
+            inside = False
+    return runs
+
+
+def _slot_rows_are_mic(
+    bitmap: Bitmap, slot: Rect, fill: Color, margin_x: int, margin_y: int
+) -> bool:
+    """方块里的字形是不是一个麦克风。
+
+    只看中间那几行有几段墨迹：暂停是两根竖条，无论横切哪一行都只有两段；
+    麦克风是"胶囊轮廓 + 外面两道弧"，切过去会变成四段。实测真实界面上
+    麦克风在正中间那一行是四段，暂停是两段。
+
+    为什么不用"靠下那一行有没有墨迹"来判：暂停的两根竖条不一定会画满整个
+    方块（不同缩放、不同版本留的边距不一样），拿它当判据会把真的暂停键
+    判成麦克风，结果该等的时候不等。
+    """
+
+    inner_top = slot.top + margin_y
+    inner_height = max(1, slot.height - 2 * margin_y)
+    for fraction in (0.42, 0.5, 0.58):
+        y = inner_top + int(inner_height * fraction)
+        if _row_runs(bitmap, slot, fill, margin_x, y) >= 3:
+            return True
+    return False
 
 
 def detect_panels(bitmap: Bitmap) -> list[int]:

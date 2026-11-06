@@ -145,23 +145,35 @@ def capture_client(hwnd: int, allow_raise: bool = True) -> Optional[tuple[Bitmap
     它自己的画面。这条路对 Chromium 系的窗口有个前提——它得在出帧。被完全
     遮住时浏览器会停掉合成，PrintWindow 照样"成功"，但画出来是全黑。
 
-    所以全黑时先把它提到最前面再重试一次（不抢键盘焦点），仍然拿不到就退回
-    截屏；截屏之前必须确认这个位置最上面确实是目标窗口，否则截到的是别人，
-    后面的识别全是错的。
+    比全黑更糟的是"画出别人"：窗口被完全遮住时，PrintWindow 有时会直接返回
+    挡着它的那个程序的像素。看上去一切正常——有字、有图、能 OCR——但认出来
+    的是别人的界面。所以在拿画面之前先问一句"这个窗口真的露在屏幕上吗"，
+    露得不够就先把它提上来；提不上来就明确失败，绝不拿别人的画面去点击。
     """
 
     rect = winapi.get_client_rect(hwnd)
     if not rect or rect["width"] <= 0 or rect["height"] <= 0:
         return None
+    exposed = winapi.exposed_ratio(hwnd)
     bitmap = _render(hwnd, rect)
+    if bitmap is not None and exposed >= 0.5:
+        return bitmap, rect
+
     center = (rect["left"] + rect["width"] // 2, rect["top"] + rect["height"] // 2)
     on_top = winapi.point_to_root_window(*center) == int(hwnd)
-    if bitmap is None and allow_raise and not on_top:
+    if allow_raise and exposed < 0.5 and not on_top:
         # 看不见它，它也画不出自己。提上来（不动焦点）再试一次。
         if winapi.raise_window(hwnd):
-            time.sleep(0.25)
-            bitmap = _render(hwnd, rect)
+            time.sleep(0.3)
+            exposed = winapi.exposed_ratio(hwnd)
+            fresh = _render(hwnd, rect)
+            if fresh is not None:
+                bitmap = fresh
             on_top = winapi.point_to_root_window(*center) == int(hwnd)
+    if exposed < 0.5:
+        # 还是被挡着。这时候 PrintWindow 给的画面不可信，截屏截到的更是别人，
+        # 两条路都不能用——交给调用方去说清楚"目标窗口被挡住了"。
+        return None
     if bitmap is not None:
         return bitmap, rect
     if not on_top:
