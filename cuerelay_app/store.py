@@ -58,6 +58,8 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "overlay_linger_seconds": 1.2,
     # 命令面板的历史搜索词，回车后下次还能直接用。
     "last_palette_query": "",
+    # 在任何程序里按 Ctrl+Alt+K 把窗口叫回来并打开命令面板。
+    "global_hotkey": True,
 }
 
 # 这些键在配置文件里必须是真正的布尔值。手改过的 JSON 里 "false" 是个
@@ -72,6 +74,7 @@ BOOL_SETTINGS = (
     "auto_launch_target",
     "launch_v2ray_first",
     "show_overlay",
+    "global_hotkey",
 )
 
 SCHEDULE_VALUES = ("once", "daily", "interval")

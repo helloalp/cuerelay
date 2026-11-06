@@ -132,8 +132,39 @@ def main(argv: list[str]) -> int:
         failures += 1
         print(f"[失败] 命令面板: {exc.__class__.__name__}: {exc}")
 
+    # 全局热键：真的按一次 Ctrl+Alt+K，看窗口和面板会不会被叫出来。
+    # keybd_event 造的按键和真按一样会触发 RegisterHotKey，所以这一条走的是
+    # 完整链路：热键线程 -> 队列 -> 界面线程 -> 唤出。
+    try:
+        app.show_view("tasks")
+        pump(root, 6)
+        if app._palette is not None:
+            app._palette.close()
+            pump(root, 4)
+        if app._hotkey is None or not app._hotkey.active:
+            print("[跳过] 全局热键：没有注册成功（多半是被别的程序占了）")
+        else:
+            KEYUP = 0x0002
+            user32 = winapi.user32
+            for vk in (winapi.VK_CONTROL, winapi.VK_MENU, winapi.VK_K):
+                user32.keybd_event(vk, 0, 0, 0)
+            for vk in (winapi.VK_K, winapi.VK_MENU, winapi.VK_CONTROL):
+                user32.keybd_event(vk, 0, KEYUP, 0)
+            for _ in range(90):
+                root.update()
+                if app._palette is not None:
+                    break
+                time.sleep(0.02)
+            assert app._palette is not None, "热键没有唤出命令面板"
+            print("[通过] 全局热键唤出")
+            app._palette.close()
+            pump(root, 4)
+    except Exception as exc:  # noqa: BLE001
+        failures += 1
+        print(f"[失败] 全局热键: {exc.__class__.__name__}: {exc}")
+
     # 每个视图截一张，人工核对排版
-    for view in ("tasks", "snippets", "chats", "log"):
+    for view in ("tasks", "snippets", "chats", "apps", "settings", "log"):
         try:
             app.show_view(view)
             pump(root, 10)

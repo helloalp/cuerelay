@@ -10,10 +10,11 @@ from __future__ import annotations
 import datetime as _dt
 import json
 import tempfile
+import threading
 from pathlib import Path
 from typing import Callable, List, Tuple
 
-from . import apps, conversations, ocr, vision
+from . import apps, conversations, hotkey, ocr, vision
 from .config import now_local, parse_datetime
 from .imaging import Bitmap
 from .store import (
@@ -787,6 +788,35 @@ def test_tidy_path() -> None:
     assert apps.tidy_path("") == ""
 
 
+def test_hotkey_register() -> None:
+    """真的注册一次全局热键再注销。
+
+    这条测的不是"能不能按到"，而是线程能不能起来、注册结果能不能同步回来、
+    能不能干净退出。用 Ctrl+Alt+Shift+F12：没人会占这个组合。万一真被占了
+    （或者不是 Windows），要给出原因而不是假装成功。
+    """
+
+    fired = threading.Event()
+    key = hotkey.GlobalHotkey(
+        fired.set,
+        mods=hotkey.MOD_CONTROL | hotkey.MOD_ALT | hotkey.MOD_SHIFT | hotkey.MOD_NOREPEAT,
+        vk=0x7B,  # VK_F12
+    )
+    ok, reason = key.start()
+    if not ok:
+        assert reason, "注册失败却没给原因"
+        assert key.active is False
+        return
+    assert key.active is True
+    # 重复 start 不该再注册一次，也不该报错。
+    again, _ = key.start()
+    assert again is True
+    key.stop()
+    assert key.active is False
+    # 没起来过的实例也要能安全 stop。
+    hotkey.GlobalHotkey(fired.set).stop()
+
+
 def test_panels_near_right_edge() -> None:
     """分隔线贴到窗口右边界时不能越界。
 
@@ -843,6 +873,7 @@ TESTS: List[Tuple[str, Callable[[], None]]] = [
     ("命令面板过滤", test_palette_filter),
     ("右边界分隔线", test_panels_near_right_edge),
     ("开机自启命令", test_autostart_command),
+    ("全局热键注册", test_hotkey_register),
     ("路径清理", test_tidy_path),
 ]
 

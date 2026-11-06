@@ -21,7 +21,8 @@ from .. import config, locator, store as store_module, winapi
 from ..automation import AutomationError
 from ..config import friendly_error, iso_datetime, now_local, parse_datetime
 from ..conversations import Conversation
-from ..hotkey import VirtualCapture
+from ..hotkey import DEFAULT_LABEL as HOTKEY_LABEL
+from ..hotkey import GlobalHotkey, VirtualCapture
 from ..scheduler import Scheduler
 from ..store import (
     KIND_LABELS,
@@ -120,6 +121,11 @@ class App:
         self._log_mode = "log"
         self._snippet_signature: Optional[tuple] = None
 
+        # 全局热键。动作执行期间窗口是自己藏起来的，那时按热键不能再把它拉出来，
+        # 否则会盖在目标窗口上，正好挡住自动化要点的位置。
+        self._hotkey: Optional[GlobalHotkey] = None
+        self._hidden_for_action = False
+
         settings = self.store.settings()
         self.theme = Theme(str(settings.get("theme") or "light"), winapi.get_system_dpi())
         self.overlay = Overlay(self.root, self.theme)
@@ -142,6 +148,7 @@ class App:
         self._apps_poll_id = self.root.after(2500, self._poll_apps)
         self._bind_shortcuts()
         self.refresh_snippets()
+        self._start_hotkey()
         if not str(self.store.setting("v2ray_path") or ""):
             # 第一次打开就顺手找一下 v2rayN，省得用户还要自己去点「自动检测」。
             threading.Thread(target=self._autodetect_v2ray, daemon=True).start()
@@ -183,6 +190,7 @@ class App:
         self.v2ray_path_var = tk.StringVar(value=str(settings.get("v2ray_path") or ""))
         self.launch_v2ray_var = tk.BooleanVar(value=bool(settings.get("launch_v2ray_first", True)))
         self.autostart_var = tk.BooleanVar(value=apps_module.autostart_enabled())
+        self.hotkey_var = tk.BooleanVar(value=bool(settings.get("global_hotkey", True)))
         self.catch_up_var = tk.StringVar(value=str(int(settings.get("catch_up_seconds", 300) or 300) // 60))
         try:
             saved_delay = float(settings.get("step_delay_seconds", 1.2))
@@ -1673,6 +1681,22 @@ class App:
             font=theme.font("tiny"),
             anchor="w",
         ).pack(fill="x", pady=(theme.px(5), 0))
+        Switch(
+            inner,
+            theme,
+            f"{HOTKEY_LABEL} 全局唤出",
+            self.hotkey_var,
+            command=self._save_hotkey,
+            bg_key="surface",
+        ).pack(fill="x", pady=(theme.px(14), 0))
+        tk.Label(
+            inner,
+            text=f"在别的程序里按 {HOTKEY_LABEL}，把 CueRelay 叫到前台并打开命令面板。",
+            bg=theme.c("surface"),
+            fg=theme.c("text_3"),
+            font=theme.font("tiny"),
+            anchor="w",
+        ).pack(fill="x", pady=(theme.px(5), 0))
 
         # 识别与校准
         card_body = self._settings_card(body, "识别与校准")
@@ -2571,6 +2595,50 @@ class App:
             return
         self._set_status("已设为开机自动启动" if enabled else "已取消开机自动启动")
 
+    def _apply_hotkey(self, enabled: bool) -> tuple[bool, str]:
+        """按设置注册或注销全局热键。返回 (成功, 原因)。"""
+
+        if enabled:
+            if self._hotkey is not None and self._hotkey.active:
+                return True, ""
+            if self._hotkey is None:
+                self._hotkey = GlobalHotkey(lambda: self.emit("hotkey", None))
+            ok, reason = self._hotkey.start()
+            if not ok:
+                # 注册失败时线程已经退出了，留着这个对象只会让人以为它还活着。
+                self._hotkey = None
+                return False, reason
+            return True, ""
+        if self._hotkey is not None:
+            self._hotkey.stop()
+            self._hotkey = None
+        return True, ""
+
+    def _start_hotkey(self) -> None:
+        """启动时按保存的设置注册热键。
+
+        注册失败要把开关纠正成关：显示"已启用"、按下去却没反应，是比直接
+        报错更难查的状态。
+        """
+
+        wanted = bool(self.store.setting("global_hotkey", True))
+        ok, reason = self._apply_hotkey(wanted)
+        if wanted and not ok:
+            self.hotkey_var.set(False)
+            self.store.update_settings(global_hotkey=False)
+            self.log("warning", f"全局热键没有启用：{reason}")
+
+    def _save_hotkey(self) -> None:
+        enabled = bool(self.hotkey_var.get())
+        ok, reason = self._apply_hotkey(enabled)
+        if not ok:
+            self.hotkey_var.set(False)
+            self.store.update_settings(global_hotkey=False)
+            messagebox.showwarning("全局热键", f"启用失败：{reason}", parent=self.root)
+            return
+        self.store.update_settings(global_hotkey=enabled)
+        self._set_status(f"全局热键已启用：{HOTKEY_LABEL}" if enabled else "全局热键已关闭")
+
     def _save_launch_v2ray(self) -> None:
         self.store.update_settings(launch_v2ray_first=bool(self.launch_v2ray_var.get()))
 
@@ -2865,6 +2933,36 @@ class App:
     def _on_palette_closed(self) -> None:
         self._palette = None
 
+    def _summon(self) -> None:
+        """全局热键按下了：把窗口叫到前台，顺手打开命令面板。
+
+        动作执行期间窗口是自己藏起来的，这时不能再拉出来——它会正好盖住
+        目标窗口上要点的位置。宁可不响应，也不要在自动化中途插一杠。
+        """
+
+        if self._hidden_for_action or (self.scheduler is not None and self.scheduler.is_busy()):
+            self.log("warning", "正在执行动作，热键暂时不唤出窗口。")
+            return
+        try:
+            if str(self.root.state()) == "withdrawn":
+                self.root.deiconify()
+            self.root.lift()
+            self._apply_topmost()
+        except tk.TclError:
+            return
+        hwnd = self.root_hwnd
+        if not hwnd:
+            try:
+                hwnd = winapi.root_window(int(self.root.winfo_id()))
+            except Exception:
+                hwnd = 0
+        if hwnd:
+            # 光 lift 不够：Windows 会把前台切换权交给"用户刚点过的那个程序"，
+            # 从别的进程调过来的窗口只能靠 SetForegroundWindow 争取一下。
+            winapi.activate_window(hwnd)
+        if self._palette is None:
+            self.open_palette()
+
     def _palette_commands(self) -> list[Command]:
         """面板里的每一条命令。顺序就是默认顺序：先视图，再动作，最后数据。"""
 
@@ -2992,6 +3090,8 @@ class App:
                 elif event == "refresh":
                     self.refresh_tasks()
                 elif event == "prepare":
+                    # 从这里开始窗口是藏起来的，热键不能把它拉出来。
+                    self._hidden_for_action = True
                     try:
                         self.root.withdraw()
                     except tk.TclError:
@@ -2999,9 +3099,15 @@ class App:
                     if isinstance(payload, object) and hasattr(payload, "set"):
                         payload.set()
                 elif event == "restore":
+                    self._hidden_for_action = False
                     try:
                         self.root.deiconify()
                         self._apply_topmost()
+                    except tk.TclError:
+                        pass
+                elif event == "hotkey":
+                    try:
+                        self._summon()
                     except tk.TclError:
                         pass
                 elif event == "overlay":
@@ -3077,6 +3183,14 @@ class App:
     def _on_close(self) -> None:
         if not messagebox.askyesno("退出", "退出后定时任务将不再执行。确定退出吗？", parent=self.root):
             return
+        # 热键是注册在这个进程上的，进程退出系统会自动收回；这里先注销一次，
+        # 是为了在窗口已经没了的情况下不让消息循环继续往界面线程丢事件。
+        if self._hotkey is not None:
+            try:
+                self._hotkey.stop()
+            except Exception:
+                pass
+            self._hotkey = None
         try:
             geometry = self.root.geometry()
             if geometry:
