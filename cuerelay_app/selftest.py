@@ -16,7 +16,7 @@ from typing import Callable, List, Tuple
 from . import vision
 from .config import parse_datetime
 from .imaging import Bitmap
-from .store import TaskStore, advance_next_run_past_now
+from .store import TaskStore, advance_next_run_past_now, duplicate_groups
 from .vision import Rect
 
 Color = Tuple[int, int, int]
@@ -107,6 +107,30 @@ def test_change_detection() -> None:
     assert vision.mean_difference(empty, filled) > 10
     assert vision.looks_changed(empty, filled)
     assert not vision.looks_changed(empty, make_bitmap(320, 80, (40, 40, 40), []))
+
+
+def test_sparse_change_detection() -> None:
+    """一小行文字也必须算"变了"。
+
+    输入框很大、消息很短时，平均亮度差会被背景稀释到阈值以下，
+    于是粘贴被误判成失败并重复粘贴，最终发出去的是两遍内容。
+    """
+
+    empty = make_bitmap(740, 100, (42, 44, 48), [])
+    panels = [((18, 18, 300, 34), (230, 230, 230))]
+    one_line = make_bitmap(740, 100, (42, 44, 48), panels)
+    assert vision.changed_ratio(empty, one_line) > 0.02, vision.changed_ratio(empty, one_line)
+    assert vision.looks_changed(empty, one_line), vision.mean_difference(empty, one_line)
+
+    # 光标闪烁只影响个别采样点，不能当成"内容变化"。
+    caret = make_bitmap(740, 100, (42, 44, 48), [((18, 18, 20, 34), (230, 230, 230))])
+    assert not vision.looks_changed(empty, caret), vision.changed_ratio(empty, caret)
+
+    # 大区域里只有一行字：用来判断"对话到底切过去了没有"。
+    big_empty = make_bitmap(1100, 640, (30, 31, 34), [])
+    big_line = make_bitmap(1100, 640, (30, 31, 34), [((350, 90, 650, 108), (226, 226, 230))])
+    assert vision.looks_changed(big_empty, big_line), vision.changed_ratio(big_empty, big_line)
+    assert not vision.looks_changed(big_empty, big_empty)
 
 
 def test_full_window_layout() -> None:
@@ -226,6 +250,47 @@ def test_time_parsing() -> None:
     assert parse_datetime("不是时间") is None
 
 
+def test_duplicate_groups() -> None:
+    """同名同内容的重复任务要能合并，且保留最近修改的一条。"""
+
+    tasks = [
+        {"id": "a", "content": "继续", "name": "睡前", "updated_at": "2026-11-01T10:00:00"},
+        {"id": "b", "content": " 继续 ", "name": "睡前", "updated_at": "2026-11-05T10:00:00"},
+        {"id": "c", "content": "继续", "name": "睡前", "updated_at": "2026-11-03T10:00:00"},
+        {"id": "d", "content": "say hi", "name": "睡前", "updated_at": "2026-11-02T10:00:00"},
+        {"id": "e", "content": "say  hi", "name": "其它", "updated_at": "2026-11-04T10:00:00"},
+        {"id": "f", "content": "独一无二", "name": "单独", "updated_at": "2026-11-04T10:00:00"},
+        {"id": "g", "content": "", "name": "空", "updated_at": "2026-11-04T10:00:00"},
+    ]
+    groups = duplicate_groups(tasks)
+    assert len(groups) == 2, [group["content"] for group in groups]
+
+    first = groups[0]
+    assert first["content"] == "继续"
+    assert first["keep"]["id"] == "b", first["keep"]
+    assert sorted(task["id"] for task in first["extra"]) == ["a", "c"]
+
+    second = groups[1]
+    assert second["content"] == "say hi"
+    assert second["keep"]["id"] == "e"
+    assert [task["id"] for task in second["extra"]] == ["d"]
+
+    # 空内容不参与判重，避免把一堆空任务合成一组。
+    assert all(group["content"] for group in groups)
+
+
+def test_delete_many() -> None:
+    with tempfile.TemporaryDirectory() as folder:
+        store = TaskStore(Path(folder) / "cuerelay_data.json")
+        for index in range(4):
+            store.add({"name": f"任务{index}", "content": f"内容{index}"})
+        ids = [str(task["id"]) for task in store.tasks()]
+        assert store.delete_many([ids[0], ids[2], "不存在的id"]) == 2
+        assert len(store.tasks()) == 2
+        assert store.delete_many([]) == 0
+        assert len(TaskStore(Path(folder) / "cuerelay_data.json").tasks()) == 2
+
+
 def test_png_preview() -> None:
     bitmap = make_bitmap(40, 20, (10, 20, 30), [])
     data, width, height = bitmap.to_png(100)
@@ -244,6 +309,78 @@ def test_png_preview() -> None:
     assert small.startswith(b"\x89PNG\r\n\x1a\n")
 
 
+class _RecordingOverlay:
+    """只记录调用，不碰 Tk，这样自检不需要显示器。"""
+
+    def __init__(self) -> None:
+        self.calls: List[tuple] = []
+
+    def show(self, rect: dict) -> None:
+        self.calls.append(("show", rect))
+
+    def hide(self) -> None:
+        self.calls.append(("hide",))
+
+    def box(self, rect: dict, kind: str, label: str) -> None:
+        self.calls.append(("box", rect, kind, label))
+
+    def clear_boxes(self) -> None:
+        self.calls.append(("clear",))
+
+    def progress(self, index: int, total: int, text: str, tone: str) -> None:
+        self.calls.append(("progress", index, total, text, tone))
+
+
+def test_overlay_events() -> None:
+    """浮层事件翻译必须容错：线程发来的脏数据不能把执行带崩。"""
+
+    from .ui.overlay import apply_event
+
+    sink = _RecordingOverlay()
+    rect = {"left": 10, "top": 20, "width": 300, "height": 200}
+    apply_event(sink, {"action": "show", "rect": rect})
+    apply_event(sink, {"action": "progress", "index": "2", "total": "5", "text": "校验粘贴", "tone": "success"})
+    apply_event(
+        sink,
+        {"action": "box", "rect": {"left": 1, "top": 2, "right": 3, "bottom": 4}, "kind": "composer", "label": "输入框"},
+    )
+    apply_event(sink, {"action": "clear"})
+    apply_event(sink, {"action": "hide"})
+
+    # 脏载荷：None、缺字段、未知动作，都应该被安静地忽略。
+    apply_event(sink, None)
+    apply_event(sink, "not a dict")
+    apply_event(sink, {"action": "progress", "index": None, "total": None})
+    apply_event(sink, {"action": "不存在的动作"})
+
+    assert sink.calls[0] == ("show", rect), sink.calls[0]
+    assert sink.calls[1] == ("progress", 2, 5, "校验粘贴", "success"), sink.calls[1]
+    assert sink.calls[2][0] == "box" and sink.calls[2][2] == "composer", sink.calls[2]
+    assert sink.calls[3] == ("clear",), sink.calls[3]
+    assert sink.calls[4] == ("hide",), sink.calls[4]
+    assert sink.calls[5] == ("progress", 0, 1, "", "accent"), sink.calls[5]
+    assert len(sink.calls) == 6, sink.calls
+
+
+def test_settings_bool_coercion() -> None:
+    """手改过的配置文件里 "false" 不能被当成 True。"""
+
+    with tempfile.TemporaryDirectory() as folder:
+        path = Path(folder) / "cuerelay_data.json"
+        path.write_text(
+            json.dumps(
+                {"version": 2, "settings": {"show_overlay": "false", "verify_send": 0}, "tasks": []},
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+        settings = TaskStore(path).settings()
+        assert settings["show_overlay"] is False, settings["show_overlay"]
+        assert settings["verify_send"] is False, settings["verify_send"]
+        assert settings["verify_paste"] is True, settings["verify_paste"]
+        assert settings["strict_conversation"] is True
+
+
 TESTS: List[Tuple[str, Callable[[], None]]] = [
     ("颜色众数", test_modal_color),
     ("输入框识别", test_composer_detection),
@@ -251,11 +388,16 @@ TESTS: List[Tuple[str, Callable[[], None]]] = [
     ("发送按钮识别", test_send_button_detection),
     ("整窗识别", test_full_window_layout),
     ("界面变化检测", test_change_detection),
+    ("短消息变化检测", test_sparse_change_detection),
     ("矩形缩放", test_rect_scaling),
     ("调度推进", test_schedule_advance),
     ("旧数据迁移", test_store_migration),
     ("时间解析", test_time_parsing),
+    ("重复任务归组", test_duplicate_groups),
+    ("批量删除", test_delete_many),
     ("预览图生成", test_png_preview),
+    ("浮层事件翻译", test_overlay_events),
+    ("设置布尔纠正", test_settings_bool_coercion),
 ]
 
 

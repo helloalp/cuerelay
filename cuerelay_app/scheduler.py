@@ -98,6 +98,7 @@ class Scheduler:
                 settings,
                 lambda level, message: self.emit("log", (level, message)),
                 exclude_hwnd=self.exclude_hwnd,
+                emit=self.emit,
             ).paste_only(content)
             self._persist_composer(settings)
         except Exception as exc:
@@ -206,6 +207,7 @@ class Scheduler:
                 settings,
                 lambda level, message: self.emit("log", (level, message)),
                 exclude_hwnd=self.exclude_hwnd,
+                emit=self.emit,
             )
             runner.run_task(task)
 

@@ -220,6 +220,11 @@ SWP_SHOWWINDOW = 0x0040
 HWND_TOPMOST = -1
 HWND_NOTOPMOST = -2
 DWMWA_USE_IMMERSIVE_DARK_MODE = 20
+GWL_EXSTYLE = -20
+WS_EX_LAYERED = 0x00080000
+WS_EX_TRANSPARENT = 0x00000020
+WS_EX_NOACTIVATE = 0x08000000
+WS_EX_TOOLWINDOW = 0x00000080
 
 
 def _require() -> None:
@@ -401,6 +406,30 @@ def root_window(hwnd: int) -> int:
     except Exception:
         return int(hwnd)
     return root or int(hwnd)
+
+
+def make_click_through(hwnd: int) -> bool:
+    """把窗口变成不抢焦点、不接收鼠标的浮层。
+
+    只用颜色键做透明时，画上去的框线仍然会挡住点击；加上 WS_EX_TRANSPARENT
+    之后整个窗口对鼠标完全透明，自动化点击才能穿透到目标应用。
+    """
+
+    if not IS_WINDOWS or not hwnd:
+        return False
+    try:
+        getter = getattr(user32, "GetWindowLongPtrW", None) or user32.GetWindowLongW
+        setter = getattr(user32, "SetWindowLongPtrW", None) or user32.SetWindowLongW
+        getter.argtypes = [HWND, ctypes.c_int]
+        getter.restype = ctypes.c_ssize_t
+        setter.argtypes = [HWND, ctypes.c_int, ctypes.c_ssize_t]
+        setter.restype = ctypes.c_ssize_t
+        style = int(getter(HWND(int(hwnd)), GWL_EXSTYLE))
+        style |= WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW
+        setter(HWND(int(hwnd)), GWL_EXSTYLE, ctypes.c_ssize_t(style))
+        return True
+    except Exception:
+        return False
 
 
 def enumerate_windows() -> list[dict[str, Any]]:

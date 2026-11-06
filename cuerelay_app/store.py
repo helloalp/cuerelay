@@ -10,6 +10,7 @@ from __future__ import annotations
 import datetime as _dt
 import json
 import os
+import re
 import threading
 import time
 import uuid
@@ -40,6 +41,8 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "verify_paste": True,
     "verify_send": True,
     "strict_conversation": True,
+    # 执行时在目标窗口上盖一层框线浮层，标出识别到的输入框与发送按钮。
+    "show_overlay": True,
     "default_action": "click",
     # 空字符串表示"按屏幕大小自动决定"，避免把物理像素当成设计尺寸。
     "window_size": "",
@@ -105,6 +108,22 @@ def _coerce_int(value: Any, default: int, low: int, high: int) -> int:
     except (TypeError, ValueError):
         return default
     return max(low, min(high, number))
+
+
+def _coerce_bool(value: Any, default: bool) -> bool:
+    """配置文件是手改过的 JSON，字符串 "false" 不能被当成 True。"""
+
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if text in ("1", "true", "yes", "on"):
+            return True
+        if text in ("0", "false", "no", "off", ""):
+            return False
+    return default
 
 
 def normalize_task(item: dict[str, Any]) -> dict[str, Any]:
@@ -185,6 +204,8 @@ def schedule_text(task: dict[str, Any]) -> str:
 
 def next_run_text(task: dict[str, Any]) -> str:
     state = task_state(task)
+    if state == "failed":
+        return "失败"
     if state == "expired":
         return "已跳过"
     if state == "paused":
@@ -198,6 +219,79 @@ def next_run_text(task: dict[str, Any]) -> str:
 
 def task_summary(task: dict[str, Any]) -> str:
     return f"{schedule_text(task)} · {next_run_text(task)}"
+
+
+def content_snippet(task: dict[str, Any], limit: int = 46) -> str:
+    """列表里用来区分同名任务的一行内容摘要。"""
+
+    text = " ".join(str(task.get("content") or "").split())
+    if not text:
+        return "（空内容）"
+    return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
+# ---------------------------------------------------------------------------
+# 分组与整理
+# ---------------------------------------------------------------------------
+
+# 列表按这三组展示，避免几十个任务平铺在一起分不清轻重。
+GROUP_ORDER: tuple[tuple[str, str, tuple[str, ...]], ...] = (
+    ("active", "进行中", ("running", "waiting")),
+    ("failed", "失败", ("failed",)),
+    ("idle", "已停止", ("paused", "done", "expired")),
+)
+
+
+def state_group(task: dict[str, Any]) -> str:
+    state = task_state(task)
+    for key, _label, states in GROUP_ORDER:
+        if state in states:
+            return key
+    return "idle"
+
+
+def group_label(key: str) -> str:
+    for group_key, label, _states in GROUP_ORDER:
+        if group_key == key:
+            return label
+    return "其它"
+
+
+def content_signature(task: dict[str, Any]) -> str:
+    """判重用的归一化内容：忽略大小写与空白差异。"""
+
+    return re.sub(r"\s+", " ", str(task.get("content") or "").strip()).lower()
+
+
+def duplicate_groups(tasks: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """内容完全相同的任务归为一组，每组保留最近修改的一条。
+
+    返回 [{"content": 归一化内容, "keep": 保留的任务, "extra": [可删除的任务]}]，
+    按可删除数量从多到少排序。
+    """
+
+    buckets: dict[str, list[dict[str, Any]]] = {}
+    for task in tasks:
+        key = content_signature(task)
+        if not key:
+            continue
+        buckets.setdefault(key, []).append(task)
+
+    groups: list[dict[str, Any]] = []
+    for key, items in buckets.items():
+        if len(items) < 2:
+            continue
+        items.sort(
+            key=lambda item: str(item.get("updated_at") or item.get("created_at") or ""),
+            reverse=True,
+        )
+        groups.append({"content": key, "keep": items[0], "extra": items[1:]})
+    groups.sort(key=lambda group: (-len(group["extra"]), group["content"]))
+    return groups
+
+
+def stopped_tasks(tasks: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [task for task in tasks if state_group(task) == "idle"]
 
 
 class TaskStore:
@@ -280,6 +374,9 @@ class TaskStore:
         settings["catch_up_seconds"] = _coerce_int(
             settings.get("catch_up_seconds"), config.SCHEDULE_CATCH_UP_SECONDS, 0, 3600
         )
+        settings["show_overlay"] = _coerce_bool(settings.get("show_overlay"), True)
+        for key in ("recognition_enabled", "verify_paste", "verify_send", "strict_conversation"):
+            settings[key] = _coerce_bool(settings.get(key), True)
 
         tasks = [normalize_task(item) for item in raw_tasks if isinstance(item, dict)]
         return {"version": SCHEMA_VERSION, "settings": settings, "tasks": tasks}
@@ -421,6 +518,22 @@ class TaskStore:
                 self._save_locked()
                 return True
         return False
+
+    def delete_many(self, task_ids: list[str]) -> int:
+        """批量删除，返回实际删除的数量。"""
+
+        targets = {str(task_id) for task_id in task_ids}
+        if not targets:
+            return 0
+        with self._lock:
+            before = len(self.data.get("tasks", []))
+            self.data["tasks"] = [
+                task for task in self.data.get("tasks", []) if str(task.get("id")) not in targets
+            ]
+            removed = before - len(self.data["tasks"])
+            if removed:
+                self._save_locked()
+            return removed
 
     def record_run(self, task_id: str, ok: bool, message: str, duration_ms: int) -> None:
         with self._lock:

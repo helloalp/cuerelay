@@ -20,9 +20,17 @@ from ..automation import AutomationError
 from ..config import friendly_error, iso_datetime, now_local, parse_datetime
 from ..hotkey import VirtualCapture
 from ..scheduler import Scheduler
-from ..store import TaskStore, advance_next_run_past_now, task_state, task_summary
+from ..store import (
+    TaskStore,
+    advance_next_run_past_now,
+    content_snippet,
+    next_run_text,
+    task_state,
+)
 from .calibrate import CalibrationDialog
+from .overlay import Overlay, apply_event
 from .theme import Theme
+from .tidy import TidyDialog
 from .widgets import Button, Field, ScrollArea, Segmented, Switch, TextArea, card, dispatch_wheel
 
 ACTION_OPTIONS = (("click", "点击发送"), ("enter", "Enter 发送"))
@@ -67,6 +75,7 @@ class App:
 
         settings = self.store.settings()
         self.theme = Theme(str(settings.get("theme") or "light"), winapi.get_system_dpi())
+        self.overlay = Overlay(self.root, self.theme)
 
         self._create_variables(settings)
         self._configure_root()
@@ -105,6 +114,7 @@ class App:
         self.verify_paste_var = tk.BooleanVar(value=bool(settings.get("verify_paste", True)))
         self.verify_send_var = tk.BooleanVar(value=bool(settings.get("verify_send", True)))
         self.strict_var = tk.BooleanVar(value=bool(settings.get("strict_conversation", True)))
+        self.overlay_var = tk.BooleanVar(value=bool(settings.get("show_overlay", True)))
         self.keywords_var = tk.StringVar(value=str(settings.get("target_keywords") or ""))
         self.catch_up_var = tk.StringVar(value=str(int(settings.get("catch_up_seconds", 300) or 300) // 60))
         try:
@@ -376,17 +386,20 @@ class App:
 
         head = tk.Frame(left, bg=theme.c("bg"))
         head.pack(fill="x", pady=(theme.px(16), theme.px(10)))
-        tk.Label(
+        self.list_count_label = tk.Label(
             head,
-            text="任务",
+            textvariable=self.count_var,
             bg=theme.c("bg"),
-            fg=theme.c("text"),
-            font=theme.font("section"),
+            fg=theme.c("text_3"),
+            font=theme.font("small"),
             anchor="w",
-        ).pack(side="left")
+        )
+        self.list_count_label.pack(side="left")
         Button(head, theme, "新建", self.new_task, kind="ghost", size="sm").pack(side="right")
+        self.tidy_button = Button(head, theme, "整理", self.tidy_tasks, kind="ghost", size="sm")
+        self.tidy_button.pack(side="right", padx=(0, theme.px(6)))
 
-        search = Field(left, theme, "", self.filter_var, bg_key="bg", placeholder="搜索任务")
+        search = Field(left, theme, "", self.filter_var, bg_key="bg", placeholder="搜索名称或内容")
         search.pack(fill="x", pady=(0, theme.px(10)))
         search.entry.configure(font=theme.font("small"))
 
@@ -409,10 +422,11 @@ class App:
         actions.grid(row=1, column=0, sticky="ew", pady=(theme.px(12), 0))
         self.delete_button = Button(actions, theme, "删除", self.delete_task, kind="danger")
         self.delete_button.pack(side="left")
-        self.save_button = Button(actions, theme, "保存", self.save_task, kind="primary")
-        self.save_button.pack(side="right")
-        self.run_button = Button(actions, theme, "保存并运行", self.save_and_run, kind="ghost")
-        self.run_button.pack(side="right", padx=(0, theme.px(8)))
+        # 主按钮只有一个：立刻把这条提示词发出去。保存是次要动作。
+        self.run_button = Button(actions, theme, "立即执行", self.save_and_run, kind="primary")
+        self.run_button.pack(side="right")
+        self.save_button = Button(actions, theme, "保存", self.save_task, kind="ghost")
+        self.save_button.pack(side="right", padx=(0, theme.px(8)))
         self.editor_state = tk.Label(
             actions,
             text="",
@@ -445,21 +459,10 @@ class App:
         self.name_field = Field(body, theme, "名称", self.name_var)
         self.name_field.pack(fill="x", padx=pad)
 
-        self.prompt_area = TextArea(body, theme, "提示词", height=11)
-        self.prompt_area.pack(fill="both", expand=True, padx=pad, pady=(theme.px(16), 0))
-
-        meta = tk.Frame(body, bg=theme.c("surface"))
-        meta.pack(fill="x", padx=pad, pady=(theme.px(6), 0))
-        self.char_label = tk.Label(
-            meta,
-            text="",
-            bg=theme.c("surface"),
-            fg=theme.c("text_3"),
-            font=theme.font("tiny"),
-            anchor="e",
-        )
-        self.char_label.pack(side="right")
-        self.prompt_area.text.bind("<KeyRelease>", lambda _e: self._update_char_count())
+        # 提示词不再吃掉全部剩余高度：把计划、发送方式、目标对话留在首屏可见，
+        # 用户一眼就能看完整条流程（写什么 -> 发到哪 -> 什么时候发 -> 怎么发）。
+        self.prompt_area = TextArea(body, theme, "提示词", height=7)
+        self.prompt_area.pack(fill="x", padx=pad, pady=(theme.px(14), 0))
 
         schedule_head = tk.Label(
             body,
@@ -469,28 +472,22 @@ class App:
             font=theme.font("small"),
             anchor="w",
         )
-        schedule_head.pack(fill="x", padx=pad, pady=(theme.px(18), theme.px(6)))
+        schedule_head.pack(fill="x", padx=pad, pady=(theme.px(16), theme.px(6)))
         Segmented(body, theme, SCHEDULE_OPTIONS, self.schedule_var, self._on_schedule_change).pack(
             fill="x", padx=pad
         )
 
         self.schedule_holder = tk.Frame(body, bg=theme.c("surface"))
-        self.schedule_holder.pack(fill="x", padx=pad, pady=(theme.px(12), 0))
+        self.schedule_holder.pack(fill="x", padx=pad, pady=(theme.px(10), 0))
 
         self.time_row = tk.Frame(self.schedule_holder, bg=theme.c("surface"))
-        date_field = Field(self.time_row, theme, "日期", self.date_var, hint="格式 2026-11-06")
+        date_field = Field(self.time_row, theme, "日期", self.date_var)
         date_field.pack(side="left", fill="x", expand=True)
-        time_field = Field(self.time_row, theme, "时间", self.time_var, hint="24 小时制")
+        time_field = Field(self.time_row, theme, "时间", self.time_var)
         time_field.pack(side="left", fill="x", expand=True, padx=(theme.px(12), 0))
 
         self.interval_row = tk.Frame(self.schedule_holder, bg=theme.c("surface"))
-        Field(
-            self.interval_row,
-            theme,
-            "间隔分钟",
-            self.interval_var,
-            hint="从保存时刻开始计算下一次执行",
-        ).pack(fill="x")
+        Field(self.interval_row, theme, "间隔分钟", self.interval_var).pack(fill="x")
 
         action_head = tk.Label(
             body,
@@ -500,28 +497,19 @@ class App:
             font=theme.font("small"),
             anchor="w",
         )
-        action_head.pack(fill="x", padx=pad, pady=(theme.px(18), theme.px(6)))
+        action_head.pack(fill="x", padx=pad, pady=(theme.px(16), theme.px(6)))
         Segmented(body, theme, ACTION_OPTIONS, self.action_var).pack(fill="x", padx=pad)
-        tk.Label(
-            body,
-            text="点击发送会在每次执行时重新识别按钮位置；识别失败会自动改用 Enter。",
-            bg=theme.c("surface"),
-            fg=theme.c("text_3"),
-            font=theme.font("tiny"),
-            anchor="w",
-        ).pack(fill="x", padx=pad, pady=(theme.px(6), 0))
 
         self.conversation_field = Field(
             body,
             theme,
             "目标对话",
             self.conversation_var,
-            hint="留空则在当前对话发送",
+            placeholder="留空则发送到当前对话",
         )
-        self.conversation_field.pack(fill="x", padx=pad, pady=(theme.px(18), pad))
+        self.conversation_field.pack(fill="x", padx=pad, pady=(theme.px(14), pad))
 
         self._on_schedule_change(self.schedule_var.get())
-        self._update_char_count()
 
     def _on_schedule_change(self, value: str) -> None:
         if value == "interval":
@@ -530,12 +518,6 @@ class App:
         else:
             self.interval_row.pack_forget()
             self.time_row.pack(fill="x")
-
-    def _update_char_count(self) -> None:
-        if not hasattr(self, "prompt_area"):
-            return
-        count = len(self.prompt_area.get())
-        self.char_label.configure(text=f"{count} 字")
 
     # ------------------------------------------------------------------
     # 日志视图
@@ -743,6 +725,7 @@ class App:
         switches = tk.Frame(inner, bg=theme.c("surface"))
         switches.pack(fill="x", pady=(theme.px(10), 0))
         for text, variable, command in (
+            ("执行时显示识别框线", self.overlay_var, self._save_recognition),
             ("执行时重新识别界面", self.recognition_var, self._save_recognition),
             ("校验粘贴结果", self.verify_paste_var, self._save_recognition),
             ("校验发送结果", self.verify_send_var, self._save_recognition),
@@ -875,8 +858,16 @@ class App:
             ]
         tasks.sort(key=self._sort_key)
 
+        grouped = self._group_tasks(tasks)
         signature = tuple(
-            (task.get("id"), task.get("name"), task_state(task), task_summary(task)) for task in tasks
+            (
+                key,
+                tuple(
+                    (task.get("id"), task.get("name"), next_run_text(task), content_snippet(task))
+                    for task in items
+                ),
+            )
+            for key, items in grouped
         )
         if not force and signature == self._list_signature:
             return
@@ -887,20 +878,54 @@ class App:
         self._row_widgets.clear()
 
         if not tasks:
+            message = "没有匹配的任务" if keyword else "还没有任务，点右上角「新建」"
             tk.Label(
                 self.list_body,
-                text="还没有任务",
+                text=message,
                 bg=self.theme.c("bg"),
                 fg=self.theme.c("text_3"),
                 font=self.theme.font("small"),
                 anchor="w",
             ).pack(fill="x", padx=self.theme.px(4), pady=self.theme.px(14))
-        for task in tasks:
-            self._render_row(task)
+        for key, items in grouped:
+            self._render_group_head(key, len(items))
+            for task in items:
+                self._render_row(task)
 
         total = len(self.store.tasks())
         self.count_var.set(f"{total} 个任务")
         self._apply_selection()
+
+    def _group_tasks(self, tasks: list[dict[str, Any]]) -> list[tuple[str, list[dict[str, Any]]]]:
+        buckets: dict[str, list[dict[str, Any]]] = {}
+        for task in tasks:
+            buckets.setdefault(store_module.state_group(task), []).append(task)
+        return [
+            (key, buckets[key])
+            for key, _label, _states in store_module.GROUP_ORDER
+            if buckets.get(key)
+        ]
+
+    def _render_group_head(self, key: str, count: int) -> None:
+        theme = self.theme
+        head = tk.Frame(self.list_body, bg=theme.c("bg"))
+        head.pack(fill="x", padx=theme.px(4), pady=(theme.px(10), theme.px(4)))
+        tk.Label(
+            head,
+            text=store_module.group_label(key),
+            bg=theme.c("bg"),
+            fg=theme.c("text_2"),
+            font=theme.font("small_strong"),
+            anchor="w",
+        ).pack(side="left")
+        tk.Label(
+            head,
+            text=str(count),
+            bg=theme.c("bg"),
+            fg=theme.c("text_3"),
+            font=theme.font("tiny"),
+            anchor="e",
+        ).pack(side="right")
 
     @staticmethod
     def _sort_key(task: dict[str, Any]) -> tuple:
@@ -919,21 +944,11 @@ class App:
         content = tk.Frame(row, bg=theme.c("bg"))
         content.pack(side="left", fill="both", expand=True, padx=(theme.px(11), theme.px(6)), pady=theme.px(8))
 
-        name_label = tk.Label(
-            content,
-            text=str(task.get("name") or "未命名任务"),
-            bg=theme.c("bg"),
-            fg=theme.c("text"),
-            font=theme.font("strong"),
-            anchor="w",
-        )
-        name_label.pack(fill="x")
-
-        meta = tk.Frame(content, bg=theme.c("bg"))
-        meta.pack(fill="x", pady=(theme.px(3), 0))
+        name_row = tk.Frame(content, bg=theme.c("bg"))
+        name_row.pack(fill="x")
         state = task_state(task)
         dot = tk.Canvas(
-            meta,
+            name_row,
             width=theme.px(7),
             height=theme.px(7),
             bg=theme.c("bg"),
@@ -941,18 +956,38 @@ class App:
             bd=0,
         )
         dot.create_oval(0, 0, theme.px(6), theme.px(6), fill=theme.tone(store_module.STATE_TONE[state]), outline="")
-        dot.pack(side="left", pady=(theme.px(2), 0))
+        dot.pack(side="left", pady=(theme.px(5), 0))
+        name_label = tk.Label(
+            name_row,
+            text=str(task.get("name") or "未命名任务"),
+            bg=theme.c("bg"),
+            fg=theme.c("text"),
+            font=theme.font("strong"),
+            anchor="w",
+        )
+        name_label.pack(side="left", padx=(theme.px(7), 0))
+
         meta_label = tk.Label(
-            meta,
-            text=task_summary(task),
+            name_row,
+            text=next_run_text(task),
             bg=theme.c("bg"),
             fg=theme.c("text_3"),
+            font=theme.font("tiny"),
+            anchor="e",
+        )
+        meta_label.pack(side="right")
+
+        snippet_label = tk.Label(
+            content,
+            text=content_snippet(task, 40),
+            bg=theme.c("bg"),
+            fg=theme.c("text_2"),
             font=theme.font("small"),
             anchor="w",
         )
-        meta_label.pack(side="left", padx=(theme.px(6), 0))
+        snippet_label.pack(fill="x", padx=(theme.px(14), 0), pady=(theme.px(3), 0))
 
-        widgets = (row, content, name_label, meta, meta_label)
+        widgets = (row, content, name_row, name_label, snippet_label, meta_label)
         for widget in widgets:
             widget.bind("<Button-1>", lambda _event, tid=task_id: self.select_task(tid))
             widget.bind("<Button-3>", lambda event, tid=task_id: self._open_row_menu(event, tid))
@@ -963,8 +998,9 @@ class App:
             "row": row,
             "bar": bar,
             "content": content,
+            "name_row": name_row,
             "name": name_label,
-            "meta": meta,
+            "snippet": snippet_label,
             "meta_label": meta_label,
             "dot": dot,
             "hover": False,
@@ -992,8 +1028,9 @@ class App:
         try:
             parts["row"].configure(bg=background)
             parts["content"].configure(bg=background)
+            parts["name_row"].configure(bg=background)
             parts["name"].configure(bg=background, fg=theme.c("accent_label") if selected else theme.c("text"))
-            parts["meta"].configure(bg=background)
+            parts["snippet"].configure(bg=background)
             parts["meta_label"].configure(bg=background)
             parts["dot"].configure(bg=background)
             parts["bar"].configure(bg=theme.c("accent") if selected else background)
@@ -1055,7 +1092,6 @@ class App:
         if hasattr(self, "prompt_area"):
             self.prompt_area.set(self.draft["content"])
             self._on_schedule_change(self.draft["schedule"])
-            self._update_char_count()
 
     def _sync_draft_from_editor(self) -> None:
         self.draft["name"] = self.name_var.get().strip()
@@ -1253,6 +1289,30 @@ class App:
         self.log("info", f"已复制：{created.get('name')}")
         self._set_status(f"已复制：{created.get('name')}")
 
+    def tidy_tasks(self) -> None:
+        tasks = self.store.tasks()
+        if len(tasks) < 2:
+            messagebox.showinfo("整理任务", "任务太少，暂时不需要整理。", parent=self.root)
+            return
+        TidyDialog(self.root, self.theme, tasks, self._apply_tidy)
+
+    def _apply_tidy(self, task_ids: list[str]) -> None:
+        removed = self.store.delete_many(task_ids)
+        if self.draft["id"] and self.draft["id"] in set(task_ids):
+            self.selected_id = None
+            self.draft = _empty_draft()
+            self._sync_editor_from_draft()
+            self._baseline = self._editor_signature()
+            self.editor_title.configure(text="新建任务")
+            self.delete_button.set_enabled(False)
+            self.editor_state.configure(text="", fg=self.theme.c("text_3"))
+        if self.selected_id and not self.store.get(self.selected_id):
+            self.selected_id = None
+        self._list_signature = None
+        self.refresh_tasks(force=True)
+        self.log("info", f"整理完成：删除 {removed} 个任务")
+        self._set_status(f"已删除 {removed} 个任务，剩余 {len(self.store.tasks())} 个")
+
     def _open_row_menu(self, event, task_id: str) -> None:
         task = self.store.get(task_id)
         if not task:
@@ -1336,6 +1396,7 @@ class App:
             verify_paste=bool(self.verify_paste_var.get()),
             verify_send=bool(self.verify_send_var.get()),
             strict_conversation=bool(self.strict_var.get()),
+            show_overlay=bool(self.overlay_var.get()),
         )
         self._set_status("识别设置已保存")
 
@@ -1365,6 +1426,7 @@ class App:
         self._sync_draft_from_editor()
         self.store.update_settings(theme=value)
         self.theme = Theme(value, winapi.get_system_dpi())
+        self.overlay.retheme(self.theme)
         self._build()
         self.refresh_tasks(force=True)
         self._sync_editor_from_draft()
@@ -1585,6 +1647,11 @@ class App:
                         self._apply_topmost()
                     except tk.TclError:
                         pass
+                elif event == "overlay":
+                    try:
+                        apply_event(self.overlay, payload)
+                    except tk.TclError:
+                        pass
         except queue.Empty:
             pass
         try:
@@ -1615,7 +1682,12 @@ class App:
             pass
 
     def _set_status(self, message: str) -> None:
-        self.status_var.set(message)
+        """状态栏只放一行结论，长句子折成单行并截断，避免变成一段说明文字。"""
+
+        text = " ".join(str(message or "").split())
+        if len(text) > 56:
+            text = text[:55] + "…"
+        self.status_var.set(text)
 
     # ------------------------------------------------------------------
     # 关闭
@@ -1636,6 +1708,10 @@ class App:
             except Exception:
                 pass
         self._after_ids = []
+        try:
+            self.overlay.destroy()
+        except Exception:
+            pass
         if self.scheduler:
             self.scheduler.stop()
         try:

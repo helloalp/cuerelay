@@ -34,10 +34,38 @@ class Runner:
         settings: dict[str, Any],
         log: Callable[[str, str], None],
         exclude_hwnd: int = 0,
+        emit: Optional[Callable[[str, Any], None]] = None,
     ) -> None:
         self.settings = settings
         self.log = log
         self.exclude_hwnd = int(exclude_hwnd or 0)
+        self.emit = emit
+
+    # -- 浮层 ----------------------------------------------------------
+
+    def _overlay(self, action: str, **payload: Any) -> None:
+        """浮层只是给人看的，任何异常都不能影响执行。"""
+
+        if self.emit is None:
+            return
+        if not self.settings.get("show_overlay", True):
+            return
+        try:
+            self.emit("overlay", {"action": action, **payload})
+        except Exception:
+            pass
+
+    def _overlay_hide(self) -> None:
+        self._overlay("hide")
+
+    def _overlay_show(self, frame: locator.Frame) -> None:
+        self._overlay("show", rect=dict(frame.rect))
+
+    def _overlay_box(self, rect: Rect, kind: str, label: str = "") -> None:
+        self._overlay("box", rect=rect.as_dict(), kind=kind, label=label)
+
+    def _overlay_progress(self, index: int, total: int, text: str, tone: str = "accent") -> None:
+        self._overlay("progress", index=index, total=total, text=text, tone=tone)
 
     # -- 基础 ----------------------------------------------------------
 
@@ -121,6 +149,14 @@ class Runner:
             self.log("warning", "无法定位左侧搜索框，改为在当前对话发送。")
             return
 
+        # 切换前先记住右侧消息区的样子：切没切过去，看它变没变。
+        # 搜索不到对话时右侧不会有任何变化，据此可以拦住"发错对话"。
+        region = None
+        baseline = None
+        if composer is not None:
+            region = vision.Rect(composer.left, 0, frame.width, max(1, composer.top))
+            baseline = self._capture(frame.to_screen(region))
+
         self.log("info", f"切换对话：{title}")
         winapi.click(frame.point_to_screen(point))
         time.sleep(self._delay())
@@ -132,6 +168,18 @@ class Runner:
         time.sleep(self._delay())
         if winapi.foreground_window() != hwnd:
             raise AutomationError("切换对话后目标窗口失去焦点。")
+
+        if region is None or baseline is None:
+            return
+        switched, _ = self._wait_change(frame.to_screen(region), baseline, 6.0)
+        if switched:
+            return
+        # 目标对话本来就是当前对话时，消息区不会变化，所以这里只提示不中止，
+        # 避免把"本来就在这个对话里"的正常任务拦下来。
+        self.log(
+            "warning",
+            f"没有检测到对话切换：{title}。如果该对话名不存在，消息会发到当前对话。",
+        )
 
     # -- 粘贴 ----------------------------------------------------------
 
@@ -158,6 +206,20 @@ class Runner:
         action = str(task.get("action") or "click")
         conversation = str(task.get("conversation_title") or "").strip()
 
+        steps = 3
+        if conversation:
+            steps += 1
+        if self.settings.get("verify_paste", True):
+            steps += 1
+        if self.settings.get("verify_send", True):
+            steps += 1
+        step_index = 0
+
+        def advance(text: str, tone: str = "accent") -> None:
+            nonlocal step_index
+            step_index += 1
+            self._overlay_progress(step_index, steps, text, tone)
+
         old_clipboard = winapi.get_clipboard_text()
         try:
             saved_cursor = None
@@ -172,21 +234,33 @@ class Runner:
             time.sleep(min(self._delay(), 0.6))
 
             if conversation:
+                advance("切换对话")
                 self._switch_conversation(hwnd, conversation)
 
+            advance("定位输入框")
             frame, composer, source = self._resolve_composer(hwnd)
             self.log("info", f"输入框定位：{source}")
+            self._overlay_show(frame)
+            self._overlay_box(
+                frame.to_screen(composer),
+                "composer",
+                f"输入框 · {source} · {composer.width}×{composer.height}",
+            )
             locator.remember_composer(self.settings, frame, composer)
 
             screen_composer = frame.to_screen(composer)
+            winapi.set_clipboard_text(content)
+
+            advance("粘贴提示词")
+            # 基线要在浮层画完之后取：浮层同样会被截进画面，
+            # 否则"输入框是否变化"会被自己的框线骗成"已经变化"。
             baseline = self._capture(screen_composer)
             if baseline is None:
                 raise AutomationError("无法读取输入框画面，请确认目标窗口没有被遮挡。")
-            winapi.set_clipboard_text(content)
-
             self._paste(hwnd, frame, composer)
             verify_paste = bool(self.settings.get("verify_paste", True))
             if verify_paste:
+                advance("校验粘贴")
                 changed, _ = self._wait_change(screen_composer, baseline, 4.0)
                 if not changed:
                     self.log("warning", "输入框没有变化，重试粘贴。")
@@ -202,14 +276,36 @@ class Runner:
             grown, _ = self._locator().composer(fresh)
             if grown is None:
                 grown = composer
+            self._overlay_show(fresh)
+            self._overlay_box(
+                fresh.to_screen(grown),
+                "composer",
+                f"输入框 · {grown.width}×{grown.height}",
+            )
             send_region = fresh.to_screen(grown)
-            before_send = self._capture(send_region)
 
             send_point = None
             if action == "click":
                 send_point = self._locator().send_point(fresh, grown)
+            advance("发送")
+            screen_send = None
             if send_point is not None:
-                winapi.click(fresh.point_to_screen(send_point))
+                screen_send = fresh.point_to_screen(send_point)
+                half = 22
+                self._overlay_box(
+                    vision.Rect(
+                        screen_send[0] - half,
+                        screen_send[1] - half,
+                        screen_send[0] + half,
+                        screen_send[1] + half,
+                    ),
+                    "send",
+                    "发送按钮",
+                )
+            # 发送按钮的框线可能压在输入框上，基线必须在画完框之后再取。
+            before_send = self._capture(send_region)
+            if screen_send is not None:
+                winapi.click(screen_send)
             else:
                 if action == "click":
                     self.log("warning", "未识别到发送按钮，改用 Enter 发送。")
@@ -217,6 +313,7 @@ class Runner:
 
             verify_send = bool(self.settings.get("verify_send", True))
             if verify_send:
+                advance("校验发送")
                 cleared, _ = self._wait_change(send_region, before_send, 6.0)
                 if not cleared:
                     self.log("warning", "输入框没有清空，补按一次 Enter。")
@@ -228,6 +325,7 @@ class Runner:
                 time.sleep(min(self._delay(), 1.0))
 
             elapsed = int((time.monotonic() - started) * 1000)
+            self._overlay_progress(step_index, steps, "已发送", "success")
             self.log("success", f"已发送：{task.get('name') or '未命名任务'}")
             return RunOutcome(True, "已发送", elapsed)
         finally:
@@ -241,6 +339,7 @@ class Runner:
                     winapi.move_cursor(saved_cursor)
                 except Exception:
                     pass
+            self._overlay_hide()
 
     def paste_only(self, content: str) -> RunOutcome:
         """只粘贴不发送，用于验证识别与输入框定位是否正常。"""

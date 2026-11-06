@@ -481,10 +481,14 @@ def detect_search_field(bitmap: Bitmap, sidebar_right: int) -> Optional[Rect]:
         max_height=64,
         min_share=0.45,
         min_delta=5,
-        limit=3,
+        limit=8,
     )
     if not candidates:
         return None
+
+    # 搜索框永远在侧边栏最上方，所以按纵向位置取最靠上的候选。
+    # 按打分排序会选中下面的会话行——它们同样是"一块均匀面板"。
+    candidates.sort(key=lambda item: item[0])
 
     seed = (xs[0] + xs[-1]) // 2
     for top, bottom, inside in candidates:
@@ -522,7 +526,34 @@ def mean_difference(first: Bitmap, second: Bitmap) -> float:
     return total / max(1, count)
 
 
+def changed_ratio(first: Bitmap, second: Bitmap, delta: int = 8) -> float:
+    """明显发生变化的采样点占比。
+
+    短消息只占输入框很小一块，平均亮度差会被大片背景稀释到阈值以下，
+    于是"粘贴成功"被误判成"没粘贴上"，触发重复粘贴。改成看变化点的占比，
+    一小行文字也能被稳定识别出来，而光标闪烁只影响个别点，不会误报。
+    """
+
+    width = min(first.width, second.width)
+    height = min(first.height, second.height)
+    if width < 8 or height < 8:
+        return 0.0
+    step_x = max(1, width // 100)
+    step_y = max(1, height // 50)
+    changed = 0
+    count = 0
+    for y in range(0, height, step_y):
+        for x in range(0, width, step_x):
+            count += 1
+            if abs(first.lum(x, y) - second.lum(x, y)) >= delta:
+                changed += 1
+    return changed / max(1, count)
+
+
 def looks_changed(first: Optional[Bitmap], second: Optional[Bitmap], threshold: float = 3.0) -> bool:
     if first is None or second is None:
         return False
+    # 0.5%：一行文字在一整块消息区里大约占 1%，而光标闪烁不到 0.1%。
+    if changed_ratio(first, second) >= 0.005:
+        return True
     return mean_difference(first, second) >= threshold
