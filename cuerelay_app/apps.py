@@ -106,6 +106,29 @@ class AppSpec:
             return "在后台"
         return "未运行"
 
+    def presence(self) -> tuple[str, str]:
+        """窗口此刻"在不在眼前"，返回 (状态, 语气)。
+
+        光看"进程在跑"不够。窗口可能被别的程序整个盖住——这时它照样能被识别
+        和写入（走离屏渲染），但用户的点击会落到挡着它的那个程序上。这两种
+        情况要分开说，否则用户会以为程序坏了。
+        """
+
+        window = self.window()
+        if window is None:
+            return ("在后台" if self.running() else "未运行"), (
+                "warning" if self.running() else "text_3"
+            )
+        hwnd = int(window.get("hwnd") or 0)
+        if not hwnd:
+            return "运行中", "success"
+        rect = winapi.get_client_rect(hwnd)
+        if rect and rect["width"] > 8 and rect["height"] > 8:
+            center = (rect["left"] + rect["width"] // 2, rect["top"] + rect["height"] // 2)
+            if winapi.point_to_root_window(*center) != hwnd:
+                return "运行中 · 被遮挡", "warning"
+        return "运行中", "success"
+
     # -- 启动 ----------------------------------------------------------
 
     def launch_target(self) -> str:

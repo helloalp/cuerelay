@@ -1218,11 +1218,16 @@ class App:
         tones = {"运行中": "success", "在后台": "warning", "未运行": "text_3"}
         try:
             codex = apps_module.codex_app(settings)
-            status = codex.status()
+            status, tone = codex.presence()
             card = self.app_cards.get("codex")
             if card:
-                card["status"].configure(text=status, fg=theme.tone(tones.get(status, "text_3")))
-                card["path"].configure(text=f"{card['hint']}   {codex.launch_target()}")
+                card["status"].configure(text=status, fg=theme.tone(tone))
+                hint = card["hint"]
+                if "被遮挡" in status:
+                    # 被挡住时识别和写入都还能用（走离屏渲染），只是用户的点击
+                    # 会落到挡着它的那个程序上。说清楚，别让人以为程序坏了。
+                    hint = "窗口被别的程序盖住了；自动发送仍然可用，但点击会落到挡着它的窗口上。"
+                card["path"].configure(text=f"{hint}   {codex.launch_target()}")
 
             path = str(settings.get("v2ray_path") or "")
             v2ray = apps_module.v2ray_app(settings)
