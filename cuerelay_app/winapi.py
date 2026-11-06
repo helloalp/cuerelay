@@ -67,6 +67,8 @@ if IS_WINDOWS:  # pragma: no branch - 只在 Windows 上真正执行
     user32.GetWindowTextLengthW.restype = ctypes.c_int
     user32.GetWindowTextW.argtypes = [HWND, wintypes.LPWSTR, ctypes.c_int]
     user32.GetWindowTextW.restype = ctypes.c_int
+    user32.GetClassNameW.argtypes = [HWND, wintypes.LPWSTR, ctypes.c_int]
+    user32.GetClassNameW.restype = ctypes.c_int
     user32.IsWindowVisible.argtypes = [HWND]
     user32.IsWindowVisible.restype = wintypes.BOOL
     user32.IsWindow.argtypes = [HWND]
@@ -97,6 +99,15 @@ if IS_WINDOWS:  # pragma: no branch - 只在 Windows 上真正执行
     user32.BringWindowToTop.restype = wintypes.BOOL
     user32.ShowWindow.argtypes = [HWND, ctypes.c_int]
     user32.ShowWindow.restype = wintypes.BOOL
+    # 句柄在 64 位下是指针宽度。GetWindowLongW 的返回值同样是 LONG_PTR，
+    # 不声明的话 ctypes 会按 32 位截断，样式位看着"读到了"其实是垃圾。
+    _get_style = getattr(user32, "GetWindowLongPtrW", None) or user32.GetWindowLongW
+    _get_style.argtypes = [HWND, ctypes.c_int]
+    _get_style.restype = ctypes.c_ssize_t
+    user32.InvalidateRect.argtypes = [HWND, ctypes.c_void_p, wintypes.BOOL]
+    user32.InvalidateRect.restype = wintypes.BOOL
+    user32.RedrawWindow.argtypes = [HWND, ctypes.c_void_p, wintypes.HANDLE, wintypes.UINT]
+    user32.RedrawWindow.restype = wintypes.BOOL
     user32.SetCursorPos.argtypes = [ctypes.c_int, ctypes.c_int]
     user32.SetCursorPos.restype = wintypes.BOOL
     user32.mouse_event.argtypes = [DWORD, DWORD, DWORD, DWORD, ctypes.c_void_p]
@@ -265,6 +276,11 @@ WS_EX_LAYERED = 0x00080000
 WS_EX_TRANSPARENT = 0x00000020
 WS_EX_NOACTIVATE = 0x08000000
 WS_EX_TOOLWINDOW = 0x00000080
+WS_EX_TOPMOST = 0x00000008
+RDW_INVALIDATE = 0x0001
+RDW_FRAME = 0x0400
+RDW_ALLCHILDREN = 0x0080
+RDW_UPDATENOW = 0x0100
 
 
 def _require() -> None:
@@ -359,6 +375,30 @@ def window_info(hwnd: int) -> dict[str, Any]:
         "process_path": path,
         "process_name": Path(path).name if path else "",
     }
+
+
+def window_class(hwnd: int) -> str:
+    """窗口类名。标题会被用户改、被应用改，类名相对稳，用它认系统窗口。"""
+
+    if not IS_WINDOWS or not hwnd:
+        return ""
+    try:
+        buffer = ctypes.create_unicode_buffer(256)
+        length = user32.GetClassNameW(HWND(int(hwnd)), buffer, 256)
+        return str(buffer.value) if length else ""
+    except Exception:
+        return ""
+
+
+def window_pid(hwnd: int) -> int:
+    if not IS_WINDOWS or not hwnd:
+        return 0
+    try:
+        pid = DWORD()
+        user32.GetWindowThreadProcessId(HWND(int(hwnd)), ctypes.byref(pid))
+        return int(pid.value)
+    except Exception:
+        return 0
 
 
 # ---------------------------------------------------------------------------
@@ -756,6 +796,10 @@ def find_target_window(
             score += 45
         if hwnd == active:
             score += 30
+        # 工具窗口通常是应用自己开的辅助面板（浮窗、取词条之类），不是
+        # 用户正在用的那个窗口。同分时它应该排在后面。
+        if is_tool_window(hwnd):
+            score -= 60
         candidates.append((score, info))
 
     if not candidates:
@@ -861,6 +905,180 @@ def set_topmost(hwnd: int, enabled: bool) -> None:
     flags = SWP_NOSIZE | SWP_NOMOVE | SWP_SHOWWINDOW
     target = HWND_TOPMOST if enabled else HWND_NOTOPMOST
     user32.SetWindowPos(HWND(hwnd), HWND(target), 0, 0, 0, 0, flags)
+
+
+def _ex_style(hwnd: int) -> int:
+    """读扩展样式。读不到就返回 0——调用方只关心"有没有某一位"。"""
+
+    if not IS_WINDOWS or not hwnd:
+        return 0
+    try:
+        getter = getattr(user32, "GetWindowLongPtrW", None) or user32.GetWindowLongW
+        return int(getter(HWND(int(hwnd)), GWL_EXSTYLE))
+    except Exception:
+        return 0
+
+
+def is_topmost(hwnd: int) -> bool:
+    """窗口是不是被钉在了最上层。
+
+    这是"点不着"最常见的原因：置顶窗口即使没有画出来，点击也会先落到它身上，
+    下面的程序看起来一切正常，就是不理人。
+    """
+
+    return bool(_ex_style(hwnd) & WS_EX_TOPMOST)
+
+
+def is_tool_window(hwnd: int) -> bool:
+    return bool(_ex_style(hwnd) & WS_EX_TOOLWINDOW)
+
+
+def repair_window(hwnd: int, nudge: bool = True) -> dict[str, bool]:
+    """把"看着在、点不着"的窗口拉回正常状态。
+
+    典型症状：窗口 IsWindowVisible 为真、矩形正常、甚至还是前台窗口，但屏幕上
+    画的是别的东西（或者干脆没有），点击却全被它吃掉——因为 DWM 认为它在最上层。
+
+    三步：取消置顶、恢复显示、强制重绘。最后"抖一下尺寸"是关键：Chromium 只有
+    收到尺寸变化才会重新布局并重画，单纯 InvalidateRect 对它是没用的。
+    """
+
+    result = {"topmost": False, "restored": False, "repainted": False}
+    if not IS_WINDOWS or not hwnd:
+        return result
+    hwnd = int(hwnd)
+    if not is_window(hwnd):
+        return result
+    try:
+        if is_topmost(hwnd):
+            # 置顶的窗口永远盖在所有程序上面，点击自然落不到下面那个程序。
+            user32.SetWindowPos(
+                HWND(hwnd),
+                HWND(HWND_NOTOPMOST),
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+            )
+            result["topmost"] = True
+        if is_minimized(hwnd) or is_cloaked(hwnd):
+            user32.ShowWindow(HWND(hwnd), SW_SHOW)
+            user32.ShowWindow(HWND(hwnd), SW_RESTORE)
+            result["restored"] = True
+        user32.SetWindowPos(
+            HWND(hwnd),
+            0,
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED,
+        )
+        user32.InvalidateRect(HWND(hwnd), None, True)
+        user32.RedrawWindow(
+            HWND(hwnd),
+            None,
+            None,
+            RDW_INVALIDATE | RDW_ALLCHILDREN | RDW_UPDATENOW | RDW_FRAME,
+        )
+        result["repainted"] = True
+        rect = get_window_rect(hwnd)
+        # 最大化时改尺寸会把它变成"普通窗口"，那等于改了用户的工作区。
+        if nudge and rect and not is_maximized(hwnd):
+            user32.SetWindowPos(
+                HWND(hwnd),
+                0,
+                0,
+                0,
+                rect["width"] + 1,
+                rect["height"],
+                SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE,
+            )
+            time.sleep(0.06)
+            user32.SetWindowPos(
+                HWND(hwnd),
+                0,
+                rect["left"],
+                rect["top"],
+                rect["width"],
+                rect["height"],
+                SWP_NOZORDER | SWP_NOACTIVATE,
+            )
+    except Exception:
+        pass
+    return result
+
+
+# 外壳自己画的置顶窗口：任务栏、桌面、缩略图预览、托盘溢出面板。它们本来就该
+# 在最上层，取消置顶只会把系统界面弄坏，所以扫描时要跳过。
+SHELL_CLASSES = frozenset(
+    {
+        "Shell_TrayWnd",
+        "Shell_SecondaryTrayWnd",
+        "Progman",
+        "WorkerW",
+        "TaskListThumbnailWnd",
+        "NotifyIconOverflowWindow",
+        "TopLevelWindowForOverflowXamlIsland",
+        "XamlExplorerHostIslandWindow",
+        "MultitaskingViewFrame",
+        "ForegroundStaging",
+        "Windows.UI.Input.InputSite.WindowClass",
+    }
+)
+
+
+def topmost_windows(exclude_pid: int = 0) -> list[dict[str, Any]]:
+    """列出正压在别人头上的窗口。
+
+    判据是 WS_EX_TOPMOST 且真的在屏幕上（没最小化、没被 DWM 遮蔽）。这是
+    「鼠标能动能点别处、就是点不动某个程序」最常见的成因：一个置顶窗口挡在
+    中间，它自己没画出来，点击却全被它吃掉。
+    """
+
+    _require()
+    found: list[dict[str, Any]] = []
+    for info in enumerate_windows():
+        hwnd = info["hwnd"]
+        if not hwnd or is_cloaked(hwnd) or is_minimized(hwnd):
+            continue
+        if not is_topmost(hwnd):
+            continue
+        class_name = window_class(hwnd)
+        if class_name in SHELL_CLASSES:
+            continue
+        # 自己的窗口永远不是嫌疑人——程序不能指控自己。
+        if _looks_like_self(info):
+            continue
+        pid = window_pid(hwnd)
+        if exclude_pid and pid == exclude_pid:
+            continue
+        found.append(
+            {
+                "hwnd": hwnd,
+                "title": info.get("title") or "",
+                "process_name": info.get("process_name") or "",
+                "class_name": class_name,
+                "pid": pid,
+                "rect": get_window_rect(hwnd),
+                "tool": is_tool_window(hwnd),
+            }
+        )
+    # 覆盖面积大的排前面：全屏的幽灵比一个小浮窗更可能是元凶。
+    found.sort(key=lambda item: -((item["rect"] or {}).get("width", 0) * (item["rect"] or {}).get("height", 0)))
+    return found
+
+
+def repair_topmost(exclude_pid: int = 0) -> list[dict[str, Any]]:
+    """把所有可疑的置顶窗口拉回来，返回真正改过的那些。"""
+
+    changed: list[dict[str, Any]] = []
+    for item in topmost_windows(exclude_pid):
+        if repair_window(item["hwnd"]).get("topmost"):
+            item["result"] = "已取消置顶"
+            changed.append(item)
+    return changed
 
 
 def set_dark_frame(hwnd: int, enabled: bool) -> None:

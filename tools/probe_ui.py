@@ -205,6 +205,33 @@ def main(argv: list[str]) -> int:
         failures += 1
         print(f"[失败] 截图 settings-tray: {exc.__class__.__name__}: {exc}")
 
+    # 置顶排查：点一下按钮，后台线程扫完要把结果写回界面。
+    try:
+        app.show_view("apps")
+        pump(root, 6)
+        assert str(app.topmost_status.cget("text")) == "未检查", "初始状态不该是别的"
+        app._topmost_action()
+        pump(root, 30)
+        status = str(app.topmost_status.cget("text"))
+        assert status not in ("未检查", "检查中…"), f"扫描结果没有回填，状态还是 {status}"
+        assert not app._topmost_busy, "扫描结束后忙碌标记没有复位"
+        assert app.topmost_button._enabled, "扫描结束后按钮应该恢复可用"
+        if app._topmost_pending:
+            # 真有置顶窗口时按钮要变成"全部取消置顶"，否则用户没法一键修。
+            assert "取消置顶" in str(app.topmost_button.label.cget("text")), (
+                f"查出 {len(app._topmost_pending)} 个却还是「{app.topmost_button.label.cget('text')}」"
+            )
+        app.apps_scroll.canvas.yview_moveto(1.0)
+        pump(root, 6)
+        shot(root, out_dir / "apps-topmost.png")
+        names = [
+            f"{item['process_name']}「{item['title']}」" for item in app._topmost_pending
+        ]
+        print(f"[通过] 置顶排查（{status}{'：' + '、'.join(names) if names else ''}）")
+    except Exception as exc:  # noqa: BLE001
+        failures += 1
+        print(f"[失败] 置顶排查: {exc.__class__.__name__}: {exc}")
+
     try:
         # 不撤托盘图标的话，进程退出后它会一直留在通知区域，直到用户把鼠标
         # 移过去才消失——测试跑几轮就是好几个鬼影。

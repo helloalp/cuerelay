@@ -9,12 +9,13 @@ from __future__ import annotations
 
 import datetime as _dt
 import json
+import os
 import tempfile
 import threading
 from pathlib import Path
 from typing import Callable, List, Tuple
 
-from . import apps, conversations, hotkey, ocr, templates, vision
+from . import apps, conversations, hotkey, ocr, templates, vision, winapi
 from .config import now_local, parse_datetime
 from .imaging import Bitmap
 from .scheduler import Scheduler
@@ -889,6 +890,48 @@ def test_hotkey_register() -> None:
     hotkey.GlobalHotkey(fired.set).stop()
 
 
+def test_topmost_scan() -> None:
+    """置顶排查的两条底线：坏句柄不能炸，自己不能被报成嫌疑人。
+
+    "造一个置顶窗口再修掉"的完整验证在 tools/probe_topmost.py——那要开窗口，
+    自检保持无窗口，只验纯逻辑和真实环境下的扫描结果。
+    """
+
+    # 空句柄、野句柄：一律当成"没问题"，不能抛异常。
+    assert winapi.is_topmost(0) is False
+    assert winapi.is_tool_window(0) is False
+    assert winapi.window_class(0) == ""
+    assert winapi.window_pid(0) == 0
+    assert winapi.repair_window(0) == {
+        "topmost": False,
+        "restored": False,
+        "repainted": False,
+    }
+    assert winapi.repair_window(0xDEAD)["topmost"] is False
+
+    # 外壳的置顶窗口本来就该在最上层，名单里不能出现它们。
+    assert "Shell_TrayWnd" in winapi.SHELL_CLASSES
+    assert "Progman" in winapi.SHELL_CLASSES
+
+    found = winapi.topmost_windows(exclude_pid=os.getpid())
+    assert isinstance(found, list)
+    for item in found:
+        assert item["hwnd"], "扫出来的条目没有句柄"
+        assert item["class_name"] not in winapi.SHELL_CLASSES, "外壳窗口不该进名单"
+        assert item["pid"] != os.getpid(), "不能把自己报成嫌疑人"
+        assert winapi.is_topmost(item["hwnd"]), "名单里的窗口应该确实处于置顶"
+    areas = [
+        (item["rect"] or {}).get("width", 0) * (item["rect"] or {}).get("height", 0)
+        for item in found
+    ]
+    assert areas == sorted(areas, reverse=True), "名单应按覆盖面积从大到小"
+
+    foreground = winapi.foreground_window()
+    if foreground:
+        assert winapi.window_pid(foreground) > 0
+        assert winapi.window_class(foreground), "前台窗口应该有类名"
+
+
 def test_panels_near_right_edge() -> None:
     """分隔线贴到窗口右边界时不能越界。
 
@@ -949,6 +992,7 @@ TESTS: List[Tuple[str, Callable[[], None]]] = [
     ("关闭动作", test_close_action),
     ("调度暂停", test_scheduler_pause),
     ("提示词变量", test_template_expand),
+    ("置顶窗口排查", test_topmost_scan),
     ("路径清理", test_tidy_path),
 ]
 

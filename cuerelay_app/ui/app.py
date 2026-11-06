@@ -138,6 +138,11 @@ class App:
         self._tray_tip = ""
         self._last_history_id = ""
 
+        # 置顶窗口排查。_topmost_pending 是上一次查出来的嫌疑人——按钮按它决定
+        # 是"再查一次"还是"取消置顶"。
+        self._topmost_busy = False
+        self._topmost_pending: list[dict[str, Any]] = []
+
         settings = self.store.settings()
         self.theme = Theme(str(settings.get("theme") or "light"), winapi.get_system_dpi())
         self.overlay = Overlay(self.root, self.theme)
@@ -1030,6 +1035,8 @@ class App:
         scroll = ScrollArea(parent, theme, "bg")
         scroll.pack(fill="both", expand=True)
         body = scroll.body
+        # 留给自检用：置顶排查卡在页面底部，截图前得滚下去。
+        self.apps_scroll = scroll
 
         self.app_cards: dict[str, dict[str, Any]] = {}
         self._app_card(
@@ -1086,6 +1093,57 @@ class App:
             "新建「关闭 Codex」任务",
             lambda: self.new_lifecycle_task("close"),
         ).pack(side="left", padx=(theme.px(8), 0))
+
+        self._build_topmost_card(body)
+
+    def _build_topmost_card(self, parent: tk.Frame) -> None:
+        """「点了没反应」的排查入口。
+
+        鼠标能动能点别处、就是点不动某个窗口，十次有九次是某个置顶窗口挡在
+        中间——它自己没画出来，点击却全被它吃掉。这里把嫌疑人列出来，一键取消
+        置顶，比让用户去任务管理器里猜强。
+        """
+
+        theme = self.theme
+        outer, body = card(parent, theme, "surface")
+        outer.pack(fill="x", pady=(theme.px(16), 0))
+        pad = theme.px(20)
+
+        head = tk.Frame(body, bg=theme.c("surface"))
+        head.pack(fill="x", padx=pad, pady=(pad, 0))
+        tk.Label(
+            head,
+            text="窗口抢点击",
+            bg=theme.c("surface"),
+            fg=theme.c("text"),
+            font=theme.font("title"),
+            anchor="w",
+        ).pack(side="left")
+        self.topmost_status = tk.Label(
+            head,
+            text="未检查",
+            bg=theme.c("surface"),
+            fg=theme.c("text_3"),
+            font=theme.font("small"),
+            anchor="w",
+        )
+        self.topmost_status.pack(side="left", padx=(theme.px(12), 0))
+        self.topmost_button = Button(
+            head, theme, "检查", self._topmost_action, kind="ghost", size="sm"
+        )
+        self.topmost_button.pack(side="right")
+
+        self.topmost_hint = tk.Label(
+            body,
+            text="点不动某个窗口时先查这里：置顶的窗口即使没画出来，也会把点击全吃掉。",
+            bg=theme.c("surface"),
+            fg=theme.c("text_3"),
+            font=theme.font("small"),
+            anchor="w",
+            justify="left",
+            wraplength=theme.px(620),
+        )
+        self.topmost_hint.pack(fill="x", padx=pad, pady=(theme.px(8), pad))
 
     def _app_card(
         self,
@@ -1204,6 +1262,118 @@ class App:
             return "Codex 已关闭"
 
         self._app_worker("关闭 Codex", worker)
+
+    # -- 置顶窗口排查 --------------------------------------------------
+
+    def _topmost_action(self) -> None:
+        """同一个按钮两种意思：查出过嫌疑人就直接修，否则先查。"""
+
+        self._scan_topmost(repair=bool(self._topmost_pending))
+
+    def _scan_topmost(self, repair: bool = False) -> None:
+        """扫一遍谁压在最上面；repair=True 时顺手把它们拉下来。
+
+        扫窗口要开进程句柄（取进程名），几十个窗口加起来不是零成本，所以放
+        后台线程。界面线程只负责渲染结果。
+        """
+
+        if self._topmost_busy:
+            return
+        self._topmost_busy = True
+        try:
+            self.topmost_status.configure(text="检查中…", fg=self.theme.c("text_3"))
+            self.topmost_button.set_enabled(False)
+        except tk.TclError:
+            self._topmost_busy = False
+            return
+
+        def worker() -> None:
+            payload: dict[str, Any] = {"repair": repair, "before": [], "after": [], "changed": []}
+            try:
+                payload["before"] = winapi.topmost_windows(exclude_pid=os.getpid())
+                if repair:
+                    for item in payload["before"]:
+                        # 逐个修，别用 repair_topmost()：那个会自己再扫一遍，
+                        # 而我们手上的名单已经够新了。
+                        if winapi.repair_window(item["hwnd"]).get("topmost"):
+                            payload["changed"].append(item)
+                    payload["after"] = winapi.topmost_windows(exclude_pid=os.getpid())
+                else:
+                    payload["after"] = payload["before"]
+            except Exception as exc:
+                payload["error"] = friendly_error(exc)
+            self.emit("topmost", payload)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _apply_topmost_scan(self, payload: dict[str, Any]) -> None:
+        self._topmost_busy = False
+        theme = self.theme
+        error = payload.get("error")
+        if error:
+            self._topmost_pending = []
+            self.topmost_status.configure(text="检查失败", fg=theme.tone("danger"))
+            self.topmost_hint.configure(text=str(error))
+            self.topmost_button.set_text("重试")
+            self.topmost_button.set_enabled(True)
+            return
+
+        before = list(payload.get("before") or [])
+        after = list(payload.get("after") or [])
+        changed = list(payload.get("changed") or [])
+        repaired = bool(payload.get("repair"))
+        # 剩下的嫌疑人决定按钮下一步是什么意思。
+        self._topmost_pending = after
+
+        for item in changed:
+            self.log(
+                "success",
+                f"已取消置顶：{item.get('process_name') or '未知进程'}"
+                f"（{item.get('title') or item.get('class_name') or '无标题'}）",
+            )
+
+        if after:
+            # 还剩没修的（或者只是检查完还没动手）：把嫌疑人报出来。
+            names = []
+            for item in after[:3]:
+                label = item.get("process_name") or item.get("class_name") or "未知"
+                title = str(item.get("title") or "").strip()
+                if title:
+                    label = f"{label}「{title}」"
+                if item.get("tool"):
+                    # 浮窗是用户自己装的工具（取词条、便签、悬浮球），提醒一句，
+                    # 免得把有用的东西一起关掉。
+                    label += "（浮窗）"
+                names.append(label)
+            more = f" 等 {len(after)} 个" if len(after) > 3 else ""
+            self.topmost_status.configure(
+                text=f"{len(after)} 个置顶" if not repaired else f"还剩 {len(after)} 个",
+                fg=theme.tone("warning"),
+            )
+            self.topmost_hint.configure(
+                text="设了「总在最前」的是：" + "、".join(names) + more + "。它们会挡住下面的点击。"
+            )
+            self.topmost_button.set_text("全部取消置顶")
+            self.topmost_button.set_enabled(True)
+            return
+
+        if repaired:
+            count = len(changed)
+            self.topmost_status.configure(
+                text=f"已修复 {count} 个" if count else "本来就正常",
+                fg=theme.tone("success") if count else theme.c("text_3"),
+            )
+            self.topmost_hint.configure(
+                text="已经把置顶撤掉了，现在再点点不动的那个窗口试试。"
+                if count
+                else "没有窗口设了「总在最前」，点击不会被谁截走。"
+            )
+            self.topmost_button.set_text("再查一次")
+        else:
+            self.topmost_status.configure(text="正常", fg=theme.tone("success"))
+            self.topmost_hint.configure(text="没有窗口设了「总在最前」，点击不会被谁截走。")
+            self.topmost_button.set_text("再查一次")
+        self.topmost_button.set_enabled(True)
 
     def _app_launch_v2ray(self) -> None:
         def worker() -> str:
@@ -3143,6 +3313,13 @@ class App:
         add("关闭 Codex", self._app_close_codex, "应用", "", "quit close 退出")
         add("启动 v2rayN", self._app_launch_v2ray, "应用", "", "proxy 代理")
         add("一键启动 v2rayN → Codex", self._app_start_chain, "应用", "", "chain 启动")
+        add(
+            "排查窗口抢点击",
+            lambda: (self.show_view("apps"), self._scan_topmost(repair=False)),
+            "应用",
+            "",
+            "topmost 置顶 点不动 抢鼠标 卡住 click",
+        )
         add("打开数据目录", self._open_data_dir, "设置", "", "data folder")
         if self._tray is not None:
             add("收进托盘", lambda: self._hide_to_tray(), "窗口", "", "tray hide 隐藏")
@@ -3301,6 +3478,13 @@ class App:
                     self._tray_run_next()
                 elif event == "tray_pause":
                     self._toggle_pause()
+                elif event == "tray_topmost":
+                    try:
+                        self._restore_from_tray()
+                        self.show_view("apps")
+                        self._scan_topmost(repair=True)
+                    except tk.TclError:
+                        pass
                 elif event == "tray_quit":
                     self._quit()
                 elif event == "overlay":
@@ -3311,6 +3495,11 @@ class App:
                 elif event == "apps":
                     try:
                         self._refresh_apps()
+                    except tk.TclError:
+                        pass
+                elif event == "topmost":
+                    try:
+                        self._apply_topmost_scan(payload)
                     except tk.TclError:
                         pass
                 elif event == "chats":
@@ -3432,6 +3621,9 @@ class App:
         else:
             items.append(("立即运行第一个进行中任务", emit("tray_run_next")))
         items.append(("恢复定时任务" if paused else "暂停定时任务", emit("tray_pause")))
+        items.append(None)
+        # 鼠标点不动东西的时候，这条是唯一还能靠键盘走到的救援入口。
+        items.append(("排查窗口抢点击", emit("tray_topmost")))
         items.append(None)
         items.append(("退出 CueRelay", emit("tray_quit")))
         return items
