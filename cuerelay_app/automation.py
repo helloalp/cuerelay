@@ -153,13 +153,25 @@ class Runner:
         # 搜索不到对话时右侧不会有任何变化，据此可以拦住"发错对话"。
         region = None
         baseline = None
+        sidebar_region = None
+        sidebar_baseline = None
         if composer is not None:
             region = vision.Rect(composer.left, 0, frame.width, max(1, composer.top))
             baseline = self._capture(frame.to_screen(region))
+            sidebar_region = vision.Rect(0, 0, max(1, composer.left), max(1, composer.top))
+            sidebar_baseline = self._capture(frame.to_screen(sidebar_region))
 
         self.log("info", f"切换对话：{title}")
         winapi.click(frame.point_to_screen(point))
-        time.sleep(self._delay())
+        # 搜索框往往要点一下放大镜才出现，等它真的出来再输入，
+        # 否则这些按键会落到别的控件上。没变化说明搜索框本来就可见，直接输入。
+        if sidebar_region is not None and sidebar_baseline is not None:
+            opened, _ = self._wait_change(frame.to_screen(sidebar_region), sidebar_baseline, 1.5)
+            if opened:
+                self.log("info", "搜索框已打开")
+                time.sleep(0.25)
+        else:
+            time.sleep(self._delay())
         winapi.ctrl_a()
         winapi.set_clipboard_text(title)
         winapi.ctrl_v()
