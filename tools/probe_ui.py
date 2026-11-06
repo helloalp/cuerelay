@@ -174,7 +174,41 @@ def main(argv: list[str]) -> int:
             failures += 1
             print(f"[失败] 截图 {view}: {exc.__class__.__name__}: {exc}")
 
+    # 托盘：收起来，再叫回来
     try:
+        app.show_view("tasks")
+        pump(root, 6)
+        if app._tray is None:
+            print("[跳过] 托盘：图标没有起来")
+        else:
+            app._hide_to_tray(silent=True)
+            pump(root, 8)
+            assert app._in_tray, "收进托盘后状态没有更新"
+            assert str(root.state()) == "withdrawn", f"窗口状态是 {root.state()}"
+            app._restore_from_tray()
+            pump(root, 8)
+            assert not app._in_tray, "唤回后状态没有复位"
+            assert str(root.state()) == "normal", f"窗口状态是 {root.state()}"
+            print("[通过] 托盘收起与唤回")
+    except Exception as exc:  # noqa: BLE001
+        failures += 1
+        print(f"[失败] 托盘: {exc.__class__.__name__}: {exc}")
+
+    # 设置页下半部分（托盘与关闭）在首屏之外，单独滚下去截一张。
+    try:
+        app.show_view("settings")
+        pump(root, 8)
+        app.settings_scroll.canvas.yview_moveto(0.62)
+        pump(root, 6)
+        shot(root, out_dir / "settings-tray.png")
+    except Exception as exc:  # noqa: BLE001
+        failures += 1
+        print(f"[失败] 截图 settings-tray: {exc.__class__.__name__}: {exc}")
+
+    try:
+        # 不撤托盘图标的话，进程退出后它会一直留在通知区域，直到用户把鼠标
+        # 移过去才消失——测试跑几轮就是好几个鬼影。
+        app._stop_tray()
         root.destroy()
     except tk.TclError:
         pass

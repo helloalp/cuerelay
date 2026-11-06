@@ -25,6 +25,8 @@ from ..hotkey import DEFAULT_LABEL as HOTKEY_LABEL
 from ..hotkey import GlobalHotkey, VirtualCapture
 from ..scheduler import Scheduler
 from ..store import (
+    CLOSE_ACTION_LABELS,
+    CLOSE_ACTIONS,
     KIND_LABELS,
     TaskStore,
     advance_next_run_past_now,
@@ -32,10 +34,12 @@ from ..store import (
     is_lifecycle,
     kind_label,
     next_run_text,
+    normalize_close_action,
     normalize_snippet,
     task_state,
 )
 from ..toolbox import Toolbox, ToolboxError
+from ..tray import Tray
 from .calibrate import CalibrationDialog
 from .overlay import Overlay, apply_event
 from .palette import Command, CommandPalette
@@ -126,6 +130,13 @@ class App:
         self._hotkey: Optional[GlobalHotkey] = None
         self._hidden_for_action = False
 
+        # 托盘。_in_tray 表示"窗口是用户主动收起来的"，执行完任务不能顺手把它
+        # 弹回来——那会让用户以为程序自己跳出来了。
+        self._tray: Optional[Tray] = None
+        self._in_tray = False
+        self._tray_hinted = False
+        self._last_history_id = ""
+
         settings = self.store.settings()
         self.theme = Theme(str(settings.get("theme") or "light"), winapi.get_system_dpi())
         self.overlay = Overlay(self.root, self.theme)
@@ -149,9 +160,13 @@ class App:
         self._bind_shortcuts()
         self.refresh_snippets()
         self._start_hotkey()
+        self._start_tray()
         if not str(self.store.setting("v2ray_path") or ""):
             # 第一次打开就顺手找一下 v2rayN，省得用户还要自己去点「自动检测」。
             threading.Thread(target=self._autodetect_v2ray, daemon=True).start()
+        if self._tray is not None and bool(self.store.setting("start_hidden", False)):
+            # 开机自启时直接进托盘：开机第一屏不该被一个定时器挡住。
+            self._hide_to_tray(silent=True)
 
     # ------------------------------------------------------------------
     # 初始化
@@ -191,6 +206,12 @@ class App:
         self.launch_v2ray_var = tk.BooleanVar(value=bool(settings.get("launch_v2ray_first", True)))
         self.autostart_var = tk.BooleanVar(value=apps_module.autostart_enabled())
         self.hotkey_var = tk.BooleanVar(value=bool(settings.get("global_hotkey", True)))
+        self.tray_var = tk.BooleanVar(value=bool(settings.get("tray_enabled", True)))
+        self.minimize_tray_var = tk.BooleanVar(value=bool(settings.get("minimize_to_tray", True)))
+        self.start_hidden_var = tk.BooleanVar(value=bool(settings.get("start_hidden", False)))
+        self.close_action_var = tk.StringVar(
+            value=normalize_close_action(settings.get("close_action", "tray"))
+        )
         self.catch_up_var = tk.StringVar(value=str(int(settings.get("catch_up_seconds", 300) or 300) // 60))
         try:
             saved_delay = float(settings.get("step_delay_seconds", 1.2))
@@ -231,6 +252,8 @@ class App:
         self.root.configure(bg=theme.c("bg"))
         self.root.minsize(theme.px(880), theme.px(580))
         self.root.bind_all("<MouseWheel>", dispatch_wheel)
+        # 最小化时收进托盘。绑在 root 上，子控件的 Unmap 会冒泡上来。
+        self.root.bind("<Unmap>", self._on_unmap, add="+")
 
         # 默认尺寸按屏幕可用区域收敛，避免在 1366×768 或高缩放下超出屏幕。
         screen_width = self.root.winfo_screenwidth()
@@ -1714,6 +1737,66 @@ class App:
             anchor="w",
         ).pack(fill="x", pady=(theme.px(5), 0))
 
+        # 托盘与关闭
+        card_body = self._settings_card(body, "托盘与关闭")
+        inner = tk.Frame(card_body, bg=theme.c("surface"))
+        inner.pack(fill="x", padx=theme.px(20), pady=(0, theme.px(18)))
+        Switch(
+            inner,
+            theme,
+            "显示托盘图标",
+            self.tray_var,
+            command=self._save_tray,
+            bg_key="surface",
+        ).pack(fill="x")
+        tk.Label(
+            inner,
+            text="关掉之后窗口只能留在任务栏，「收进托盘」会退化成退出。",
+            bg=theme.c("surface"),
+            fg=theme.c("text_3"),
+            font=theme.font("tiny"),
+            anchor="w",
+        ).pack(fill="x", pady=(theme.px(5), 0))
+        tk.Label(
+            inner,
+            text="关闭窗口时",
+            bg=theme.c("surface"),
+            fg=theme.c("text_2"),
+            font=theme.font("small"),
+            anchor="w",
+        ).pack(fill="x", pady=(theme.px(16), theme.px(6)))
+        Segmented(
+            inner,
+            theme,
+            [(key, CLOSE_ACTION_LABELS[key]) for key in CLOSE_ACTIONS],
+            self.close_action_var,
+            command=lambda _value: self._save_close_action(),
+        ).pack(fill="x")
+        Switch(
+            inner,
+            theme,
+            "最小化时也收进托盘",
+            self.minimize_tray_var,
+            command=self._save_minimize_tray,
+            bg_key="surface",
+        ).pack(fill="x", pady=(theme.px(16), 0))
+        Switch(
+            inner,
+            theme,
+            "开机启动时不显示窗口",
+            self.start_hidden_var,
+            command=self._save_start_hidden,
+            bg_key="surface",
+        ).pack(fill="x", pady=(theme.px(10), 0))
+        tk.Label(
+            inner,
+            text="配合上面的开机自启使用：开机后只留托盘图标，定时任务照常执行。",
+            bg=theme.c("surface"),
+            fg=theme.c("text_3"),
+            font=theme.font("tiny"),
+            anchor="w",
+        ).pack(fill="x", pady=(theme.px(5), 0))
+
         # 识别与校准
         card_body = self._settings_card(body, "识别与校准")
         inner = tk.Frame(card_body, bg=theme.c("surface"))
@@ -2655,6 +2738,48 @@ class App:
         self.store.update_settings(global_hotkey=enabled)
         self._set_status(f"全局热键已启用：{HOTKEY_LABEL}" if enabled else "全局热键已关闭")
 
+    def _save_tray(self) -> None:
+        enabled = bool(self.tray_var.get())
+        if not enabled:
+            if self._in_tray:
+                # 图标撤掉之后窗口就再也叫不回来了，先把窗口放出来。
+                self._restore_from_tray()
+            self._stop_tray()
+            self.store.update_settings(tray_enabled=False)
+            self._set_status("托盘图标已关闭")
+            return
+        self.store.update_settings(tray_enabled=True)
+        self._start_tray()
+        if self._tray is None:
+            self.tray_var.set(False)
+            self.store.update_settings(tray_enabled=False)
+            messagebox.showwarning(
+                "托盘",
+                "托盘图标没有起来，可能是通知区域没有运行。\n"
+                "关掉这个开关后，关闭窗口会按「关闭窗口时」的设置处理。",
+                parent=self.root,
+            )
+            return
+        self._set_status("托盘图标已启用")
+
+    def _save_close_action(self) -> None:
+        action = normalize_close_action(self.close_action_var.get())
+        self.close_action_var.set(action)
+        self.store.update_settings(close_action=action)
+        self._set_status(f"关闭窗口时：{CLOSE_ACTION_LABELS.get(action, action)}")
+
+    def _save_minimize_tray(self) -> None:
+        enabled = bool(self.minimize_tray_var.get())
+        self.store.update_settings(minimize_to_tray=enabled)
+        if not enabled and self._in_tray:
+            self._restore_from_tray()
+        self._set_status("最小化时收进托盘" if enabled else "最小化时留在任务栏")
+
+    def _save_start_hidden(self) -> None:
+        enabled = bool(self.start_hidden_var.get())
+        self.store.update_settings(start_hidden=enabled)
+        self._set_status("开机启动时不显示窗口" if enabled else "开机启动时显示窗口")
+
     def _save_launch_v2ray(self) -> None:
         self.store.update_settings(launch_v2ray_first=bool(self.launch_v2ray_var.get()))
 
@@ -2959,6 +3084,8 @@ class App:
         if self._hidden_for_action or (self.scheduler is not None and self.scheduler.is_busy()):
             self.log("warning", "正在执行动作，热键暂时不唤出窗口。")
             return
+        if self._in_tray:
+            self._restore_from_tray()
         try:
             if str(self.root.state()) == "withdrawn":
                 self.root.deiconify()
@@ -3014,6 +3141,9 @@ class App:
         add("启动 v2rayN", self._app_launch_v2ray, "应用", "", "proxy 代理")
         add("一键启动 v2rayN → Codex", self._app_start_chain, "应用", "", "chain 启动")
         add("打开数据目录", self._open_data_dir, "设置", "", "data folder")
+        if self._tray is not None:
+            add("收进托盘", lambda: self._hide_to_tray(), "窗口", "", "tray hide 隐藏")
+        add("退出 CueRelay", self._quit, "窗口", "", "quit exit 关闭")
 
         for task in self.store.tasks():
             name = str(task.get("name") or "未命名任务")
@@ -3105,6 +3235,8 @@ class App:
                     self.log(level, message)
                 elif event == "refresh":
                     self.refresh_tasks()
+                    self._update_tray_tip()
+                    self._check_tray_failure()
                 elif event == "prepare":
                     # 从这里开始窗口是藏起来的，热键不能把它拉出来。
                     self._hidden_for_action = True
@@ -3116,16 +3248,41 @@ class App:
                         payload.set()
                 elif event == "restore":
                     self._hidden_for_action = False
-                    try:
-                        self.root.deiconify()
-                        self._apply_topmost()
-                    except tk.TclError:
+                    # 用户自己把窗口收进托盘了，任务跑完不能顺手弹回来——
+                    # 那看起来像程序自己跳出来了。
+                    if self._in_tray:
                         pass
+                    else:
+                        try:
+                            self.root.deiconify()
+                            self._apply_topmost()
+                        except tk.TclError:
+                            pass
                 elif event == "hotkey":
                     try:
                         self._summon()
                     except tk.TclError:
                         pass
+                elif event == "tray_show":
+                    try:
+                        self._restore_from_tray()
+                    except tk.TclError:
+                        pass
+                elif event == "tray_palette":
+                    try:
+                        self._restore_from_tray()
+                        if self._palette is None:
+                            self.open_palette()
+                    except tk.TclError:
+                        pass
+                elif event == "tray_start_codex":
+                    self._app_launch_codex()
+                elif event == "tray_stop_codex":
+                    self._app_close_codex()
+                elif event == "tray_run_next":
+                    self._tray_run_next()
+                elif event == "tray_quit":
+                    self._quit()
                 elif event == "overlay":
                     try:
                         apply_event(self.overlay, payload)
@@ -3193,12 +3350,214 @@ class App:
         self.status_var.set(text)
 
     # ------------------------------------------------------------------
+    # 托盘
+    # ------------------------------------------------------------------
+
+    def _start_tray(self) -> None:
+        """按设置起托盘图标。起不来就把开关拨回去，不装样子。"""
+
+        wanted = bool(self.store.setting("tray_enabled", True))
+        if not wanted:
+            self.tray_var.set(False)
+            return
+        if self._tray is not None and self._tray.active:
+            return
+        tray = Tray(
+            tooltip="CueRelay",
+            on_activate=lambda: self.emit("tray_show", None),
+            menu_provider=self._tray_menu,
+            icon_path=config.ICON_PATH,
+        )
+        ok, reason = tray.start()
+        if not ok:
+            self._tray = None
+            self.tray_var.set(False)
+            self.store.update_settings(tray_enabled=False)
+            self.log("warning", f"托盘图标没有起来：{reason}")
+            return
+        self._tray = tray
+        self._update_tray_tip()
+
+    def _stop_tray(self) -> None:
+        if self._tray is not None:
+            try:
+                self._tray.stop()
+            except Exception:
+                pass
+            self._tray = None
+        self._in_tray = False
+
+    def _tray_menu(self) -> list:
+        """托盘右键菜单。
+
+        这个方法跑在托盘线程上，所以它只能读状态、往队列里丢事件——
+        任何 tkinter 调用都会让托盘线程和界面线程撞在一起。
+        """
+
+        def emit(event: str) -> Any:
+            return lambda: self.emit(event, None)
+
+        busy = bool(self.scheduler is not None and self.scheduler.is_busy())
+        items: list = [
+            ("显示主窗口", emit("tray_show")),
+            ("命令面板", emit("tray_palette")),
+            None,
+            ("启动 Codex", emit("tray_start_codex")),
+            ("关闭 Codex", emit("tray_stop_codex")),
+            None,
+        ]
+        if busy:
+            items.append(("正在执行任务…", lambda: None))
+        else:
+            items.append(("立即运行第一个进行中任务", emit("tray_run_next")))
+        items.append(None)
+        items.append(("退出 CueRelay", emit("tray_quit")))
+        return items
+
+    def _update_tray_tip(self) -> None:
+        if self._tray is None:
+            return
+        tasks = self.store.tasks()
+        active = sum(1 for item in tasks if item.get("enabled"))
+        parts = ["CueRelay"]
+        if self.scheduler is not None and self.scheduler.is_busy():
+            parts.append("执行中")
+        parts.append(f"{len(tasks)} 个任务")
+        if active:
+            parts.append(f"{active} 个启用")
+        self._tray.set_tooltip(" · ".join(parts))
+
+    def _notify_tray(self, title: str, text: str, level: str = "info") -> None:
+        if self._tray is not None:
+            self._tray.notify(title, text, level)
+
+    def _hide_to_tray(self, silent: bool = False) -> None:
+        if self._tray is None:
+            # 没有托盘图标还藏起来，就等于把窗口弄丢了。
+            self._set_status("托盘图标没有启用，窗口保持显示")
+            return
+        try:
+            self.root.withdraw()
+        except tk.TclError:
+            return
+        self._in_tray = True
+        if not silent and not self._tray_hinted:
+            # 第一次收起时说一句，否则用户会以为程序被关掉了。
+            self._tray_hinted = True
+            self._notify_tray("CueRelay 仍在运行", f"定时任务照常执行。{HOTKEY_LABEL} 可随时唤出。")
+        self._set_status("已收进托盘")
+
+    def _restore_from_tray(self) -> None:
+        self._in_tray = False
+        try:
+            self.root.deiconify()
+            self.root.lift()
+            self._apply_topmost()
+        except tk.TclError:
+            return
+        hwnd = self.root_hwnd
+        if hwnd:
+            winapi.activate_window(hwnd)
+
+    def _check_tray_failure(self) -> None:
+        """任务失败、而且窗口收在托盘里时，弹一条气泡。
+
+        窗口开着的时候界面上已经有红点和状态栏了，再弹气泡只是噪音。
+        """
+
+        if self._tray is None:
+            return
+        entries = self.store.history(1)
+        if not entries:
+            return
+        entry = entries[0]
+        entry_id = str(entry.get("id") or "")
+        if entry_id == self._last_history_id:
+            return
+        self._last_history_id = entry_id
+        if entry.get("ok") or not self._in_tray:
+            return
+        name = str(entry.get("task_name") or "任务")
+        message = str(entry.get("message") or "执行失败")
+        self._notify_tray("任务失败", f"{name}：{message}", "error")
+
+    def _tray_run_next(self) -> None:
+        """托盘菜单里的「立即运行」：挑第一个启用的发送类任务。
+
+        这里不走 run_task()：那个方法在没有任务时会弹对话框，而窗口可能正
+        收在托盘里，弹出来就是凭空跳出一个窗口。
+        """
+
+        for task in self.store.tasks():
+            if not task.get("enabled") or is_lifecycle(task):
+                continue
+            if self.scheduler is not None and self.scheduler.trigger(str(task.get("id")), "manual"):
+                self._set_status(f"正在执行：{task.get('name')}")
+                return
+        self._set_status("没有可立即运行的提示词任务")
+
+    def _on_unmap(self, event: Any = None) -> None:
+        """窗口被最小化时，按设置收进托盘。"""
+
+        if event is not None and getattr(event, "widget", None) is not self.root:
+            return
+        if not bool(self.store.setting("minimize_to_tray", True)):
+            return
+        try:
+            # withdraw 之后状态是 withdrawn，不是 iconic，所以这条不会自己
+            # 触发自己，不会来回循环。
+            if str(self.root.state()) != "iconic":
+                return
+        except tk.TclError:
+            return
+        if self._tray is None:
+            return
+        # 直接 withdraw 会和最小化动画抢时序，等一拍再收。
+        try:
+            self.root.after(10, lambda: self._hide_to_tray(silent=True))
+        except tk.TclError:
+            pass
+
+    # ------------------------------------------------------------------
     # 关闭
     # ------------------------------------------------------------------
 
-    def _on_close(self) -> None:
-        if not messagebox.askyesno("退出", "退出后定时任务将不再执行。确定退出吗？", parent=self.root):
+    def _request_close(self) -> None:
+        """点关闭按钮时做什么，由设置决定。"""
+
+        action = normalize_close_action(self.store.setting("close_action", "tray"))
+        if action == "tray" and self._tray is None:
+            # 没有托盘就无处可收，退化成退出，并且要问一句。
+            action = "ask"
+        if action == "tray":
+            self._hide_to_tray()
             return
+        if action == "minimize":
+            try:
+                self.root.iconify()
+            except tk.TclError:
+                pass
+            return
+        if action == "ask":
+            # 两个按钮表达两件事：是 = 退出，否 = 留在托盘继续跑。
+            leave = messagebox.askyesno(
+                "关闭窗口",
+                "退出 CueRelay？\n\n"
+                "选「否」会收进托盘继续执行定时任务，"
+                f"{HOTKEY_LABEL} 可随时唤出。",
+                parent=self.root,
+            )
+            if leave:
+                self._quit()
+            else:
+                self._hide_to_tray()
+            return
+        self._quit()
+
+    def _on_close(self) -> None:
+        self._request_close()
+
+    def _quit(self) -> None:
         # 热键是注册在这个进程上的，进程退出系统会自动收回；这里先注销一次，
         # 是为了在窗口已经没了的情况下不让消息循环继续往界面线程丢事件。
         if self._hotkey is not None:
@@ -3207,6 +3566,9 @@ class App:
             except Exception:
                 pass
             self._hotkey = None
+        # 托盘图标必须自己撤：进程没了图标会留在通知区域，直到用户把鼠标
+        # 移过去它才消失，看起来像程序没退干净。
+        self._stop_tray()
         try:
             geometry = self.root.geometry()
             if geometry:

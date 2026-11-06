@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 APP_NAME = "CueRelay"
-APP_VERSION = "2.5.0"
+APP_VERSION = "2.6.0"
 
 # cuerelay.py 位于项目根目录，本文件位于 cuerelay_app/ 下。
 BASE_DIR = Path(__file__).resolve().parent.parent

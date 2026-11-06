@@ -60,6 +60,14 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "last_palette_query": "",
     # 在任何程序里按 Ctrl+Alt+K 把窗口叫回来并打开命令面板。
     "global_hotkey": True,
+    # 托盘图标。关掉之后"收进托盘"就没有意义了，关闭动作会退化成退出。
+    "tray_enabled": True,
+    # 点关闭时做什么：tray / minimize / ask / quit
+    "close_action": "tray",
+    # 点最小化时也收进托盘，而不是留在任务栏。
+    "minimize_to_tray": True,
+    # 配合开机自启：开机时只留托盘图标，不弹窗口。
+    "start_hidden": False,
 }
 
 # 这些键在配置文件里必须是真正的布尔值。手改过的 JSON 里 "false" 是个
@@ -75,7 +83,26 @@ BOOL_SETTINGS = (
     "launch_v2ray_first",
     "show_overlay",
     "global_hotkey",
+    "tray_enabled",
+    "minimize_to_tray",
+    "start_hidden",
 )
+
+# 关闭窗口时的动作。顺序就是界面上按钮的顺序。
+CLOSE_ACTIONS = ("tray", "minimize", "ask", "quit")
+CLOSE_ACTION_LABELS = {
+    "tray": "收进托盘",
+    "minimize": "最小化",
+    "ask": "每次询问",
+    "quit": "直接退出",
+}
+
+
+def normalize_close_action(value: Any) -> str:
+    """认不出的值按默认处理，不抛异常：这个字段来自手改的配置文件。"""
+
+    text = str(value or "").strip().lower()
+    return text if text in CLOSE_ACTIONS else "tray"
 
 SCHEDULE_VALUES = ("once", "daily", "interval")
 ACTION_VALUES = ("click", "enter")
@@ -500,6 +527,7 @@ class TaskStore:
         # 在 Python 里是真值，会让"关闭自动拉起"这种开关失效。
         for key in BOOL_SETTINGS:
             settings[key] = _coerce_bool(settings.get(key), bool(DEFAULT_SETTINGS.get(key)))
+        settings["close_action"] = normalize_close_action(settings.get("close_action"))
         try:
             linger = float(settings.get("overlay_linger_seconds", 1.2))
         except (TypeError, ValueError):

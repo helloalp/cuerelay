@@ -18,12 +18,15 @@ from . import apps, conversations, hotkey, ocr, templates, vision
 from .config import now_local, parse_datetime
 from .imaging import Bitmap
 from .store import (
+    CLOSE_ACTION_LABELS,
+    CLOSE_ACTIONS,
     HISTORY_LIMIT,
     TaskStore,
     advance_next_run_past_now,
     content_snippet,
     duplicate_groups,
     is_lifecycle,
+    normalize_close_action,
     normalize_snippet,
     normalize_task,
 )
@@ -810,6 +813,22 @@ def test_template_expand() -> None:
     assert templates.expand("普通的 {花括号}", now=moment) == "普通的 {花括号}"
 
 
+def test_close_action() -> None:
+    """关闭动作只认四个值。
+
+    这个字段来自手改的配置文件，写错一个词不该让程序起不来——认不出就按
+    默认（收进托盘）处理。
+    """
+
+    assert normalize_close_action("tray") == "tray"
+    assert normalize_close_action("QUIT") == "quit"
+    assert normalize_close_action("  minimize ") == "minimize"
+    assert normalize_close_action("ask") == "ask"
+    assert normalize_close_action("关掉") == "tray"
+    assert normalize_close_action(None) == "tray"
+    assert set(CLOSE_ACTION_LABELS) == set(CLOSE_ACTIONS)
+
+
 def test_hotkey_register() -> None:
     """真的注册一次全局热键再注销。
 
@@ -896,6 +915,7 @@ TESTS: List[Tuple[str, Callable[[], None]]] = [
     ("右边界分隔线", test_panels_near_right_edge),
     ("开机自启命令", test_autostart_command),
     ("全局热键注册", test_hotkey_register),
+    ("关闭动作", test_close_action),
     ("提示词变量", test_template_expand),
     ("路径清理", test_tidy_path),
 ]
