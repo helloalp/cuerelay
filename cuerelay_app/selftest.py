@@ -13,17 +13,20 @@ import tempfile
 from pathlib import Path
 from typing import Callable, List, Tuple
 
-from . import apps, ocr, vision
+from . import apps, conversations, ocr, vision
 from .config import now_local, parse_datetime
 from .imaging import Bitmap
 from .store import (
+    HISTORY_LIMIT,
     TaskStore,
     advance_next_run_past_now,
     content_snippet,
     duplicate_groups,
     is_lifecycle,
+    normalize_snippet,
     normalize_task,
 )
+from .ui.palette import Command, filter_commands
 from .vision import Rect
 
 Color = Tuple[int, int, int]
@@ -611,6 +614,179 @@ def test_task_kind_coercion() -> None:
     assert content_snippet({"kind": "prompt", "content": "写" * 60}).endswith("…")
 
 
+def test_conversation_parse() -> None:
+    """侧边栏那一堆文字里，只有对话标题该留下。
+
+    这里用的是真实窗口读出来的行（菜单栏、应用名、New chat、分区标题、项目名、
+    缩进的对话、Show more），不是编出来的理想数据。
+    """
+
+    rows = [
+        ocr.OcrLine("File", 185, 20, 30, 16),
+        ocr.OcrLine("Edit", 252, 20, 34, 16),
+        ocr.OcrLine("View", 321, 20, 44, 16),
+        ocr.OcrLine("Help", 401, 20, 42, 21),
+        ocr.OcrLine("Codex", 103, 95, 78, 20),
+        ocr.OcrLine("C New chat", 105, 158, 120, 18),
+        ocr.OcrLine("Pinned", 103, 222, 64, 16),
+        ocr.OcrLine("Clarify say", 102, 274, 94, 21),
+        ocr.OcrLine("Projects", 103, 342, 74, 21),
+        ocr.OcrLine("B helloalp_sms", 104, 392, 152, 22),
+        ocr.OcrLine("20261103 31 Big LiquidGlass", 138, 487, 265, 21),
+        ocr.OcrLine("20261103 30", 138, 581, 119, 15),
+        ocr.OcrLine("Show more", 139, 718, 104, 16),
+    ]
+    parsed = conversations.parse(rows)
+    titles = conversations.titles(parsed)
+    assert titles == [
+        "Clarify say",
+        "helloalp_sms",
+        "20261103 31 Big LiquidGlass",
+        "20261103 30",
+    ], titles
+    assert parsed[0].section == "pinned"
+    assert parsed[1].section == "projects"
+
+
+def test_conversation_chrome_filter() -> None:
+    """固定文案不能被当成对话；正常标题不能因为长得像就被删。"""
+
+    assert conversations.is_chrome("New chat")
+    assert conversations.is_chrome("C New chat")
+    assert conversations.is_chrome("Show more")
+    assert not conversations.is_chrome("New chat 的整理结果")
+    # 只是包含菜单词、并不等于菜单词的标题要留下。
+    rows = [ocr.OcrLine("View the logs", 140, 420, 120, 18)]
+    assert [item.title for item in conversations.parse(rows)] == ["View the logs"]
+
+    assert conversations.strip_icon("B helloalp_sms") == ("helloalp_sms", True)
+    assert conversations.strip_icon("Clarify say") == ("Clarify say", False)
+    # 单字母开头的正常标题也会被剥掉图标，这条规则只影响显示，不影响跳转。
+    assert conversations.strip_icon("A B") == ("A B", False)
+
+
+def test_snippet_store() -> None:
+    """片段的名字可以从内容推出来，但内容不能被改。"""
+
+    with tempfile.TemporaryDirectory() as folder:
+        store = TaskStore(Path(folder) / "cuerelay_data.json")
+        item = store.add_snippet({"content": "  把这段总结成三点  "})
+        assert item["name"] == "把这段总结成三点"
+        assert item["content"] == "  把这段总结成三点  ", "内容不能顺手 trim，缩进可能是格式的一部分"
+
+        store.touch_snippet(item["id"])
+        store.touch_snippet(item["id"])
+        assert store.get_snippet(item["id"])["use_count"] == 2
+
+        assert store.replace_snippet(item["id"], {"name": "改名", "content": "新内容"})
+        assert store.get_snippet(item["id"])["name"] == "改名"
+        assert store.delete_snippet(item["id"])
+        assert store.snippets() == []
+        assert not store.delete_snippet("不存在")
+
+        long_item = store.add_snippet({"content": "x" * 80})
+        assert long_item["name"].endswith("…") and len(long_item["name"]) <= 25
+
+
+def test_history_cap_and_finish_run() -> None:
+    """执行记录要封顶，而且 finish_run 必须同时更新任务和记录。"""
+
+    with tempfile.TemporaryDirectory() as folder:
+        store = TaskStore(Path(folder) / "cuerelay_data.json")
+        task = store.add({"name": "记录测试", "content": "hi"})
+        store.finish_run(task, False, "失败原因", 1500, attempt=1)
+
+        history = store.history()
+        assert len(history) == 1
+        assert history[0]["ok"] is False
+        assert history[0]["attempt"] == 1
+        assert history[0]["task_name"] == "记录测试"
+        updated = store.get(task["id"])
+        assert updated["status"] == "failed"
+        assert updated["last_error"] == "失败原因"
+
+        for index in range(HISTORY_LIMIT + 20):
+            store.add_history({"task_id": "x", "task_name": f"第 {index} 条", "ok": True})
+        items = store.history()
+        assert len(items) == HISTORY_LIMIT, len(items)
+        # 新的在前：最后写进去的那条应该是第一条。
+        assert items[0]["task_name"] == f"第 {HISTORY_LIMIT + 19} 条"
+
+
+def test_retry_bounds() -> None:
+    """重试次数与间隔来自输入框，必须夹到安全区间。"""
+
+    assert normalize_task({"retry_limit": 99})["retry_limit"] == 5
+    assert normalize_task({"retry_limit": -3})["retry_limit"] == 0
+    assert normalize_task({"retry_limit": "2"})["retry_limit"] == 2
+    assert normalize_task({})["retry_limit"] == 0
+    assert normalize_task({"retry_delay": 1})["retry_delay"] == 5
+    assert normalize_task({"retry_delay": 99999})["retry_delay"] == 600
+
+
+def test_bool_settings_are_real_bools() -> None:
+    """手改配置留下的字符串 "false" 不能把开关打开。"""
+
+    with tempfile.TemporaryDirectory() as folder:
+        path = Path(folder) / "cuerelay_data.json"
+        path.write_text(
+            json.dumps(
+                {
+                    "version": 3,
+                    "settings": {"auto_launch_target": "false", "launch_v2ray_first": "0"},
+                    "tasks": [],
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+        settings = TaskStore(path).settings()
+        assert settings["auto_launch_target"] is False
+        assert settings["launch_v2ray_first"] is False
+        assert settings["show_overlay"] is True
+
+
+def test_palette_filter() -> None:
+    """命令面板：空输入全给，多个词要同时命中，前缀命中的排前面。"""
+
+    items = [
+        Command(label="打开：任务", group="视图"),
+        Command(label="新建任务", group="任务"),
+        Command(label="切换对话：Clarify say", group="对话", keywords="clarify"),
+    ]
+    assert len(filter_commands(items, "")) == 3
+    assert [item.label for item in filter_commands(items, "新建")] == ["新建任务"]
+    assert [item.label for item in filter_commands(items, "视图 任务")] == ["打开：任务"]
+    # 关键词也要能搜到
+    assert [item.label for item in filter_commands(items, "clarify")] == ["切换对话：Clarify say"]
+    assert filter_commands(items, "不存在的东西") == []
+
+    # 前缀命中排前面：打「任务」时，「任务」视图应该压过「执行：任务A」。
+    ranked = filter_commands([Command(label="执行：任务A"), Command(label="任务")], "任务")
+    assert ranked[0].label == "任务"
+
+
+def test_panels_near_right_edge() -> None:
+    """分隔线贴到窗口右边界时不能越界。
+
+    detect_panels 里要比较 `row[x + 2]`，如果整行只取到 width - 2，
+    最右边那几个 x 就会 IndexError。全黑画面时 `and` 短路把它掩盖住了，
+    一旦右边缘附近真有一条亮线就会炸——这正是窗口拉宽后识别崩掉的原因。
+    """
+
+    width, height = 400, 300
+    data = bytearray(width * height * 4)
+    for y in range(height):
+        for x in range(width):
+            value = 255 if x in (380, 381) else 20
+            index = (y * width + x) * 4
+            data[index] = data[index + 1] = data[index + 2] = value
+            data[index + 3] = 255
+    bitmap = Bitmap(width, height, bytes(data))
+    assert vision.detect_panels(bitmap) == [380]
+    assert vision.detect_sidebar_right(bitmap) == 380
+
+
 TESTS: List[Tuple[str, Callable[[], None]]] = [
     ("颜色众数", test_modal_color),
     ("输入框识别", test_composer_detection),
@@ -637,6 +813,14 @@ TESTS: List[Tuple[str, Callable[[], None]]] = [
     ("设置布尔纠正", test_settings_bool_coercion),
     ("MSIX 启动目标", test_msix_launch_target),
     ("任务类型纠正", test_task_kind_coercion),
+    ("侧边栏对话解析", test_conversation_parse),
+    ("侧边栏固定文案", test_conversation_chrome_filter),
+    ("片段存储", test_snippet_store),
+    ("执行记录", test_history_cap_and_finish_run),
+    ("重试参数", test_retry_bounds),
+    ("布尔设置纠正", test_bool_settings_are_real_bools),
+    ("命令面板过滤", test_palette_filter),
+    ("右边界分隔线", test_panels_near_right_edge),
 ]
 
 

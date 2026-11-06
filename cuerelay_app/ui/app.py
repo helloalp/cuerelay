@@ -20,6 +20,7 @@ from .. import apps as apps_module
 from .. import config, locator, store as store_module, winapi
 from ..automation import AutomationError
 from ..config import friendly_error, iso_datetime, now_local, parse_datetime
+from ..conversations import Conversation
 from ..hotkey import VirtualCapture
 from ..scheduler import Scheduler
 from ..store import (
@@ -30,10 +31,13 @@ from ..store import (
     is_lifecycle,
     kind_label,
     next_run_text,
+    normalize_snippet,
     task_state,
 )
+from ..toolbox import Toolbox, ToolboxError
 from .calibrate import CalibrationDialog
 from .overlay import Overlay, apply_event
+from .palette import Command, CommandPalette
 from .theme import Theme
 from .tidy import TidyDialog
 from .widgets import Button, Field, ScrollArea, Segmented, Switch, TextArea, card, dispatch_wheel
@@ -44,10 +48,14 @@ KIND_OPTIONS = (("prompt", "发送提示词"), ("launch", "启动应用"), ("clo
 DELAY_OPTIONS = (("0.8", "0.8 秒"), ("1.2", "1.2 秒"), ("1.8", "1.8 秒"), ("2.5", "2.5 秒"))
 THEME_OPTIONS = (("light", "浅色"), ("dark", "深色"))
 FILTER_OPTIONS = (("all", "全部"), ("info", "信息"), ("success", "成功"), ("warning", "警告"), ("error", "错误"))
+LOG_MODE_OPTIONS = (("log", "运行日志"), ("history", "执行记录"))
 
 # 分组默认展开状态。失败要立刻看到，"已停止"往往是几十条历史，默认收起，
 # 否则一打开就是一大片同名的旧任务。
 GROUP_DEFAULT_OPEN = {"active": True, "failed": True, "idle": False}
+
+# 对话页的分区小标题。侧边栏里的分区名照抄，用户一眼能对上。
+_SECTION_TITLES = {"pinned": "置顶", "projects": "项目", "chats": "对话"}
 
 
 def _clip(text: str, limit: int) -> str:
@@ -71,6 +79,10 @@ def _empty_draft() -> dict[str, Any]:
         "interval": "60",
         "action": "click",
         "enabled": True,
+        # 失败重试只对"还没把内容交出去"的失败生效，默认关闭：
+        # 大多数失败是额度或网络问题，重试只会白等一轮。
+        "retry": "0",
+        "retry_delay": "30",
     }
 
 
@@ -92,6 +104,22 @@ class App:
         self._log_filter = "all"
         self._calibrated_at = str(self.store.setting("calibrated_at") or "")
 
+        # 片段编辑器的状态。和任务草稿一样，靠"签名"判断有没有未保存的修改。
+        self.selected_snippet_id: Optional[str] = None
+        self._snippet_baseline: Optional[tuple] = None
+        self._snippet_rows: dict[str, dict[str, Any]] = {}
+
+        # 对话列表是"扫描一次、手动刷新"的：每次扫描要滚动侧边栏、跑好几次 OCR，
+        # 不可能像应用状态那样每两秒刷一遍。
+        self._conversations: list[Conversation] = []
+        self._conversation_scanning = False
+        self._conversation_rows: list[dict[str, Any]] = []
+
+        self._palette: Optional[CommandPalette] = None
+        self._apps_poll_id: Optional[str] = None
+        self._log_mode = "log"
+        self._snippet_signature: Optional[tuple] = None
+
         settings = self.store.settings()
         self.theme = Theme(str(settings.get("theme") or "light"), winapi.get_system_dpi())
         self.overlay = Overlay(self.root, self.theme)
@@ -111,7 +139,9 @@ class App:
             self._sync_editor_from_draft()
             self._set_status(f"配置文件：{config.DATA_PATH.name}")
         self._refresh_apps()
-        self._after_ids.append(self.root.after(2500, self._poll_apps))
+        self._apps_poll_id = self.root.after(2500, self._poll_apps)
+        self._bind_shortcuts()
+        self.refresh_snippets()
         if not str(self.store.setting("v2ray_path") or ""):
             # 第一次打开就顺手找一下 v2rayN，省得用户还要自己去点「自动检测」。
             threading.Thread(target=self._autodetect_v2ray, daemon=True).start()
@@ -129,9 +159,16 @@ class App:
         self.time_var = tk.StringVar(value=self.draft["time"])
         self.interval_var = tk.StringVar(value=self.draft["interval"])
         self.action_var = tk.StringVar(value=self.draft["action"])
+        self.retry_var = tk.StringVar(value=self.draft["retry"])
+        self.retry_delay_var = tk.StringVar(value=self.draft["retry_delay"])
         self.enabled_var = tk.BooleanVar(value=bool(self.draft["enabled"]))
         self.filter_var = tk.StringVar(value="")
         self.log_filter_var = tk.StringVar(value="all")
+        self.log_mode_var = tk.StringVar(value="log")
+        self.snippet_name_var = tk.StringVar(value="")
+        self.snippet_filter_var = tk.StringVar(value="")
+        self.snippet_count_var = tk.StringVar(value="0 个片段")
+        self.chat_status_var = tk.StringVar(value="还没有扫描")
 
         self.theme_var = tk.StringVar(value=str(settings.get("theme") or "light"))
         self.topmost_var = tk.BooleanVar(value=bool(settings.get("always_on_top", True)))
@@ -166,6 +203,7 @@ class App:
 
         # 只注册一次；界面重建时不会重复累积。
         self.filter_var.trace_add("write", lambda *_: self.refresh_tasks(force=True))
+        self.snippet_filter_var.trace_add("write", lambda *_: self.refresh_snippets(force=True))
 
     def _configure_root(self) -> None:
         theme = self.theme
@@ -322,7 +360,14 @@ class App:
         items.pack(fill="x", pady=(theme.px(16), 0))
 
         self.rail_items: dict[str, dict[str, Any]] = {}
-        for key, text in (("tasks", "任务"), ("apps", "应用"), ("log", "日志"), ("settings", "设置")):
+        for key, text in (
+            ("tasks", "任务"),
+            ("snippets", "片段"),
+            ("chats", "对话"),
+            ("apps", "应用"),
+            ("log", "日志"),
+            ("settings", "设置"),
+        ):
             item = tk.Frame(items, bg=theme.c("bg"), cursor="hand2")
             item.pack(fill="x", pady=(0, theme.px(2)))
             bar = tk.Frame(item, bg=theme.c("bg"), width=theme.px(3))
@@ -362,6 +407,18 @@ class App:
             font=theme.font("tiny"),
             anchor="w",
         ).pack(fill="x", pady=(theme.px(4), 0))
+        # 命令面板是快捷键驱动的，不写出来没人会去猜。
+        hint = tk.Label(
+            bottom,
+            text="Ctrl+K 命令",
+            bg=theme.c("bg"),
+            fg=theme.c("text_3"),
+            font=theme.font("tiny"),
+            anchor="w",
+            cursor="hand2",
+        )
+        hint.pack(fill="x", pady=(theme.px(6), 0))
+        hint.bind("<Button-1>", lambda _event: self.open_palette())
 
     def _build_content(self, parent: tk.Frame) -> None:
         theme = self.theme
@@ -371,12 +428,14 @@ class App:
         content.grid_columnconfigure(0, weight=1)
 
         self.views: dict[str, tk.Frame] = {}
-        for key in ("tasks", "apps", "log", "settings"):
+        for key in ("tasks", "snippets", "chats", "apps", "log", "settings"):
             frame = tk.Frame(content, bg=theme.c("bg"))
             frame.grid(row=0, column=0, sticky="nsew")
             self.views[key] = frame
 
         self._build_tasks_view(self.views["tasks"])
+        self._build_snippets_view(self.views["snippets"])
+        self._build_chats_view(self.views["chats"])
         self._build_apps_view(self.views["apps"])
         self._build_log_view(self.views["log"])
         self._build_settings_view(self.views["settings"])
@@ -459,6 +518,467 @@ class App:
             anchor="w",
         )
         self.editor_state.pack(side="left", padx=(theme.px(12), 0))
+
+    # ------------------------------------------------------------------
+    # 片段视图
+    # ------------------------------------------------------------------
+
+    def _build_snippets_view(self, parent: tk.Frame) -> None:
+        theme = self.theme
+        left = tk.Frame(parent, bg=theme.c("bg"), width=theme.px(286))
+        left.pack(side="left", fill="y")
+        left.pack_propagate(False)
+
+        head = tk.Frame(left, bg=theme.c("bg"))
+        head.pack(fill="x", pady=(theme.px(16), theme.px(10)))
+        tk.Label(
+            head,
+            textvariable=self.snippet_count_var,
+            bg=theme.c("bg"),
+            fg=theme.c("text_3"),
+            font=theme.font("small"),
+            anchor="w",
+        ).pack(side="left")
+        Button(head, theme, "新建", self.new_snippet, kind="ghost", size="sm").pack(side="right")
+
+        search = Field(left, theme, "", self.snippet_filter_var, bg_key="bg", placeholder="搜索片段")
+        search.pack(fill="x", pady=(0, theme.px(10)))
+        search.entry.configure(font=theme.font("small"))
+
+        wrap = tk.Frame(left, bg=theme.c("bg"))
+        wrap.pack(fill="both", expand=True)
+        self.snippet_scroll = ScrollArea(wrap, theme, "bg")
+        self.snippet_scroll.pack(fill="both", expand=True)
+        self.snippet_list_body = self.snippet_scroll.body
+
+        right = tk.Frame(parent, bg=theme.c("bg"))
+        right.pack(side="left", fill="both", expand=True, padx=(theme.px(20), 0))
+        right.grid_rowconfigure(0, weight=1)
+        right.grid_columnconfigure(0, weight=1)
+
+        # 片段编辑器不用外层滚动：内容框自己会滚，外层再套一层只会让卡片
+        # 停在自然高度，下面留一大块空白。
+        pad = theme.px(20)
+        outer, body = card(right, theme, "surface")
+        outer.grid(row=0, column=0, sticky="nsew")
+        self.snippet_name_field = Field(body, theme, "名称", self.snippet_name_var)
+        self.snippet_name_field.pack(fill="x", padx=pad, pady=(pad, 0))
+        self.snippet_area = TextArea(body, theme, "内容", height=8)
+        self.snippet_area.pack(fill="both", expand=True, padx=pad, pady=(theme.px(14), pad))
+
+        actions = tk.Frame(right, bg=theme.c("bg"))
+        actions.grid(row=1, column=0, sticky="ew", pady=(theme.px(12), 0))
+        self.snippet_delete_button = Button(actions, theme, "删除", self.delete_snippet, kind="danger")
+        self.snippet_delete_button.pack(side="left")
+        # 片段的主按钮是「发送」：这个页面的意义就是把常用的话一句话发出去。
+        Button(actions, theme, "发送", self.send_snippet, kind="primary").pack(side="right")
+        Button(actions, theme, "填入任务", self.snippet_to_task, kind="ghost").pack(
+            side="right", padx=(0, theme.px(8))
+        )
+        Button(actions, theme, "保存", self.save_snippet, kind="ghost").pack(
+            side="right", padx=(0, theme.px(8))
+        )
+        self.snippet_state = tk.Label(
+            actions,
+            text="",
+            bg=theme.c("bg"),
+            fg=theme.c("text_3"),
+            font=theme.font("tiny"),
+            anchor="w",
+        )
+        self.snippet_state.pack(side="left", padx=(theme.px(12), 0))
+
+    def refresh_snippets(self, force: bool = False) -> None:
+        if not hasattr(self, "snippet_list_body"):
+            return
+        items = self.store.snippets()
+        total = len(items)
+        keyword = self.snippet_filter_var.get().strip().lower()
+        if keyword:
+            items = [
+                item
+                for item in items
+                if keyword in str(item.get("name") or "").lower()
+                or keyword in str(item.get("content") or "").lower()
+            ]
+        # 常用的排前面：片段库的价值在于"那几句我天天用"。
+        items.sort(key=lambda item: (-int(item.get("use_count") or 0), str(item.get("name") or "")))
+
+        signature = tuple((item["id"], item["name"], int(item.get("use_count") or 0)) for item in items)
+        if not force and signature == self._snippet_signature:
+            self._paint_snippets()
+            return
+        self._snippet_signature = signature
+
+        for child in self.snippet_list_body.winfo_children():
+            child.destroy()
+        self._snippet_rows.clear()
+
+        if not items:
+            tk.Label(
+                self.snippet_list_body,
+                text="没有匹配的片段" if keyword else "还没有片段，点右上角「新建」",
+                bg=self.theme.c("bg"),
+                fg=self.theme.c("text_3"),
+                font=self.theme.font("small"),
+                anchor="w",
+            ).pack(fill="x", padx=self.theme.px(4), pady=self.theme.px(14))
+        for item in items:
+            self._render_snippet_row(item)
+
+        self.snippet_count_var.set(f"{total} 个片段")
+        self._paint_snippets()
+
+    def _render_snippet_row(self, snippet: dict[str, Any]) -> None:
+        theme = self.theme
+        row = tk.Frame(self.snippet_list_body, bg=theme.c("bg"), cursor="hand2")
+        row.pack(fill="x", pady=(0, theme.px(2)))
+
+        inner = tk.Frame(row, bg=theme.c("bg"))
+        inner.pack(fill="x", padx=theme.px(10), pady=theme.px(7))
+
+        name = tk.Label(
+            inner,
+            text=str(snippet.get("name") or ""),
+            bg=theme.c("bg"),
+            fg=theme.c("text"),
+            font=theme.font("body"),
+            anchor="w",
+            justify="left",
+        )
+        name.pack(fill="x")
+
+        used = int(snippet.get("use_count") or 0)
+        preview = " ".join(str(snippet.get("content") or "").split())
+        if len(preview) > 40:
+            preview = preview[:39] + "…"
+        meta = f"用过 {used} 次 · {preview}" if used else preview
+        detail = tk.Label(
+            inner,
+            text=meta,
+            bg=theme.c("bg"),
+            fg=theme.c("text_3"),
+            font=theme.font("tiny"),
+            anchor="w",
+            justify="left",
+        )
+        detail.pack(fill="x", pady=(theme.px(3), 0))
+
+        for widget in (row, inner, name, detail):
+            widget.bind("<Button-1>", lambda _event, i=snippet["id"]: self.select_snippet(i))
+        self._snippet_rows[str(snippet["id"])] = {"frame": row, "inner": inner, "name": name, "detail": detail}
+
+    def _paint_snippets(self) -> None:
+        theme = self.theme
+        for snippet_id, widgets in self._snippet_rows.items():
+            active = snippet_id == self.selected_snippet_id
+            fill = theme.c("accent_soft") if active else theme.c("bg")
+            for widget in widgets.values():
+                try:
+                    widget.configure(bg=fill)
+                except tk.TclError:
+                    pass
+            if active:
+                widgets["name"].configure(fg=theme.c("accent_label"))
+                widgets["detail"].configure(fg=theme.c("accent_label"))
+            else:
+                widgets["name"].configure(fg=theme.c("text"))
+                widgets["detail"].configure(fg=theme.c("text_3"))
+
+    def _snippet_signature_now(self) -> tuple:
+        return (self.snippet_name_var.get().strip(), self.snippet_area.get())
+
+    def _snippet_dirty(self) -> bool:
+        if self._snippet_baseline is None:
+            return bool(self.snippet_name_var.get().strip() or self.snippet_area.get().strip())
+        return self._snippet_signature_now() != self._snippet_baseline
+
+    def _confirm_discard_snippet(self) -> bool:
+        if not self._snippet_dirty():
+            return True
+        return messagebox.askyesno("放弃修改", "当前片段有未保存的修改，确定放弃吗？", parent=self.root)
+
+    def _set_snippet_state(self, text: str, tone: str = "text_3") -> None:
+        try:
+            self.snippet_state.configure(text=_clip(text, 40), fg=self.theme.c(tone))
+        except tk.TclError:
+            pass
+
+    def new_snippet(self) -> None:
+        if not self._confirm_discard_snippet():
+            return
+        self.selected_snippet_id = None
+        self.snippet_name_var.set("")
+        self.snippet_area.set("")
+        self._snippet_baseline = ("", "")
+        self._paint_snippets()
+        self._set_snippet_state("")
+        self.snippet_area.text.focus_set()
+
+    def select_snippet(self, snippet_id: str) -> None:
+        if snippet_id == self.selected_snippet_id:
+            return
+        if not self._confirm_discard_snippet():
+            return
+        item = self.store.get_snippet(snippet_id)
+        if item is None:
+            return
+        self.selected_snippet_id = snippet_id
+        self.snippet_name_var.set(str(item.get("name") or ""))
+        self.snippet_area.set(str(item.get("content") or ""))
+        self._snippet_baseline = self._snippet_signature_now()
+        self._paint_snippets()
+        self._set_snippet_state("")
+
+    def save_snippet(self) -> bool:
+        content = self.snippet_area.get()
+        if not content.strip():
+            self._set_snippet_state("内容不能为空", "danger")
+            return False
+        name = self.snippet_name_var.get().strip()
+        if self.selected_snippet_id:
+            self.store.replace_snippet(self.selected_snippet_id, {"name": name, "content": content})
+            message = "已保存"
+        else:
+            item = self.store.add_snippet({"name": name, "content": content})
+            self.selected_snippet_id = str(item["id"])
+            message = "已新建"
+        self._snippet_baseline = self._snippet_signature_now()
+        self.refresh_snippets(force=True)
+        self._set_snippet_state(message, "success")
+        return True
+
+    def delete_snippet(self) -> None:
+        if not self.selected_snippet_id:
+            self._set_snippet_state("还没有选中片段", "warning")
+            return
+        name = self.snippet_name_var.get().strip() or "这个片段"
+        if not messagebox.askyesno("删除片段", f"确定删除「{name}」吗？", parent=self.root):
+            return
+        self.store.delete_snippet(self.selected_snippet_id)
+        self.new_snippet()
+        self.refresh_snippets(force=True)
+        self._set_snippet_state("已删除", "success")
+
+    def send_snippet(self) -> None:
+        """把片段立刻发出去。保存不是前提，但改了内容要先存下来。"""
+
+        if not self.save_snippet():
+            return
+        snippet_id = self.selected_snippet_id
+        content = self.snippet_area.get()
+        name = self.snippet_name_var.get().strip() or "片段"
+
+        def work(toolbox: Toolbox) -> str:
+            outcome = toolbox.send(content, name=name)
+            return outcome.message or "已发送"
+
+        self._run_toolbox(f"发送「{name}」", work)
+        if snippet_id:
+            self.store.touch_snippet(snippet_id)
+            self.refresh_snippets(force=True)
+
+    def snippet_to_task(self) -> None:
+        """把片段变成一条新任务草稿。不直接保存，先让用户定计划。"""
+
+        content = self.snippet_area.get()
+        if not content.strip():
+            self._set_snippet_state("内容不能为空", "danger")
+            return
+        if not self._confirm_discard():
+            return
+        self.selected_id = None
+        self.draft = _empty_draft()
+        self.draft["name"] = self.snippet_name_var.get().strip()
+        self.draft["content"] = content
+        self._sync_editor_from_draft()
+        self._baseline = None
+        self.show_view("tasks")
+        self._set_status("已填入新任务，选好计划后保存")
+
+    # ------------------------------------------------------------------
+    # 对话视图
+    # ------------------------------------------------------------------
+
+    def _build_chats_view(self, parent: tk.Frame) -> None:
+        theme = self.theme
+        head = tk.Frame(parent, bg=theme.c("bg"))
+        head.pack(fill="x", pady=(theme.px(16), theme.px(6)))
+        tk.Label(
+            head,
+            text="对话",
+            bg=theme.c("bg"),
+            fg=theme.c("text"),
+            font=theme.font("section"),
+        ).pack(side="left")
+        tk.Label(
+            head,
+            textvariable=self.chat_status_var,
+            bg=theme.c("bg"),
+            fg=theme.c("text_3"),
+            font=theme.font("small"),
+        ).pack(side="left", padx=(theme.px(12), 0))
+        Button(head, theme, "扫描对话", self.scan_conversations, kind="primary", size="sm").pack(side="right")
+        Button(head, theme, "新建对话", self.new_conversation, kind="ghost", size="sm").pack(
+            side="right", padx=(0, theme.px(8))
+        )
+
+        tk.Label(
+            parent,
+            text="读 Codex 侧边栏里当前能看到的标题；点一条切过去，切换后核对标题栏。",
+            bg=theme.c("bg"),
+            fg=theme.c("text_3"),
+            font=theme.font("small"),
+            anchor="w",
+            justify="left",
+            wraplength=theme.px(720),
+        ).pack(fill="x", pady=(0, theme.px(12)))
+
+        outer, inner = card(parent, theme, "surface")
+        outer.pack(fill="both", expand=True)
+        self.chat_scroll = ScrollArea(inner, theme, "surface")
+        self.chat_scroll.pack(fill="both", expand=True, padx=theme.px(6), pady=theme.px(6))
+        self.chat_list_body = self.chat_scroll.body
+        self._render_chats()
+
+    def _render_chats(self) -> None:
+        if not hasattr(self, "chat_list_body"):
+            return
+        theme = self.theme
+        for child in self.chat_list_body.winfo_children():
+            child.destroy()
+        self._conversation_rows.clear()
+
+        if self._conversation_scanning:
+            tk.Label(
+                self.chat_list_body,
+                text="正在读取侧边栏…",
+                bg=theme.c("surface"),
+                fg=theme.c("text_3"),
+                font=theme.font("small"),
+                anchor="w",
+            ).pack(fill="x", padx=theme.px(12), pady=theme.px(14))
+            return
+
+        if not self._conversations:
+            tk.Label(
+                self.chat_list_body,
+                text="还没有扫描。点右上角「扫描对话」读一次侧边栏。",
+                bg=theme.c("surface"),
+                fg=theme.c("text_3"),
+                font=theme.font("small"),
+                anchor="w",
+            ).pack(fill="x", padx=theme.px(12), pady=theme.px(14))
+            return
+
+        section = ""
+        for index, item in enumerate(self._conversations):
+            if item.section != section:
+                section = item.section
+                tk.Label(
+                    self.chat_list_body,
+                    text=_SECTION_TITLES.get(section, "对话"),
+                    bg=theme.c("surface"),
+                    fg=theme.c("text_3"),
+                    font=theme.font("small_strong"),
+                    anchor="w",
+                ).pack(fill="x", padx=theme.px(12), pady=(theme.px(10), theme.px(2)))
+
+            row = tk.Frame(self.chat_list_body, bg=theme.c("surface"), cursor="hand2")
+            row.pack(fill="x")
+            label = tk.Label(
+                row,
+                text=item.title,
+                bg=theme.c("surface"),
+                fg=theme.c("text"),
+                font=theme.font("body"),
+                anchor="w",
+                padx=theme.px(12),
+                pady=theme.px(7),
+                justify="left",
+            )
+            label.pack(fill="x")
+            for widget in (row, label):
+                widget.bind("<Button-1>", lambda _event, title=item.title: self.open_conversation(title))
+                widget.bind("<Enter>", lambda _event, r=row, l=label: self._hover_chat(r, l, True))
+                widget.bind("<Leave>", lambda _event, r=row, l=label: self._hover_chat(r, l, False))
+            self._conversation_rows.append({"frame": row, "label": label, "title": item.title})
+
+    def _hover_chat(self, row: tk.Frame, label: tk.Label, hover: bool) -> None:
+        theme = self.theme
+        fill = theme.c("surface_3") if hover else theme.c("surface")
+        try:
+            row.configure(bg=fill)
+            label.configure(bg=fill)
+        except tk.TclError:
+            pass
+
+    def scan_conversations(self) -> None:
+        if self._conversation_scanning:
+            return
+        self._conversation_scanning = True
+        self.chat_status_var.set("正在读取…")
+        self._render_chats()
+
+        def work(toolbox: Toolbox) -> str:
+            try:
+                items = toolbox.conversations()
+            except Exception as exc:
+                self.emit("chats", exc)
+                raise
+            self.emit("chats", items)
+            return f"扫描到 {len(items)} 个对话"
+
+        self.scheduler.run_exclusive(work, "扫描对话")
+
+    def _apply_conversations(self, payload: Any) -> None:
+        self._conversation_scanning = False
+        if isinstance(payload, Exception):
+            self.chat_status_var.set("扫描失败")
+        else:
+            self._conversations = list(payload)
+            self.chat_status_var.set(f"{len(self._conversations)} 个对话")
+        self._render_chats()
+
+    def open_conversation(self, title: str) -> None:
+        def work(toolbox: Toolbox) -> str:
+            return toolbox.open_conversation(title)
+
+        self._run_toolbox(f"切换「{title}」", work)
+
+    def new_conversation(self) -> None:
+        self._run_toolbox("新建对话", lambda toolbox: toolbox.new_conversation())
+
+    def stop_generation(self) -> None:
+        self._run_toolbox("停止生成", lambda toolbox: toolbox.stop_generation())
+
+    def clear_input(self) -> None:
+        self._run_toolbox("清空输入框", lambda toolbox: toolbox.clear_input())
+
+    # ------------------------------------------------------------------
+    # 工具箱动作的公共入口
+    # ------------------------------------------------------------------
+
+    def _run_toolbox(self, label: str, work: Callable[[Toolbox], Any]) -> None:
+        """把一次工具箱动作交给调度器执行。
+
+        调度器会隐藏主窗口、拿到窗口锁、跑完再恢复——所以界面按钮和定时任务
+        不会同时去点同一个窗口。
+        """
+
+        settings = self.store.settings()
+        log = self.log_async
+        emit = self.emit
+        exclude = self.root_hwnd
+
+        def runner() -> str:
+            result = work(Toolbox(settings, log, exclude_hwnd=exclude, emit=emit))
+            if isinstance(result, str) and result:
+                return result
+            return f"{label}完成"
+
+        self.scheduler.run_exclusive(runner, label)
+        self._set_status(f"{label}…")
 
     # ------------------------------------------------------------------
     # 应用视图
@@ -776,6 +1296,19 @@ class App:
         self.interval_row = tk.Frame(self.schedule_holder, bg=theme.c("surface"))
         Field(self.interval_row, theme, "间隔分钟", self.interval_var).pack(fill="x")
 
+        # 重试属于"计划"的一部分：这次没成，要不要再试一次。
+        self.retry_row = tk.Frame(self.schedule_holder, bg=theme.c("surface"))
+        Field(
+            self.retry_row,
+            theme,
+            "失败重试次数",
+            self.retry_var,
+            hint="0 表示不重试；已提交内容后不会重试",
+        ).pack(side="left", fill="x", expand=True)
+        Field(self.retry_row, theme, "重试间隔（秒）", self.retry_delay_var).pack(
+            side="left", fill="x", expand=True, padx=(theme.px(12), 0)
+        )
+
         self.send_group = tk.Frame(body, bg=theme.c("surface"))
         self.send_group.pack(fill="x", after=self.schedule_holder)
 
@@ -823,12 +1356,17 @@ class App:
             pass
 
     def _on_schedule_change(self, value: str) -> None:
-        if value == "interval":
-            self.time_row.pack_forget()
-            self.interval_row.pack(fill="x")
-        else:
-            self.interval_row.pack_forget()
-            self.time_row.pack(fill="x")
+        try:
+            self.retry_row.pack_forget()
+            if value == "interval":
+                self.time_row.pack_forget()
+                self.interval_row.pack(fill="x")
+            else:
+                self.interval_row.pack_forget()
+                self.time_row.pack(fill="x")
+            self.retry_row.pack(fill="x", pady=(self.theme.px(12), 0))
+        except (AttributeError, tk.TclError):
+            pass
 
     # ------------------------------------------------------------------
     # 日志视图
@@ -840,23 +1378,32 @@ class App:
         head.pack(fill="x", pady=(theme.px(16), theme.px(12)))
         tk.Label(
             head,
-            text="运行日志",
+            text="日志",
             bg=theme.c("bg"),
             fg=theme.c("text"),
             font=theme.font("section"),
         ).pack(side="left")
-        Button(head, theme, "打开日志文件", self._open_log_file, kind="ghost", size="sm").pack(side="right")
-        Button(head, theme, "清空", self._clear_log, kind="ghost", size="sm").pack(
-            side="right", padx=(0, theme.px(8))
-        )
+        self.log_file_button = Button(head, theme, "打开日志文件", self._open_log_file, kind="ghost", size="sm")
+        self.log_file_button.pack(side="right")
+        self.log_clear_button = Button(head, theme, "清空", self._clear_current, kind="ghost", size="sm")
+        self.log_clear_button.pack(side="right", padx=(0, theme.px(8)))
 
-        filters = tk.Frame(parent, bg=theme.c("bg"))
+        mode_row = tk.Frame(parent, bg=theme.c("bg"))
+        mode_row.pack(fill="x", pady=(0, theme.px(12)))
+        Segmented(mode_row, theme, LOG_MODE_OPTIONS, self.log_mode_var, self._on_log_mode).pack(side="left")
+
+        # 两个面板交替显示。日志是"这一次跑了什么"，记录是"每条任务最后怎么样"，
+        # 内容不同但都是"回头看"，放在同一个视图里用一段切换最省位置。
+        self.log_panel = tk.Frame(parent, bg=theme.c("bg"))
+        self.history_panel = tk.Frame(parent, bg=theme.c("bg"))
+
+        filters = tk.Frame(self.log_panel, bg=theme.c("bg"))
         filters.pack(fill="x", pady=(0, theme.px(12)))
         Segmented(filters, theme, FILTER_OPTIONS, self.log_filter_var, self._on_log_filter).pack(
             side="left"
         )
 
-        outer, inner = card(parent, theme, "surface")
+        outer, inner = card(self.log_panel, theme, "surface")
         outer.pack(fill="both", expand=True)
         self.log_text = tk.Text(
             inner,
@@ -883,6 +1430,102 @@ class App:
             ("time", theme.c("text_3")),
         ):
             self.log_text.tag_configure(level, foreground=color)
+
+        outer, inner = card(self.history_panel, theme, "surface")
+        outer.pack(fill="both", expand=True)
+        self.history_scroll = ScrollArea(inner, theme, "surface")
+        self.history_scroll.pack(fill="both", expand=True, padx=theme.px(6), pady=theme.px(6))
+        self.history_body = self.history_scroll.body
+
+        self._on_log_mode(self.log_mode_var.get())
+
+    def _on_log_mode(self, value: str) -> None:
+        self._log_mode = value
+        if not hasattr(self, "log_panel"):
+            return
+        if value == "history":
+            self.log_panel.pack_forget()
+            self.history_panel.pack(fill="both", expand=True)
+            self._render_history()
+        else:
+            self.history_panel.pack_forget()
+            self.log_panel.pack(fill="both", expand=True)
+            self._render_log()
+
+    def _render_history(self) -> None:
+        if not hasattr(self, "history_body"):
+            return
+        theme = self.theme
+        for child in self.history_body.winfo_children():
+            child.destroy()
+
+        items = self.store.history(limit=120)
+        if not items:
+            tk.Label(
+                self.history_body,
+                text="还没有执行记录。任务跑过一次之后，结果会留在这里。",
+                bg=theme.c("surface"),
+                fg=theme.c("text_3"),
+                font=theme.font("small"),
+                anchor="w",
+            ).pack(fill="x", padx=theme.px(12), pady=theme.px(14))
+            return
+
+        for entry in items:
+            row = tk.Frame(self.history_body, bg=theme.c("surface"))
+            row.pack(fill="x", padx=theme.px(12), pady=theme.px(5))
+
+            stamp = parse_datetime(entry.get("at"))
+            when = config.format_short_datetime(stamp, "")
+            tk.Label(
+                row,
+                text=when,
+                bg=theme.c("surface"),
+                fg=theme.c("text_3"),
+                font=theme.font("mono"),
+                width=14,
+                anchor="w",
+            ).pack(side="left")
+
+            ok = bool(entry.get("ok"))
+            tk.Label(
+                row,
+                text="成功" if ok else "失败",
+                bg=theme.c("surface"),
+                fg=theme.c("success") if ok else theme.c("danger"),
+                font=theme.font("small_strong"),
+                width=5,
+                anchor="w",
+            ).pack(side="left")
+
+            name = str(entry.get("task_name") or "未命名任务")
+            attempt = int(entry.get("attempt") or 0)
+            if attempt:
+                name = f"{name}（重试 {attempt}）"
+            detail = str(entry.get("message") or "")
+            duration = int(entry.get("duration_ms") or 0) / 1000.0
+            tail = f"{name} · {duration:.1f}s" + (f" · {detail}" if detail else "")
+            tk.Label(
+                row,
+                text=_clip(tail, 90),
+                bg=theme.c("surface"),
+                fg=theme.c("text_2") if ok else theme.c("danger"),
+                font=theme.font("small"),
+                anchor="w",
+                justify="left",
+            ).pack(side="left", fill="x", expand=True)
+
+    def _clear_current(self) -> None:
+        if self._log_mode == "history":
+            if not self.store.history():
+                return
+            if not messagebox.askyesno("清空记录", "确定清空全部执行记录吗？", parent=self.root):
+                return
+            self.store.clear_history()
+            self._render_history()
+            self._set_status("已清空执行记录")
+            return
+        self._clear_log()
 
     def _on_log_filter(self, value: str) -> None:
         self._log_filter = value
@@ -1190,9 +1833,17 @@ class App:
             parts["bar"].configure(bg=theme.c("accent") if active else theme.c("bg"))
         if self.view == "apps":
             self._refresh_apps()
+        elif self.view == "snippets":
+            self.refresh_snippets()
+        elif self.view == "log":
+            self._render_log()
 
     def _poll_apps(self) -> None:
-        """应用页的状态会随外部变化（用户自己关掉、托盘恢复），定时刷一下。"""
+        """应用页的状态会随外部变化（用户自己关掉、托盘恢复），定时刷一下。
+
+        这里只保留一个定时器 id。以前每轮都往 _after_ids 里追加一个，
+        跑一整天就是几万条永远不会被取消的字符串。
+        """
 
         try:
             if self.view == "apps":
@@ -1200,7 +1851,7 @@ class App:
         except tk.TclError:
             return
         try:
-            self._after_ids.append(self.root.after(2500, self._poll_apps))
+            self._apps_poll_id = self.root.after(2500, self._poll_apps)
         except tk.TclError:
             return
 
@@ -1516,6 +2167,8 @@ class App:
             "interval": str(int(task.get("interval_minutes", 60) or 60)),
             "action": str(task.get("action") or "click"),
             "enabled": bool(task.get("enabled", True)),
+            "retry": str(int(task.get("retry_limit", 0) or 0)),
+            "retry_delay": str(int(task.get("retry_delay", 30) or 30)),
         }
         self._sync_editor_from_draft()
         self._baseline = self._editor_signature()
@@ -1527,10 +2180,20 @@ class App:
             self.editor_state.configure(text=_clip(error, 52), fg=self.theme.c("danger"))
         else:
             self.editor_state.configure(
-                text=f"运行 {int(task.get('run_count', 0) or 0)} 次",
+                text=_clip(self._run_summary(task), 52),
                 fg=self.theme.c("text_3"),
             )
         self._set_status(f"已载入：{self.draft['name'] or '未命名任务'}")
+
+    @staticmethod
+    def _run_summary(task: dict[str, Any]) -> str:
+        """编辑区底部那一行：上次什么时候跑的、跑了多久、一共几次。"""
+
+        stamp = parse_datetime(task.get("last_run"))
+        if stamp is None:
+            return "还没有执行过"
+        duration = int(task.get("last_duration_ms") or 0) / 1000.0
+        return f"上次 {config.format_short_datetime(stamp)} · {duration:.1f}s · 共 {int(task.get('run_count') or 0)} 次"
 
     def _sync_editor_from_draft(self) -> None:
         self.name_var.set(self.draft["name"])
@@ -1541,6 +2204,8 @@ class App:
         self.time_var.set(self.draft["time"])
         self.interval_var.set(self.draft["interval"])
         self.action_var.set(self.draft["action"])
+        self.retry_var.set(self.draft["retry"])
+        self.retry_delay_var.set(self.draft["retry_delay"])
         self.enabled_var.set(bool(self.draft["enabled"]))
         if hasattr(self, "prompt_area"):
             self.prompt_area.set(self.draft["content"])
@@ -1556,6 +2221,8 @@ class App:
         self.draft["time"] = self.time_var.get().strip()
         self.draft["interval"] = self.interval_var.get().strip()
         self.draft["action"] = self.action_var.get()
+        self.draft["retry"] = self.retry_var.get().strip()
+        self.draft["retry_delay"] = self.retry_delay_var.get().strip()
         self.draft["enabled"] = bool(self.enabled_var.get())
         if hasattr(self, "prompt_area"):
             self.draft["content"] = self.prompt_area.get()
@@ -1571,6 +2238,8 @@ class App:
             self.draft["time"],
             self.draft["interval"],
             self.draft["action"],
+            self.draft["retry"],
+            self.draft["retry_delay"],
             bool(self.draft["enabled"]),
         )
 
@@ -1605,6 +2274,20 @@ class App:
         self.editor_state.configure(text="", fg=self.theme.c("text_3"))
         self._apply_selection()
         self._set_status("新建任务")
+
+    def _retry_limit(self) -> int:
+        try:
+            value = int(float(self.draft["retry"] or "0"))
+        except (TypeError, ValueError):
+            return 0
+        return max(0, min(5, value))
+
+    def _retry_delay(self) -> int:
+        try:
+            value = int(float(self.draft["retry_delay"] or "30"))
+        except (TypeError, ValueError):
+            return 30
+        return max(5, min(600, value))
 
     def _build_task_payload(self) -> Optional[dict[str, Any]]:
         self._sync_draft_from_editor()
@@ -1652,6 +2335,8 @@ class App:
             "next_run": iso_datetime(next_run),
             "interval_minutes": interval,
             "action": self.draft["action"],
+            "retry_limit": self._retry_limit(),
+            "retry_delay": self._retry_delay(),
             "enabled": bool(self.draft["enabled"]),
             "status": "waiting" if self.draft["enabled"] else "paused",
             "last_error": "",
@@ -2090,6 +2775,166 @@ class App:
     # 调度与事件
     # ------------------------------------------------------------------
 
+    # ------------------------------------------------------------------
+    # 快捷键与命令面板
+    # ------------------------------------------------------------------
+
+    def _bind_shortcuts(self) -> None:
+        """全局快捷键。全部绑在 root 上，切到哪个视图都能用。"""
+
+        # Ctrl+S / Ctrl+N / Ctrl+Enter 按当前视图分派：在片段页里按 Ctrl+S
+        # 存的应该是片段，而不是背后那个看不见的任务编辑器。
+        bindings = (
+            ("<Control-k>", self.open_palette),
+            ("<Control-K>", self.open_palette),
+            ("<Control-n>", self._shortcut_new),
+            ("<Control-s>", self._shortcut_save),
+            ("<Control-Return>", self._shortcut_run),
+        )
+        for sequence, handler in bindings:
+            try:
+                self.root.bind_all(sequence, lambda _event, h=handler: h())
+            except tk.TclError:
+                pass
+
+    def _shortcut_new(self) -> None:
+        if self.view == "snippets":
+            self.new_snippet()
+        elif self.view == "tasks":
+            self.new_task()
+
+    def _shortcut_save(self) -> None:
+        if self.view == "snippets":
+            self.save_snippet()
+        elif self.view == "tasks":
+            self.save_task()
+
+    def _shortcut_run(self) -> None:
+        if self.view == "snippets":
+            self.send_snippet()
+        elif self.view == "tasks":
+            self.save_and_run()
+
+    def open_palette(self) -> None:
+        if self._palette is not None:
+            # 再按一次 Ctrl+K 就是收起，符合"同一个键开同一个面板"的直觉。
+            try:
+                self._palette.close()
+            except Exception:
+                pass
+            self._palette = None
+            return
+        try:
+            self._palette = CommandPalette(
+                self.root,
+                self.theme,
+                self._palette_commands(),
+                on_close=self._on_palette_closed,
+            )
+        except tk.TclError:
+            self._palette = None
+
+    def _on_palette_closed(self) -> None:
+        self._palette = None
+
+    def _palette_commands(self) -> list[Command]:
+        """面板里的每一条命令。顺序就是默认顺序：先视图，再动作，最后数据。"""
+
+        items: list[Command] = []
+
+        def add(
+            label: str,
+            run: Callable[[], Any],
+            group: str = "",
+            hint: str = "",
+            keywords: str = "",
+        ) -> None:
+            items.append(Command(label=label, group=group, hint=hint, keywords=keywords, run=run))
+
+        for key, text in (
+            ("tasks", "任务"),
+            ("snippets", "片段"),
+            ("chats", "对话"),
+            ("apps", "应用"),
+            ("log", "日志"),
+            ("settings", "设置"),
+        ):
+            add(f"打开：{text}", lambda k=key: self.show_view(k), "视图", "视图", text)
+
+        add("新建任务", self.new_task, "任务", "Ctrl+N", "new task 新建")
+        add("新建片段", lambda: (self.show_view("snippets"), self.new_snippet()), "片段", "", "new snippet")
+        add("扫描对话", lambda: (self.show_view("chats"), self.scan_conversations()), "对话", "", "scan 刷新")
+        add("新建对话", lambda: (self.show_view("chats"), self.new_conversation()), "对话", "", "new chat")
+        add("停止生成", self.stop_generation, "动作", "", "stop 暂停")
+        add("清空输入框", self.clear_input, "动作", "", "clear 清空")
+        add("启动 Codex", self._app_launch_codex, "应用", "", "start launch 打开")
+        add("关闭 Codex", self._app_close_codex, "应用", "", "quit close 退出")
+        add("启动 v2rayN", self._app_launch_v2ray, "应用", "", "proxy 代理")
+        add("一键启动 v2rayN → Codex", self._app_start_chain, "应用", "", "chain 启动")
+        add("打开数据目录", self._open_data_dir, "设置", "", "data folder")
+
+        for task in self.store.tasks():
+            name = str(task.get("name") or "未命名任务")
+            task_id = str(task.get("id"))
+            add(
+                f"执行：{name}",
+                lambda i=task_id: self.run_task(i),
+                "任务",
+                kind_label(task),
+                f"{name} run",
+            )
+            add(
+                f"编辑：{name}",
+                lambda i=task_id: self._open_task_from_palette(i),
+                "任务",
+                "打开",
+                f"{name} open edit",
+            )
+
+        for snippet in self.store.snippets():
+            name = str(snippet.get("name") or "片段")
+            snippet_id = str(snippet.get("id"))
+            add(
+                f"发送片段：{name}",
+                lambda i=snippet_id: self._send_snippet_by_id(i),
+                "片段",
+                "立即发送",
+                f"{name} send",
+            )
+            add(
+                f"编辑片段：{name}",
+                lambda i=snippet_id: (self.show_view("snippets"), self.select_snippet(i)),
+                "片段",
+                "打开",
+                f"{name} edit",
+            )
+
+        for item in self._conversations:
+            title = item.title
+            add(
+                f"切换对话：{title}",
+                lambda t=title: self.open_conversation(t),
+                "对话",
+                "切换",
+                title,
+            )
+
+        return items
+
+    def _open_task_from_palette(self, task_id: str) -> None:
+        self.show_view("tasks")
+        self.select_task(task_id)
+
+    def _send_snippet_by_id(self, snippet_id: str) -> None:
+        item = self.store.get_snippet(snippet_id)
+        if item is None:
+            return
+        content = str(item.get("content") or "")
+        name = str(item.get("name") or "片段")
+        self._run_toolbox(f"发送「{name}」", lambda toolbox: toolbox.send(content, name=name))
+        self.store.touch_snippet(snippet_id)
+        self.refresh_snippets(force=True)
+
     def _start_scheduler(self) -> None:
         self.scheduler = Scheduler(self.store, self.emit, exclude_hwnd=self.root_hwnd)
         self.scheduler.start()
@@ -2139,6 +2984,17 @@ class App:
                 elif event == "apps":
                     try:
                         self._refresh_apps()
+                    except tk.TclError:
+                        pass
+                elif event == "chats":
+                    try:
+                        self._apply_conversations(payload)
+                    except tk.TclError:
+                        pass
+                elif event == "history":
+                    try:
+                        if self.view == "log":
+                            self._render_log()
                     except tk.TclError:
                         pass
         except queue.Empty:
@@ -2197,6 +3053,12 @@ class App:
             except Exception:
                 pass
         self._after_ids = []
+        if self._apps_poll_id:
+            try:
+                self.root.after_cancel(self._apps_poll_id)
+            except Exception:
+                pass
+            self._apps_poll_id = None
         try:
             self.overlay.destroy()
         except Exception:

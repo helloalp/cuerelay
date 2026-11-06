@@ -232,10 +232,13 @@ VK_CONTROL = 0x11
 VK_A = 0x41
 VK_V = 0x56
 VK_K = 0x4B
+VK_B = 0x42
 VK_RETURN = 0x0D
 VK_ESCAPE = 0x1B
 VK_MENU = 0x12
 VK_F8 = 0x77
+VK_DELETE = 0x2E
+VK_BACK = 0x08
 KEYEVENTF_KEYUP = 0x0002
 MOUSEEVENTF_LEFTDOWN = 0x0002
 MOUSEEVENTF_LEFTUP = 0x0004
@@ -488,7 +491,11 @@ def windows_for_process(
             user32.GetWindowThreadProcessId(HWND(hwnd), ctypes.byref(pid))
             if int(pid.value) not in pids:
                 return True
-            if not include_hidden and not user32.IsWindowVisible(HWND(hwnd)):
+            visible = bool(user32.IsWindowVisible(HWND(hwnd)))
+            cloaked = is_cloaked(hwnd)
+            # 遮蔽的窗口"可见"但屏幕上没有，按隐藏处理：这样状态会显示成
+            # 「在后台」，恢复逻辑也会走 ShowWindow 而不是直接切前台。
+            if not include_hidden and (not visible or cloaked):
                 return True
             if not get_window_title(hwnd):
                 return True
@@ -497,7 +504,8 @@ def windows_for_process(
                 return True
             info = window_info(hwnd)
             info["rect"] = rect
-            info["visible"] = bool(user32.IsWindowVisible(HWND(hwnd)))
+            info["visible"] = bool(visible and not cloaked)
+            info["cloaked"] = bool(cloaked)
             found.append(info)
         except Exception:
             pass
@@ -583,6 +591,40 @@ def is_minimized(hwnd: int) -> bool:
 
 def is_maximized(hwnd: int) -> bool:
     return is_window(hwnd) and bool(user32.IsZoomed(HWND(hwnd)))
+
+
+# DwmGetWindowAttribute 的 DWMWA_CLOAKED。
+# 被 DWM 遮蔽的窗口（最小化到托盘、在别的虚拟桌面上、UWP 挂起）依然
+# IsWindowVisible 为真、依然有正常矩形，但屏幕上根本没有它。截屏会截到
+# 它背后的桌面，点下去就是点在壁纸上——这是"看起来执行了其实没执行"的
+# 另一种来源。
+DWMWA_CLOAKED = 14
+
+
+def is_cloaked(hwnd: int) -> bool:
+    if not is_window(hwnd):
+        return False
+    try:
+        dwmapi = ctypes.WinDLL("dwmapi")
+        value = ctypes.c_int(0)
+        result = dwmapi.DwmGetWindowAttribute(
+            HWND(int(hwnd)),
+            ctypes.c_uint(DWMWA_CLOAKED),
+            ctypes.byref(value),
+            ctypes.sizeof(value),
+        )
+        if result != 0:
+            return False
+        return bool(value.value)
+    except Exception:
+        # 查不到就当作没被遮蔽：宁可让后续校验去发现异常，也不要凭空拒绝。
+        return False
+
+
+def is_foreground_usable(hwnd: int) -> bool:
+    """窗口此刻是否真的在屏幕上、能截到内容。"""
+
+    return is_window(hwnd) and is_window_visible(hwnd) and not is_cloaked(hwnd)
 
 
 def foreground_window() -> int:
@@ -693,6 +735,10 @@ def find_target_window(
         hwnd = info["hwnd"]
         if not hwnd or hwnd == exclude_hwnd or _looks_like_self(info):
             continue
+        # 被 DWM 遮蔽的窗口在屏幕上不存在，截屏只会截到壁纸。它仍然算
+        # "进程在跑"，但绝不能当成可操作的目标。
+        if is_cloaked(hwnd):
+            continue
         title = str(info.get("title") or "").lower()
         process = str(info.get("process_name") or "").lower()
 
@@ -769,6 +815,12 @@ def activate_window(hwnd: int, geometry: Optional[dict[str, Any]] = None) -> boo
 
     if not is_window(hwnd):
         return False
+    if is_cloaked(hwnd):
+        # 被 DWM 遮蔽（收进托盘、在别的虚拟桌面）：先让它真的回到屏幕上。
+        # 不先做这一步，后面的 SetForegroundWindow 会"成功"但用户看不见。
+        user32.ShowWindow(HWND(hwnd), SW_SHOW)
+        user32.ShowWindow(HWND(hwnd), SW_RESTORE)
+        time.sleep(0.15)
     if geometry:
         restore_window_geometry(hwnd, geometry)
     elif is_minimized(hwnd):
@@ -787,14 +839,20 @@ def activate_window(hwnd: int, geometry: Optional[dict[str, Any]] = None) -> boo
 
 
 def ensure_foreground(hwnd: int, geometry: Optional[dict[str, Any]] = None, attempts: int = 4) -> bool:
+    """切到前台并确认它真的在屏幕上。
+
+    只看 GetForegroundWindow 不够：被 DWM 遮蔽的窗口也能成为"前台窗口"，
+    但屏幕上什么都没有，截屏截到的是壁纸。
+    """
+
     for index in range(max(1, attempts)):
-        if foreground_window() == int(hwnd):
+        if foreground_window() == int(hwnd) and not is_cloaked(hwnd):
             return True
         activate_window(hwnd, geometry if index == 0 else None)
-        if foreground_window() == int(hwnd):
+        if foreground_window() == int(hwnd) and not is_cloaked(hwnd):
             return True
         time.sleep(0.15)
-    return foreground_window() == int(hwnd)
+    return foreground_window() == int(hwnd) and not is_cloaked(hwnd)
 
 
 def set_topmost(hwnd: int, enabled: bool) -> None:
@@ -938,8 +996,32 @@ def ctrl_k() -> None:
     _key_up(VK_CONTROL)
 
 
+def ctrl_b() -> None:
+    """多数桌面应用用 Ctrl+B 收起 / 展开左侧栏。"""
+
+    _key_down(VK_CONTROL)
+    time.sleep(0.02)
+    _key_down(VK_B)
+    time.sleep(0.02)
+    _key_up(VK_B)
+    _key_up(VK_CONTROL)
+
+
 def press_escape() -> None:
     tap(VK_ESCAPE)
+
+
+def press_delete() -> None:
+    tap(VK_DELETE)
+
+
+def select_all_and_delete() -> None:
+    """清空当前输入框。用 Ctrl+A + Delete：Backspace 在多行输入框里
+    只会退一格，Delete 才是"删掉选中内容"。"""
+
+    ctrl_a()
+    time.sleep(0.05)
+    press_delete()
 
 
 # ---------------------------------------------------------------------------

@@ -636,7 +636,10 @@ def detect_panels(bitmap: Bitmap) -> list[int]:
     step_y = max(2, height // 48)
     counts: dict[int, int] = {}
     for y in range(4, height - 4, step_y):
-        row = [bitmap.lum(x, y) for x in range(0, width - 2)]
+        # 整行都要取：下面要比 row[x + 2]，只取到 width - 2 的话
+        # 右边界的 x 会越界。全黑画面时 and 短路掩盖了这个错误，
+        # 一旦右边缘附近真有亮列就会炸。
+        row = [bitmap.lum(x, y) for x in range(0, width)]
         for x in range(40, width - 2):
             here = row[x]
             # 分隔线可能是 1px 也可能是 2px（不同缩放比例下不一样），

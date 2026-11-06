@@ -58,42 +58,63 @@ class Scheduler:
 
     # -- 触发 ----------------------------------------------------------
 
-    def trigger(self, task_id: str, reason: str = "manual") -> bool:
+    def trigger(self, task_id: str, reason: str = "manual", attempt: int = 0) -> bool:
         with self._running_lock:
             if task_id in self._running:
                 return False
             self._running.add(task_id)
         threading.Thread(
             target=self._execute,
-            args=(task_id, reason),
+            args=(task_id, reason, attempt),
             name=f"cuerelay-run-{task_id}",
             daemon=True,
         ).start()
         return True
 
-    def test_paste(self, content: str) -> bool:
-        """只粘贴不发送，用来验证识别结果；和正式任务共用同一把窗口锁。"""
+    def run_exclusive(self, work: Callable[[], Any], label: str = "操作") -> bool:
+        """在窗口锁里跑一段会驱动鼠标键盘的动作。
 
-        if not str(content or "").strip():
-            return False
+        界面上的按钮（切对话、停止生成、清空输入、快速发送）都从这里进，
+        和定时任务共用同一把锁，不会出现两个动作同时点同一个窗口。
+        """
+
         threading.Thread(
-            target=self._run_paste_test,
-            args=(content,),
-            name="cuerelay-paste-test",
+            target=self._run_exclusive,
+            args=(work, label),
+            name="cuerelay-action",
             daemon=True,
         ).start()
         return True
 
-    def _run_paste_test(self, content: str) -> None:
-        if not self._window_lock.acquire(timeout=120):
-            self.emit("log", ("error", "另一个任务正在执行，粘贴测试已取消。"))
+    def _run_exclusive(self, work: Callable[[], Any], label: str) -> None:
+        if not self._window_lock.acquire(timeout=180):
+            self.emit("log", ("error", f"{label}：另一个任务正在执行，已取消。"))
             return
         gate: Optional[threading.Event] = None
         try:
             gate = threading.Event()
             self.emit("prepare", gate)
             gate.wait(0.8)
-            settings = self.store.settings()
+            result = work()
+            if isinstance(result, str) and result:
+                self.emit("log", ("success", result))
+        except Exception as exc:
+            self.emit("log", ("error", f"{label}失败：{friendly_error(exc)}"))
+        finally:
+            if gate is not None and not gate.is_set():
+                gate.set()
+            self.emit("restore", None)
+            self._window_lock.release()
+            self.emit("refresh", None)
+
+    def test_paste(self, content: str) -> bool:
+        """只粘贴不发送，用来验证识别结果；和正式任务共用同一把窗口锁。"""
+
+        if not str(content or "").strip():
+            return False
+        settings = self.store.settings()
+
+        def work() -> str:
             Runner(
                 settings,
                 lambda level, message: self.emit("log", (level, message)),
@@ -101,13 +122,9 @@ class Scheduler:
                 emit=self.emit,
             ).paste_only(content)
             self._persist_composer(settings)
-        except Exception as exc:
-            self.emit("log", ("error", f"粘贴测试失败：{friendly_error(exc)}"))
-        finally:
-            if gate is not None and not gate.is_set():
-                gate.set()
-            self.emit("restore", None)
-            self._window_lock.release()
+            return ""
+
+        return self.run_exclusive(work, "粘贴测试")
 
     # -- 主循环 --------------------------------------------------------
 
@@ -177,7 +194,7 @@ class Scheduler:
             updates["next_run"] = iso_datetime(run_time + _dt.timedelta(minutes=minutes))
         self.store.update_task(str(task.get("id")), **updates)
 
-    def _execute(self, task_id: str, reason: str) -> None:
+    def _execute(self, task_id: str, reason: str, attempt: int = 0) -> None:
         started = time.monotonic()
         if not self._window_lock.acquire(timeout=180):
             with self._running_lock:
@@ -186,6 +203,7 @@ class Scheduler:
             return
 
         gate: Optional[threading.Event] = None
+        runner: Optional[Runner] = None
         try:
             task = self.store.get(task_id)
             if not task:
@@ -212,17 +230,23 @@ class Scheduler:
             runner.run_task(task)
 
             self._persist_composer(settings)
-            self.store.record_run(task_id, True, "", int((time.monotonic() - started) * 1000))
+            elapsed = int((time.monotonic() - started) * 1000)
+            self.store.finish_run(task, True, "", elapsed, attempt)
             self.emit("refresh", None)
+            self.emit("history", None)
         except Exception as exc:
             message = friendly_error(exc)
             elapsed = int((time.monotonic() - started) * 1000)
             task = self.store.get(task_id)
-            self.store.record_run(task_id, False, message, elapsed)
-            if reason == "schedule" and task and task.get("schedule") == "once":
-                self.store.update_task(task_id, enabled=False, next_run=None)
+            if task is not None:
+                self.store.finish_run(task, False, message, elapsed, attempt)
+                if reason == "schedule" and task.get("schedule") == "once":
+                    self.store.update_task(task_id, enabled=False, next_run=None)
             self.emit("log", ("error", f"任务失败：{message}"))
             self.emit("refresh", None)
+            self.emit("history", None)
+            if task is not None:
+                self._maybe_retry(task, message, attempt, runner)
         finally:
             if gate is not None and not gate.is_set():
                 gate.set()
@@ -230,6 +254,43 @@ class Scheduler:
             with self._running_lock:
                 self._running.discard(task_id)
             self._window_lock.release()
+
+    def _maybe_retry(
+        self,
+        task: dict[str, Any],
+        message: str,
+        attempt: int,
+        runner: Optional[Runner],
+    ) -> None:
+        """失败后按设置重排一次。
+
+        只有「还没把内容交出去」的失败才重试。已经点过发送再重来一遍，
+        结果可能是同一个提示词发出去两次——那比失败更糟。
+        """
+
+        try:
+            limit = int(task.get("retry_limit") or 0)
+        except (TypeError, ValueError):
+            limit = 0
+        if limit <= 0 or attempt >= limit:
+            return
+        if runner is not None and runner.sent:
+            self.emit("log", ("warning", "内容已经提交过，不做自动重试，避免重复发送。"))
+            return
+        try:
+            delay = max(5, min(600, int(task.get("retry_delay") or 30)))
+        except (TypeError, ValueError):
+            delay = 30
+        task_id = str(task.get("id") or "")
+        if not task_id:
+            return
+        self.emit(
+            "log",
+            ("warning", f"{delay} 秒后自动重试（第 {attempt + 1}/{limit} 次）：{message}"),
+        )
+        timer = threading.Timer(delay, lambda: self.trigger(task_id, "retry", attempt + 1))
+        timer.daemon = True
+        timer.start()
 
     def _persist_composer(self, settings: dict[str, Any]) -> None:
         """把运行期识别到的输入框位置写回，供下次识别失败时兜底。"""

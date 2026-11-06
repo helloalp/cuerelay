@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Optional
 
-from . import apps, imaging, locator, ocr, vision, winapi
+from . import apps, conversations, imaging, locator, ocr, vision, winapi
 from .vision import Rect
 
 
@@ -41,6 +41,9 @@ class Runner:
         self.log = log
         self.exclude_hwnd = int(exclude_hwnd or 0)
         self.emit = emit
+        # 是否已经把内容交给目标应用。失败重试要靠它判断"重来一次会不会发两遍"：
+        # 发送动作一旦发生，再重试就可能让同一个提示词发出去两次。
+        self.sent = False
 
     # -- 浮层 ----------------------------------------------------------
 
@@ -632,6 +635,8 @@ class Runner:
                 )
             # 发送按钮的框线可能压在输入框上，基线必须在画完框之后再取。
             before_send = self._capture(send_region)
+            # 从这里开始内容就交出去了：重试可能让同一个提示词发两遍。
+            self.sent = True
             if screen_send is not None:
                 winapi.click(screen_send)
             else:
@@ -679,6 +684,159 @@ class Runner:
                 except Exception:
                     pass
             self._overlay_hide()
+
+    # -- 工具箱用的公开入口 --------------------------------------------
+    #
+    # 下面这些方法不做完整流水线，只做"一件事"，供界面上的按钮直接调用。
+    # 它们和 run_task 共用同一把窗口锁（由 Scheduler.run_exclusive 提供），
+    # 所以不会和正在执行的任务抢鼠标键盘。
+
+    def attach(self) -> tuple[dict[str, Any], int]:
+        """找到（必要时拉起）目标窗口并切到前台。"""
+
+        window = self._find_window()
+        hwnd = self._activate(window)
+        return window, hwnd
+
+    def _rows_once(self, hwnd: int) -> tuple[locator.Frame, Optional[Rect], list[ocr.OcrLine]]:
+        frame = self._frame(hwnd)
+        composer, _ = self._locator().composer(frame)
+        return frame, composer, self._list_rows(frame, composer)
+
+    def sidebar_rows(self, hwnd: int, scrolls: int = 0) -> list[ocr.OcrLine]:
+        """读侧边栏文字。scrolls > 0 时先回到顶部，再一屏一屏往下扫。
+
+        返回的是"扫到过的所有行"的并集，每一行带着它当时那一刻的坐标——
+        所以只适合用来认标题，不能拿去点。要点击请走 open_conversation，
+        它会重新定位并校验。
+        """
+
+        frame, composer, rows = self._rows_once(hwnd)
+        if scrolls <= 0:
+            return rows
+
+        collected: dict[str, ocr.OcrLine] = {}
+        for row in rows:
+            collected.setdefault(ocr.normalize(row.text), row)
+
+        region = self._list_region(frame, composer)
+        point = frame.point_to_screen(region.center)
+        signature = tuple(row.text for row in rows)
+
+        # 先回到顶部：上一轮留下的滚动位置会让靠上的对话永远扫不到。
+        for _ in range(6):
+            winapi.scroll(point, -10)
+            time.sleep(0.3)
+            frame, composer, rows = self._rows_once(hwnd)
+            for row in rows:
+                collected.setdefault(ocr.normalize(row.text), row)
+            current = tuple(row.text for row in rows)
+            if current == signature:
+                break
+            signature = current
+
+        for _ in range(max(1, scrolls)):
+            winapi.scroll(point, 6)
+            time.sleep(0.35)
+            frame, composer, rows = self._rows_once(hwnd)
+            for row in rows:
+                collected.setdefault(ocr.normalize(row.text), row)
+            current = tuple(row.text for row in rows)
+            if current == signature:
+                break
+            signature = current
+
+        return list(collected.values())
+
+    def sidebar_collapsed(self, frame: locator.Frame, composer: Optional[Rect] = None) -> bool:
+        """侧边栏是不是收起了。
+
+        Codex 在窗口变窄时会把侧边栏收成一条图标栏。那时候列表区里根本没有
+        标题，OCR 只会从图标上读出几个乱码字符——与其把乱码当成对话列出来，
+        不如明确说"收起了"。
+        """
+
+        edge = self._sidebar_right(frame, composer)
+        return edge < max(240, int(frame.width * 0.22))
+
+    def scan_conversations(self, hwnd: int, scrolls: int = 6) -> list[conversations.Conversation]:
+        frame, composer, _ = self._rows_once(hwnd)
+        if self.sidebar_collapsed(frame, composer):
+            # 先试一下 Ctrl+B：多数桌面应用用它开合侧边栏。展开没成功也没损失，
+            # 我们只是量一下宽度，不点任何东西。
+            self.log("info", "侧边栏是收起的，尝试用 Ctrl+B 展开。")
+            winapi.ctrl_b()
+            time.sleep(0.7)
+            frame, composer, _ = self._rows_once(hwnd)
+        if self.sidebar_collapsed(frame, composer):
+            raise AutomationError(
+                "目标应用的侧边栏是收起的，扫描不到对话标题。"
+                "点开侧边栏或把窗口拉宽后再试。"
+            )
+        return conversations.parse(self.sidebar_rows(hwnd, scrolls))
+
+    def open_conversation(self, hwnd: int, title: str) -> None:
+        """按标题切过去。找不到会按 strict_conversation 决定报错还是照发。"""
+
+        self._switch_conversation(hwnd, title)
+
+    def new_conversation(self, hwnd: int) -> bool:
+        """点侧边栏里的「New chat」。
+
+        不走快捷键：不同版本的新建快捷键不一样，按错可能开出新窗口或弹菜单。
+        点那一行至少是用户平时自己也在做的事。
+        """
+
+        frame, composer, rows = self._rows_once(hwnd)
+        target = None
+        for row in rows:
+            stripped, _ = conversations.strip_icon(row.text)
+            key = ocr.normalize(stripped)
+            if key.startswith(("newchat", "新对话", "新建对话")):
+                target = row
+                break
+        if target is None:
+            self.log("warning", "侧边栏里没有找到「New chat」。")
+            return False
+        winapi.click(frame.point_to_screen(target.center))
+        time.sleep(min(self._delay(), 1.2))
+        return True
+
+    def stop_generation(self, hwnd: int) -> bool:
+        """停止生成。只在那个位置真的是暂停键时才点——空闲时它是发送箭头，
+        点下去会把输入框里没写完的内容发出去。"""
+
+        frame = self._frame(hwnd)
+        composer, _ = self._locator().composer(frame)
+        if composer is None:
+            self.log("warning", "没认出输入框，无法定位暂停键。")
+            return False
+        slot, kind = self._locator().send_slot(frame, composer)
+        if slot is None or kind != vision.SEND_SLOT_PAUSE:
+            self.log("info", "目标应用此刻没有在生成回答。")
+            return False
+        winapi.click(frame.point_to_screen(slot.center))
+        self.log("success", "已请求停止生成。")
+        return True
+
+    def clear_input(self, hwnd: int) -> bool:
+        """清空输入框。空的时候不动手，免得在占位符上乱按。"""
+
+        frame = self._frame(hwnd)
+        composer, _ = self._locator().composer(frame)
+        if composer is None:
+            self.log("warning", "没认出输入框。")
+            return False
+        try:
+            if self._locator().composer_is_empty(frame, composer) is True:
+                return True
+        except Exception:
+            pass
+        winapi.click(frame.point_to_screen(composer.center))
+        time.sleep(0.15)
+        winapi.select_all_and_delete()
+        time.sleep(0.2)
+        return True
 
     def paste_only(self, content: str) -> RunOutcome:
         """只粘贴不发送，用于验证识别与输入框定位是否正常。"""

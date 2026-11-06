@@ -20,7 +20,7 @@ from typing import Any, Optional
 from . import config
 from .config import deep_copy, iso_datetime, now_local, parse_datetime
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 DEFAULT_SETTINGS: dict[str, Any] = {
     "theme": "light",
@@ -54,7 +54,25 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     # 空字符串表示"按屏幕大小自动决定"，避免把物理像素当成设计尺寸。
     "window_size": "",
     "calibrated_at": "",
+    # 发送成功后在浮层上停一会儿，让用户看清结果再消失。
+    "overlay_linger_seconds": 1.2,
+    # 命令面板的历史搜索词，回车后下次还能直接用。
+    "last_palette_query": "",
 }
+
+# 这些键在配置文件里必须是真正的布尔值。手改过的 JSON 里 "false" 是个
+# 非空字符串，`bool("false")` 为真——所以不能只靠 bool() 转换。
+BOOL_SETTINGS = (
+    "always_on_top",
+    "restore_target_geometry",
+    "recognition_enabled",
+    "verify_paste",
+    "verify_send",
+    "strict_conversation",
+    "auto_launch_target",
+    "launch_v2ray_first",
+    "show_overlay",
+)
 
 SCHEDULE_VALUES = ("once", "daily", "interval")
 ACTION_VALUES = ("click", "enter")
@@ -176,8 +194,60 @@ def normalize_task(item: dict[str, Any]) -> dict[str, Any]:
         "last_error": str(item.get("last_error") or "")[:400],
         "run_count": _coerce_int(item.get("run_count"), 0, 0, 10_000_000),
         "last_duration_ms": _coerce_int(item.get("last_duration_ms"), 0, 0, 86_400_000),
+        # 失败重试只对"还没点发送"的失败生效，见 scheduler。
+        "retry_limit": _coerce_int(item.get("retry_limit"), 0, 0, 5),
+        "retry_delay": _coerce_int(item.get("retry_delay"), 30, 5, 600),
         "created_at": iso_datetime(created),
         "updated_at": iso_datetime(parse_datetime(item.get("updated_at")) or created),
+    }
+
+
+# ---------------------------------------------------------------------------
+# 片段
+# ---------------------------------------------------------------------------
+
+
+def normalize_snippet(item: dict[str, Any]) -> dict[str, Any]:
+    created = parse_datetime(item.get("created_at")) or now_local()
+    content = str(item.get("content") or "")
+    name = str(item.get("name") or "").strip()
+    if not name:
+        # 片段常常是"先粘一段话，再想名字"。没名字就用内容开头顶上，
+        # 列表里至少能认出是哪一条。
+        flat = " ".join(content.split())
+        name = flat[:24] + ("…" if len(flat) > 24 else "") if flat else "未命名片段"
+    return {
+        "id": str(item.get("id") or uuid.uuid4().hex[:10]),
+        "name": name[:60],
+        "content": content,
+        "use_count": _coerce_int(item.get("use_count"), 0, 0, 10_000_000),
+        "created_at": iso_datetime(created),
+        "updated_at": iso_datetime(parse_datetime(item.get("updated_at")) or created),
+    }
+
+
+# ---------------------------------------------------------------------------
+# 执行历史
+# ---------------------------------------------------------------------------
+
+# 历史只是"最近发生了什么"，不是审计日志。留太多会让数据文件越来越重，
+# 而且列表本身也没人会往下翻几百条。
+HISTORY_LIMIT = 200
+
+
+def normalize_history(item: dict[str, Any]) -> dict[str, Any]:
+    at = parse_datetime(item.get("at")) or now_local()
+    return {
+        "id": str(item.get("id") or uuid.uuid4().hex[:10]),
+        "task_id": str(item.get("task_id") or ""),
+        "task_name": str(item.get("task_name") or "")[:80],
+        "kind": _coerce_kind(item.get("kind")),
+        "ok": bool(item.get("ok", False)),
+        "message": str(item.get("message") or "")[:400],
+        "duration_ms": _coerce_int(item.get("duration_ms"), 0, 0, 86_400_000),
+        "at": iso_datetime(at),
+        # 自动重试的第几次；0 表示第一次执行。手动执行也记 0。
+        "attempt": _coerce_int(item.get("attempt"), 0, 0, 99),
     }
 
 
@@ -342,7 +412,13 @@ class TaskStore:
     def __init__(self, path: Path) -> None:
         self.path = path
         self._lock = threading.RLock()
-        self.data: dict[str, Any] = {"version": SCHEMA_VERSION, "settings": deep_copy(DEFAULT_SETTINGS), "tasks": []}
+        self.data: dict[str, Any] = {
+            "version": SCHEMA_VERSION,
+            "settings": deep_copy(DEFAULT_SETTINGS),
+            "tasks": [],
+            "snippets": [],
+            "history": [],
+        }
         self.load()
 
     # -- 读写 ----------------------------------------------------------
@@ -393,8 +469,6 @@ class TaskStore:
         for key, value in raw_settings.items():
             if key in settings:
                 settings[key] = value
-            elif key == "always_on_top":
-                settings["always_on_top"] = bool(value)
 
         if version_number < 2:
             # 1.2.x 的锚点以窗口外框为坐标系，标记 space 让解析器按旧坐标换算。
@@ -419,11 +493,28 @@ class TaskStore:
             settings.get("catch_up_seconds"), config.SCHEDULE_CATCH_UP_SECONDS, 0, 3600
         )
         settings["show_overlay"] = _coerce_bool(settings.get("show_overlay"), True)
-        for key in ("recognition_enabled", "verify_paste", "verify_send", "strict_conversation"):
-            settings[key] = _coerce_bool(settings.get(key), True)
+        # 所有布尔设置统一走 _coerce_bool。手改配置留下的 "false" 字符串
+        # 在 Python 里是真值，会让"关闭自动拉起"这种开关失效。
+        for key in BOOL_SETTINGS:
+            settings[key] = _coerce_bool(settings.get(key), bool(DEFAULT_SETTINGS.get(key)))
+        try:
+            linger = float(settings.get("overlay_linger_seconds", 1.2))
+        except (TypeError, ValueError):
+            linger = 1.2
+        settings["overlay_linger_seconds"] = round(max(0.0, min(5.0, linger)), 2)
 
         tasks = [normalize_task(item) for item in raw_tasks if isinstance(item, dict)]
-        return {"version": SCHEMA_VERSION, "settings": settings, "tasks": tasks}
+        raw_snippets = raw.get("snippets") if isinstance(raw.get("snippets"), list) else []
+        snippets = [normalize_snippet(item) for item in raw_snippets if isinstance(item, dict)]
+        raw_history = raw.get("history") if isinstance(raw.get("history"), list) else []
+        history = [normalize_history(item) for item in raw_history if isinstance(item, dict)]
+        return {
+            "version": SCHEMA_VERSION,
+            "settings": settings,
+            "tasks": tasks,
+            "snippets": snippets,
+            "history": history[:HISTORY_LIMIT],
+        }
 
     @staticmethod
     def _legacy_anchor(value: Any) -> Optional[dict[str, Any]]:
@@ -595,3 +686,112 @@ class TaskStore:
                 task["updated_at"] = iso_datetime(now_local())
                 self._save_locked()
                 return
+
+    # -- 片段 ----------------------------------------------------------
+
+    def snippets(self) -> list[dict[str, Any]]:
+        with self._lock:
+            return deep_copy(self.data.get("snippets", []))
+
+    def get_snippet(self, snippet_id: Optional[str]) -> Optional[dict[str, Any]]:
+        if not snippet_id:
+            return None
+        with self._lock:
+            for item in self.data.get("snippets", []):
+                if item.get("id") == snippet_id:
+                    return deep_copy(item)
+        return None
+
+    def add_snippet(self, snippet: dict[str, Any]) -> dict[str, Any]:
+        with self._lock:
+            normalized = normalize_snippet(snippet)
+            normalized["id"] = str(snippet.get("id") or uuid.uuid4().hex[:10])
+            self.data.setdefault("snippets", []).append(normalized)
+            self._save_locked()
+            return deep_copy(normalized)
+
+    def replace_snippet(self, snippet_id: str, snippet: dict[str, Any]) -> bool:
+        with self._lock:
+            for index, old in enumerate(self.data.get("snippets", [])):
+                if old.get("id") == snippet_id:
+                    merged = {**old, **snippet, "id": snippet_id}
+                    self.data["snippets"][index] = normalize_snippet(merged)
+                    self._save_locked()
+                    return True
+        return False
+
+    def delete_snippet(self, snippet_id: str) -> bool:
+        with self._lock:
+            before = len(self.data.get("snippets", []))
+            self.data["snippets"] = [
+                item for item in self.data.get("snippets", []) if item.get("id") != snippet_id
+            ]
+            if len(self.data["snippets"]) != before:
+                self._save_locked()
+                return True
+        return False
+
+    def touch_snippet(self, snippet_id: str) -> None:
+        """记一次使用。片段列表按使用次数排序，常用的会浮上来。"""
+
+        with self._lock:
+            for item in self.data.get("snippets", []):
+                if item.get("id") == snippet_id:
+                    item["use_count"] = int(item.get("use_count", 0)) + 1
+                    item["updated_at"] = iso_datetime(now_local())
+                    self._save_locked()
+                    return
+
+    # -- 历史 ----------------------------------------------------------
+
+    def history(self, limit: int = 0) -> list[dict[str, Any]]:
+        """最近执行记录，新的在前。"""
+
+        with self._lock:
+            items = deep_copy(self.data.get("history", []))
+        return items[:limit] if limit > 0 else items
+
+    def add_history(self, entry: dict[str, Any]) -> dict[str, Any]:
+        with self._lock:
+            normalized = normalize_history(entry)
+            items = self.data.setdefault("history", [])
+            items.insert(0, normalized)
+            del items[HISTORY_LIMIT:]
+            self._save_locked()
+            return deep_copy(normalized)
+
+    def clear_history(self) -> int:
+        with self._lock:
+            count = len(self.data.get("history", []))
+            self.data["history"] = []
+            self._save_locked()
+            return count
+
+    def finish_run(
+        self,
+        task: dict[str, Any],
+        ok: bool,
+        message: str,
+        duration_ms: int,
+        attempt: int = 0,
+    ) -> dict[str, Any]:
+        """一次执行的收尾：更新任务状态，同时留下一条历史。
+
+        两件事必须一起做。分开写的话，某个调用点漏了其中一个，就会出现
+        「任务显示成功但历史里没有」这种对不上的状态。
+        """
+
+        task_id = str(task.get("id") or "")
+        entry = self.add_history(
+            {
+                "task_id": task_id,
+                "task_name": str(task.get("name") or ""),
+                "kind": str(task.get("kind") or "prompt"),
+                "ok": ok,
+                "message": message,
+                "duration_ms": duration_ms,
+                "attempt": attempt,
+            }
+        )
+        self.record_run(task_id, ok, message, duration_ms)
+        return entry
