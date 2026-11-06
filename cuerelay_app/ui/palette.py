@@ -48,7 +48,17 @@ def filter_commands(commands: list[Command], query: str) -> list[Command]:
     return matched
 
 
-class CommandPalette(tk.Toplevel):
+class CommandPalette(tk.Frame):
+    """主窗口里的一层覆盖面板。
+
+    以前它是独立的 Toplevel（overrideredirect + topmost + grab）。那套组合在
+    Windows 上不稳：主窗口自己置顶时，第二次打开面板会落在主窗口后面，
+    背景也画不出来——按 Ctrl+K 看起来毫无反应，其实键盘已经被它抢走了。
+
+    现在它只是主窗口里的一个 Frame，用 place() 盖住内容区。没有 z-order，
+    没有跨窗口焦点，也就没有这类问题。
+    """
+
     def __init__(
         self,
         master: tk.Misc,
@@ -56,7 +66,12 @@ class CommandPalette(tk.Toplevel):
         commands: list[Command],
         on_close: Optional[Callable[[], None]] = None,
     ) -> None:
-        super().__init__(master, bg=theme.c("surface"))
+        super().__init__(
+            master,
+            bg=theme.c("surface"),
+            highlightthickness=1,
+            highlightbackground=theme.c("border_strong"),
+        )
         self.theme = theme
         self.commands = list(commands)
         self._on_close = on_close
@@ -64,12 +79,9 @@ class CommandPalette(tk.Toplevel):
         self._rows: list[tk.Frame] = []
         self._index = 0
 
-        self.overrideredirect(True)
-        self.transient(master)
-
         self.query_var = tk.StringVar()
         self._build()
-        self._place_over(master)
+        self._place_in(master)
         self._apply("")
 
         self.bind("<Escape>", lambda _event: self.close())
@@ -78,8 +90,8 @@ class CommandPalette(tk.Toplevel):
         self.bind("<Up>", lambda _event: self._move(-1))
         self.bind("<FocusOut>", self._on_focus_out)
 
+        self.lift()
         self.entry.focus_force()
-        self.grab_set()
 
     # -- 构建 ----------------------------------------------------------
 
@@ -100,26 +112,32 @@ class CommandPalette(tk.Toplevel):
         )
         self.entry.pack(fill="x", padx=pad, pady=(pad, theme.px(10)))
         self.entry.bind("<KeyRelease>", lambda _event: self._apply(self.query_var.get()))
+        # Frame 收不到子控件的按键（Tk 只往 toplevel 冒泡），所以这几个键
+        # 必须直接绑在输入框上，否则回车和上下键都没反应。
+        for sequence, handler in (
+            ("<Escape>", lambda _event: self.close()),
+            ("<Return>", lambda _event: self._run_current()),
+            ("<Down>", lambda _event: self._move(1)),
+            ("<Up>", lambda _event: self._move(-1)),
+        ):
+            self.entry.bind(sequence, handler)
 
         tk.Frame(self, bg=theme.c("border"), height=1).pack(fill="x", padx=pad)
 
         self.list_area = ScrollArea(self, theme, "surface")
         self.list_area.pack(fill="both", expand=True, padx=pad, pady=(theme.px(6), pad))
 
-    def _place_over(self, master: tk.Misc) -> None:
+    def _place_in(self, master: tk.Misc) -> None:
+        """盖在内容区上方，水平居中。窗口太窄时跟着缩，不越界。"""
+
         theme = self.theme
-        width = theme.px(560)
-        height = theme.px(400)
         try:
-            root_x = master.winfo_rootx()
-            root_y = master.winfo_rooty()
-            root_w = master.winfo_width()
+            available = max(theme.px(320), int(master.winfo_width()) - theme.px(48))
         except tk.TclError:
-            root_x, root_y, root_w = 0, 0, width
-        x = max(0, root_x + (root_w - width) // 2)
-        y = root_y + theme.px(96)
-        self.geometry(f"{width}x{height}+{x}+{y}")
-        self.configure(highlightthickness=1, highlightbackground=theme.c("border_strong"))
+            available = theme.px(560)
+        width = min(theme.px(560), available)
+        height = min(theme.px(400), max(theme.px(220), int(master.winfo_height()) - theme.px(140)))
+        self.place(relx=0.5, y=theme.px(96), anchor="n", width=width, height=height)
 
     # -- 列表 ----------------------------------------------------------
 
@@ -239,7 +257,7 @@ class CommandPalette(tk.Toplevel):
             except Exception:
                 pass
         try:
-            self.grab_release()
+            self.place_forget()
         except tk.TclError:
             pass
         try:

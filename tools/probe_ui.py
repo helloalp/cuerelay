@@ -126,6 +126,7 @@ def main(argv: list[str]) -> int:
         filtered = len(palette._results)
         assert 0 < filtered < total, f"过滤没有生效：{filtered}/{total}"
         print(f"[通过] 命令面板：共 {total} 条，过滤「片段」后 {filtered} 条")
+        shot(root, out_dir / "palette.png")
         palette.close()
         pump(root, 4)
     except Exception as exc:  # noqa: BLE001
