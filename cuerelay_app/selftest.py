@@ -465,8 +465,8 @@ def test_row_meta() -> None:
     failed_with_time = meta({"status": "failed", "last_run": stamp, "enabled": False})
     assert failed_with_time and "失败" not in failed_with_time, failed_with_time
 
-    # 没有执行记录的失败任务留空，分组名和红点已经说明问题。
-    assert meta({"status": "failed", "last_run": None, "enabled": False}) == ""
+    # 没有执行记录的失败任务写「失败」：空着会让这一行看起来只填了一半。
+    assert meta({"status": "failed", "last_run": None, "enabled": False}) == "失败"
 
     # 等待中的任务照旧显示计划时间。
     waiting = meta({"status": "waiting", "enabled": True, "next_run": stamp, "schedule": "once"})

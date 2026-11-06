@@ -422,6 +422,37 @@ class ScrollArea(tk.Frame):
 # ---------------------------------------------------------------------------
 
 
+def _field_head(parent: tk.Misc, theme: Theme, bg_key: str, label: str, hint: str = "") -> None:
+    """字段上方那一行：左边标签，右边可选的一小段灰字。
+
+    提示写在标签同一行的右端，不单独占一行——一句说明独占一行，表单就被
+    撑长了，读起来还像正文。
+    """
+
+    if not label and not hint:
+        return
+    head = tk.Frame(parent, bg=theme.c(bg_key))
+    head.pack(fill="x", pady=(0, theme.px(6)))
+    if label:
+        tk.Label(
+            head,
+            text=label,
+            bg=theme.c(bg_key),
+            fg=theme.c("text_2"),
+            font=theme.font("small"),
+            anchor="w",
+        ).pack(side="left")
+    if hint:
+        tk.Label(
+            head,
+            text=hint,
+            bg=theme.c(bg_key),
+            fg=theme.c("text_3"),
+            font=theme.font("tiny"),
+            anchor="e",
+        ).pack(side="right")
+
+
 class Field(tk.Frame):
     def __init__(
         self,
@@ -433,20 +464,13 @@ class Field(tk.Frame):
         bg_key: str = "surface",
         show: Optional[str] = None,
         placeholder: str = "",
+        width: int = 0,
     ) -> None:
         super().__init__(parent, bg=theme.c(bg_key))
         self.theme = theme
         self.variable = variable
         self._focused = False
-        if label:
-            tk.Label(
-                self,
-                text=label,
-                bg=theme.c(bg_key),
-                fg=theme.c("text_2"),
-                font=theme.font("small"),
-                anchor="w",
-            ).pack(fill="x", pady=(0, theme.px(6)))
+        _field_head(self, theme, bg_key, label, hint)
 
         self.box = tk.Frame(
             self,
@@ -472,6 +496,10 @@ class Field(tk.Frame):
             font=theme.font("body"),
             show=show or "",
         )
+        if width:
+            # tk.Entry 默认按 20 字符要宽度，并排多个字段时 pack 不肯把它压窄，
+            # 最后那一列就被挤出卡片。
+            self.entry.configure(width=width)
         self.entry.pack(fill="x")
         self.entry.bind("<FocusIn>", self._on_focus_in)
         self.entry.bind("<FocusOut>", self._on_focus_out)
@@ -489,16 +517,6 @@ class Field(tk.Frame):
             self.placeholder_label.bind("<Button-1>", lambda _event: self.entry.focus_set())
             self.variable.trace_add("write", lambda *_: self._sync_placeholder())
             self._sync_placeholder()
-
-        if hint:
-            tk.Label(
-                self,
-                text=hint,
-                bg=theme.c(bg_key),
-                fg=theme.c("text_3"),
-                font=theme.font("tiny"),
-                anchor="w",
-            ).pack(fill="x", pady=(theme.px(5), 0))
 
     def _on_focus_in(self, _event=None) -> None:
         self._focused = True
@@ -534,15 +552,7 @@ class TextArea(tk.Frame):
     ) -> None:
         super().__init__(parent, bg=theme.c(bg_key))
         self.theme = theme
-        if label:
-            tk.Label(
-                self,
-                text=label,
-                bg=theme.c(bg_key),
-                fg=theme.c("text_2"),
-                font=theme.font("small"),
-                anchor="w",
-            ).pack(fill="x", pady=(0, theme.px(6)))
+        _field_head(self, theme, bg_key, label, hint)
 
         self.box = tk.Frame(
             self,
@@ -576,16 +586,6 @@ class TextArea(tk.Frame):
         self.text.pack(fill="both", expand=True)
         self.text.bind("<FocusIn>", lambda _e: self.box.configure(highlightbackground=theme.c("accent")))
         self.text.bind("<FocusOut>", lambda _e: self.box.configure(highlightbackground=theme.c("border")))
-
-        if hint:
-            tk.Label(
-                self,
-                text=hint,
-                bg=theme.c(bg_key),
-                fg=theme.c("text_3"),
-                font=theme.font("tiny"),
-                anchor="w",
-            ).pack(fill="x", pady=(theme.px(5), 0))
 
     def get(self) -> str:
         return self.text.get("1.0", "end-1c")

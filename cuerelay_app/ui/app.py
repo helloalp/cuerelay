@@ -426,6 +426,8 @@ class App:
                 widget.bind("<Button-1>", lambda _event, k=key: self.show_view(k))
             self.rail_items[key] = {"frame": item, "bar": bar, "label": label}
 
+        # 底部只留调度状态。版本号和「Ctrl+K 命令」都是装饰：版本号属于
+        # 设置页，快捷键在命令面板自己身上写一次就够了。
         bottom = tk.Frame(rail, bg=theme.c("bg"))
         bottom.pack(side="bottom", fill="x", padx=theme.px(19), pady=theme.px(16))
         tk.Label(
@@ -437,26 +439,6 @@ class App:
             anchor="w",
             justify="left",
         ).pack(fill="x")
-        tk.Label(
-            bottom,
-            text=f"v{config.APP_VERSION}",
-            bg=theme.c("bg"),
-            fg=theme.c("text_3"),
-            font=theme.font("tiny"),
-            anchor="w",
-        ).pack(fill="x", pady=(theme.px(4), 0))
-        # 命令面板是快捷键驱动的，不写出来没人会去猜。
-        hint = tk.Label(
-            bottom,
-            text="Ctrl+K 命令",
-            bg=theme.c("bg"),
-            fg=theme.c("text_3"),
-            font=theme.font("tiny"),
-            anchor="w",
-            cursor="hand2",
-        )
-        hint.pack(fill="x", pady=(theme.px(6), 0))
-        hint.bind("<Button-1>", lambda _event: self.open_palette())
 
     def _build_content(self, parent: tk.Frame) -> None:
         theme = self.theme
@@ -477,6 +459,48 @@ class App:
         self._build_apps_view(self.views["apps"])
         self._build_log_view(self.views["log"])
         self._build_settings_view(self.views["settings"])
+
+    def _page_header(
+        self,
+        parent: tk.Frame,
+        title: str,
+        meta: Any = "",
+        actions: tuple = (),
+        top_pad: int = 16,
+    ) -> tuple[tk.Frame, tk.Label]:
+        """每个页面顶部同一条横栏：左边标题和一句短信息，右边动作。
+
+        以前六个页面各写一套：任务页干脆没有标题，对话页有标题还带一句说明，
+        日志页只有标题。同一层级的页面长得不一样，用户每切一次都要重新认一遍。
+        """
+
+        theme = self.theme
+        head = tk.Frame(parent, bg=theme.c("bg"))
+        head.pack(fill="x", pady=(theme.px(top_pad), theme.px(12)))
+        tk.Label(
+            head,
+            text=title,
+            bg=theme.c("bg"),
+            fg=theme.c("text"),
+            font=theme.font("title"),
+            anchor="w",
+        ).pack(side="left")
+        meta_label = tk.Label(
+            head,
+            textvariable=meta if isinstance(meta, tk.StringVar) else None,
+            text="" if isinstance(meta, tk.StringVar) else str(meta),
+            bg=theme.c("bg"),
+            fg=theme.c("text_3"),
+            font=theme.font("small"),
+            anchor="w",
+        )
+        meta_label.pack(side="left", padx=(theme.px(10), 0))
+        # 从右往左排，最后传进来的那个按钮落在最右边——也就是主按钮。
+        for text, command, kind in reversed(actions):
+            Button(head, theme, text, command, kind=kind, size="sm").pack(
+                side="right", padx=(theme.px(6), 0)
+            )
+        return head, meta_label
 
     def _build_statusbar(self) -> None:
         theme = self.theme
@@ -500,24 +524,19 @@ class App:
 
     def _build_tasks_view(self, parent: tk.Frame) -> None:
         theme = self.theme
-        left = tk.Frame(parent, bg=theme.c("bg"), width=theme.px(286))
+        self._page_header(
+            parent,
+            "任务",
+            self.count_var,
+            (("整理", self.tidy_tasks, "ghost"), ("新建", self.new_task, "ghost")),
+        )
+
+        body = tk.Frame(parent, bg=theme.c("bg"))
+        body.pack(fill="both", expand=True)
+
+        left = tk.Frame(body, bg=theme.c("bg"), width=theme.px(286))
         left.pack(side="left", fill="y")
         left.pack_propagate(False)
-
-        head = tk.Frame(left, bg=theme.c("bg"))
-        head.pack(fill="x", pady=(theme.px(16), theme.px(10)))
-        self.list_count_label = tk.Label(
-            head,
-            textvariable=self.count_var,
-            bg=theme.c("bg"),
-            fg=theme.c("text_3"),
-            font=theme.font("small"),
-            anchor="w",
-        )
-        self.list_count_label.pack(side="left")
-        Button(head, theme, "新建", self.new_task, kind="ghost", size="sm").pack(side="right")
-        self.tidy_button = Button(head, theme, "整理", self.tidy_tasks, kind="ghost", size="sm")
-        self.tidy_button.pack(side="right", padx=(0, theme.px(6)))
 
         search = Field(left, theme, "", self.filter_var, bg_key="bg", placeholder="搜索名称或内容")
         search.pack(fill="x", pady=(0, theme.px(10)))
@@ -529,7 +548,7 @@ class App:
         self.list_scroll.pack(fill="both", expand=True)
         self.list_body = self.list_scroll.body
 
-        right = tk.Frame(parent, bg=theme.c("bg"))
+        right = tk.Frame(body, bg=theme.c("bg"))
         right.pack(side="left", fill="both", expand=True, padx=(theme.px(20), 0))
         right.grid_rowconfigure(0, weight=1)
         right.grid_columnconfigure(0, weight=1)
@@ -561,23 +580,52 @@ class App:
     # 片段视图
     # ------------------------------------------------------------------
 
-    def _build_snippets_view(self, parent: tk.Frame) -> None:
-        theme = self.theme
-        left = tk.Frame(parent, bg=theme.c("bg"), width=theme.px(286))
-        left.pack(side="left", fill="y")
-        left.pack_propagate(False)
+    def _empty_state(
+        self,
+        parent: tk.Frame,
+        title: str,
+        action_text: str = "",
+        action: Optional[Callable[[], None]] = None,
+        bg_key: str = "bg",
+    ) -> None:
+        """空列表里那块东西：一句短话，最多一个按钮，垂直居中。
 
-        head = tk.Frame(left, bg=theme.c("bg"))
-        head.pack(fill="x", pady=(theme.px(16), theme.px(10)))
+        以前是一句"点右上角「新建」"贴在左上角——一大片空白里飘着一行小字，
+        看起来像界面没加载完。
+        """
+
+        theme = self.theme
+        holder = tk.Frame(parent, bg=theme.c(bg_key))
+        holder.pack(fill="both", expand=True, pady=theme.px(48))
         tk.Label(
-            head,
-            textvariable=self.snippet_count_var,
-            bg=theme.c("bg"),
+            holder,
+            text=title,
+            bg=theme.c(bg_key),
             fg=theme.c("text_3"),
             font=theme.font("small"),
-            anchor="w",
-        ).pack(side="left")
-        Button(head, theme, "新建", self.new_snippet, kind="ghost", size="sm").pack(side="right")
+            anchor="center",
+            justify="center",
+        ).pack(fill="x")
+        if action_text and action is not None:
+            Button(holder, theme, action_text, action, kind="ghost", size="sm").pack(
+                pady=(theme.px(12), 0)
+            )
+
+    def _build_snippets_view(self, parent: tk.Frame) -> None:
+        theme = self.theme
+        self._page_header(
+            parent,
+            "片段",
+            self.snippet_count_var,
+            (("新建", self.new_snippet, "ghost"),),
+        )
+
+        split = tk.Frame(parent, bg=theme.c("bg"))
+        split.pack(fill="both", expand=True)
+
+        left = tk.Frame(split, bg=theme.c("bg"), width=theme.px(286))
+        left.pack(side="left", fill="y")
+        left.pack_propagate(False)
 
         search = Field(left, theme, "", self.snippet_filter_var, bg_key="bg", placeholder="搜索片段")
         search.pack(fill="x", pady=(0, theme.px(10)))
@@ -589,7 +637,7 @@ class App:
         self.snippet_scroll.pack(fill="both", expand=True)
         self.snippet_list_body = self.snippet_scroll.body
 
-        right = tk.Frame(parent, bg=theme.c("bg"))
+        right = tk.Frame(split, bg=theme.c("bg"))
         right.pack(side="left", fill="both", expand=True, padx=(theme.px(20), 0))
         right.grid_rowconfigure(0, weight=1)
         right.grid_columnconfigure(0, weight=1)
@@ -599,18 +647,19 @@ class App:
         pad = theme.px(20)
         outer, body = card(right, theme, "surface")
         outer.grid(row=0, column=0, sticky="nsew")
-        self.snippet_name_field = Field(body, theme, "名称", self.snippet_name_var)
-        self.snippet_name_field.pack(fill="x", padx=pad, pady=(pad, 0))
-        self.snippet_area = TextArea(body, theme, "内容", height=8)
-        self.snippet_area.pack(fill="both", expand=True, padx=pad, pady=(theme.px(14), theme.px(6)))
-        tk.Label(
+        self.snippet_title = tk.Label(
             body,
-            text=f"变量：{templates.HELP}",
+            text="新建片段",
             bg=theme.c("surface"),
-            fg=theme.c("text_3"),
-            font=theme.font("tiny"),
+            fg=theme.c("text"),
+            font=theme.font("title"),
             anchor="w",
-        ).pack(fill="x", padx=pad, pady=(0, pad))
+        )
+        self.snippet_title.pack(fill="x", padx=pad, pady=(pad, theme.px(16)))
+        self.snippet_name_field = Field(body, theme, "名称", self.snippet_name_var)
+        self.snippet_name_field.pack(fill="x", padx=pad)
+        self.snippet_area = TextArea(body, theme, "内容", height=8, hint=templates.HELP)
+        self.snippet_area.pack(fill="both", expand=True, padx=pad, pady=(theme.px(14), pad))
 
         actions = tk.Frame(right, bg=theme.c("bg"))
         actions.grid(row=1, column=0, sticky="ew", pady=(theme.px(12), 0))
@@ -624,15 +673,9 @@ class App:
         Button(actions, theme, "保存", self.save_snippet, kind="ghost").pack(
             side="right", padx=(0, theme.px(8))
         )
-        self.snippet_state = tk.Label(
-            actions,
-            text="",
-            bg=theme.c("bg"),
-            fg=theme.c("text_3"),
-            font=theme.font("tiny"),
-            anchor="w",
-        )
-        self.snippet_state.pack(side="left", padx=(theme.px(12), 0))
+        # 片段底栏只放动作。以前这里挂一个状态标签，"已新建"会一直停在
+        # 删除旁边，看起来像按钮的一部分。
+        self.snippet_state = None
 
     def refresh_snippets(self, force: bool = False) -> None:
         if not hasattr(self, "snippet_list_body"):
@@ -661,14 +704,9 @@ class App:
         self._snippet_rows.clear()
 
         if not items:
-            tk.Label(
-                self.snippet_list_body,
-                text="没有匹配的片段" if keyword else "还没有片段，点右上角「新建」",
-                bg=self.theme.c("bg"),
-                fg=self.theme.c("text_3"),
-                font=self.theme.font("small"),
-                anchor="w",
-            ).pack(fill="x", padx=self.theme.px(4), pady=self.theme.px(14))
+            self._empty_state(
+                self.snippet_list_body, "没有匹配的片段" if keyword else "还没有片段"
+            )
         for item in items:
             self._render_snippet_row(item)
 
@@ -745,10 +783,14 @@ class App:
         return messagebox.askyesno("放弃修改", "当前片段有未保存的修改，确定放弃吗？", parent=self.root)
 
     def _set_snippet_state(self, text: str, tone: str = "text_3") -> None:
-        try:
-            self.snippet_state.configure(text=_clip(text, 40), fg=self.theme.c(tone))
-        except tk.TclError:
-            pass
+        """片段页的提示统一走状态栏。
+
+        底栏那一格已经撤掉了：状态文字挂在动作按钮旁边会一直留着，看起来
+        像按钮的一部分，也让底栏高度随内容变化。
+        """
+
+        if text:
+            self._set_status(_clip(text, 40))
 
     def new_snippet(self) -> None:
         if not self._confirm_discard_snippet():
@@ -848,37 +890,15 @@ class App:
 
     def _build_chats_view(self, parent: tk.Frame) -> None:
         theme = self.theme
-        head = tk.Frame(parent, bg=theme.c("bg"))
-        head.pack(fill="x", pady=(theme.px(16), theme.px(6)))
-        tk.Label(
-            head,
-            text="对话",
-            bg=theme.c("bg"),
-            fg=theme.c("text"),
-            font=theme.font("section"),
-        ).pack(side="left")
-        tk.Label(
-            head,
-            textvariable=self.chat_status_var,
-            bg=theme.c("bg"),
-            fg=theme.c("text_3"),
-            font=theme.font("small"),
-        ).pack(side="left", padx=(theme.px(12), 0))
-        Button(head, theme, "扫描对话", self.scan_conversations, kind="primary", size="sm").pack(side="right")
-        Button(head, theme, "新建对话", self.new_conversation, kind="ghost", size="sm").pack(
-            side="right", padx=(0, theme.px(8))
-        )
-
-        tk.Label(
+        self._page_header(
             parent,
-            text="读 Codex 侧边栏里当前能看到的标题；点一条切过去，切换后核对标题栏。",
-            bg=theme.c("bg"),
-            fg=theme.c("text_3"),
-            font=theme.font("small"),
-            anchor="w",
-            justify="left",
-            wraplength=theme.px(720),
-        ).pack(fill="x", pady=(0, theme.px(12)))
+            "对话",
+            self.chat_status_var,
+            (
+                ("新建对话", self.new_conversation, "ghost"),
+                ("扫描对话", self.scan_conversations, "primary"),
+            ),
+        )
 
         outer, inner = card(parent, theme, "surface")
         outer.pack(fill="both", expand=True)
@@ -907,14 +927,7 @@ class App:
             return
 
         if not self._conversations:
-            tk.Label(
-                self.chat_list_body,
-                text="还没有扫描。点右上角「扫描对话」读一次侧边栏。",
-                bg=theme.c("surface"),
-                fg=theme.c("text_3"),
-                font=theme.font("small"),
-                anchor="w",
-            ).pack(fill="x", padx=theme.px(12), pady=theme.px(14))
+            self._empty_state(self.chat_list_body, "还没有对话", bg_key="surface")
             return
 
         section = ""
@@ -1032,6 +1045,8 @@ class App:
 
     def _build_apps_view(self, parent: tk.Frame) -> None:
         theme = self.theme
+        self._page_header(parent, "应用")
+
         scroll = ScrollArea(parent, theme, "bg")
         scroll.pack(fill="both", expand=True)
         body = scroll.body
@@ -1478,77 +1493,78 @@ class App:
 
         # 提示词不再吃掉全部剩余高度：把计划、发送方式、目标对话留在首屏可见，
         # 用户一眼就能看完整条流程（写什么 -> 发到哪 -> 什么时候发 -> 怎么发）。
-        self.prompt_area = TextArea(self.prompt_group, theme, "提示词", height=6)
+        self.prompt_area = TextArea(
+            self.prompt_group, theme, "提示词", height=5, hint=templates.HELP
+        )
         self.prompt_area.pack(fill="x", padx=pad, pady=(theme.px(14), 0))
-        tk.Label(
-            self.prompt_group,
-            text=f"变量：{templates.HELP}",
-            bg=theme.c("surface"),
-            fg=theme.c("text_3"),
-            font=theme.font("tiny"),
-            anchor="w",
-        ).pack(fill="x", padx=pad, pady=(theme.px(6), 0))
 
-        schedule_head = tk.Label(
-            body,
+        # 「计划」和它的选项放同一行：单独占一行的组标题只是在吃高度。
+        plan_head = tk.Frame(body, bg=theme.c("surface"))
+        plan_head.pack(fill="x", padx=pad, pady=(theme.px(14), 0))
+        tk.Label(
+            plan_head,
             text="计划",
             bg=theme.c("surface"),
             fg=theme.c("text_2"),
             font=theme.font("small"),
             anchor="w",
-        )
-        schedule_head.pack(fill="x", padx=pad, pady=(theme.px(16), theme.px(6)))
+        ).pack(side="left", padx=(0, theme.px(12)))
         self.schedule_segment = Segmented(
-            body, theme, SCHEDULE_OPTIONS, self.schedule_var, self._on_schedule_change
+            plan_head, theme, SCHEDULE_OPTIONS, self.schedule_var, self._on_schedule_change
         )
-        self.schedule_segment.pack(fill="x", padx=pad)
+        self.schedule_segment.pack(side="left", fill="x", expand=True)
 
         self.schedule_holder = tk.Frame(body, bg=theme.c("surface"))
-        self.schedule_holder.pack(fill="x", padx=pad, pady=(theme.px(10), 0))
+        self.schedule_holder.pack(fill="x", padx=pad, pady=(theme.px(12), 0))
 
-        self.time_row = tk.Frame(self.schedule_holder, bg=theme.c("surface"))
-        date_field = Field(self.time_row, theme, "日期", self.date_var)
-        date_field.pack(side="left", fill="x", expand=True)
-        time_field = Field(self.time_row, theme, "时间", self.time_var)
-        time_field.pack(side="left", fill="x", expand=True, padx=(theme.px(12), 0))
-
-        self.interval_row = tk.Frame(self.schedule_holder, bg=theme.c("surface"))
-        Field(self.interval_row, theme, "间隔分钟", self.interval_var).pack(fill="x")
-
-        # 重试属于"计划"的一部分：这次没成，要不要再试一次。
-        self.retry_row = tk.Frame(self.schedule_holder, bg=theme.c("surface"))
-        Field(
-            self.retry_row,
-            theme,
-            "失败重试次数",
-            self.retry_var,
-            hint="0 表示不重试；已提交内容后不会重试",
-        ).pack(side="left", fill="x", expand=True)
-        Field(self.retry_row, theme, "重试间隔（秒）", self.retry_delay_var).pack(
-            side="left", fill="x", expand=True, padx=(theme.px(12), 0)
+        # 时间、间隔、重试都在同一排：它们是同一件事的四个参数，拆成两排只会
+        # 把表单撑出可视区，最后一行永远卡在底栏边缘。
+        self.plan_row = tk.Frame(self.schedule_holder, bg=theme.c("surface"))
+        self.plan_row.pack(fill="x")
+        self.date_field = Field(self.plan_row, theme, "日期", self.date_var, width=4)
+        self.date_field.pack(side="left", fill="x", expand=True)
+        self.time_field = Field(self.plan_row, theme, "时间", self.time_var, width=4)
+        self.time_field.pack(side="left", fill="x", expand=True, padx=(theme.px(12), 0))
+        self.interval_field = Field(self.plan_row, theme, "间隔分钟", self.interval_var, width=4)
+        self.retry_field = Field(
+            self.plan_row, theme, "重试次数", self.retry_var, hint="0 = 不重试", width=4
         )
+        self.retry_delay_field = Field(
+            self.plan_row, theme, "重试间隔", self.retry_delay_var, hint="秒", width=4
+        )
+        for widget in (self.retry_field, self.retry_delay_field):
+            widget.pack(side="left", fill="x", expand=True, padx=(theme.px(12), 0))
 
         self.send_group = tk.Frame(body, bg=theme.c("surface"))
         self.send_group.pack(fill="x", after=self.schedule_holder)
 
+        send_row = tk.Frame(self.send_group, bg=theme.c("surface"))
+        send_row.pack(fill="x", padx=pad, pady=(theme.px(14), 0))
+
+        send_left = tk.Frame(send_row, bg=theme.c("surface"))
+        send_left.pack(side="left", fill="x", expand=True)
         tk.Label(
-            self.send_group,
+            send_left,
             text="发送方式",
             bg=theme.c("surface"),
             fg=theme.c("text_2"),
             font=theme.font("small"),
             anchor="w",
-        ).pack(fill="x", padx=pad, pady=(theme.px(16), theme.px(6)))
-        Segmented(self.send_group, theme, ACTION_OPTIONS, self.action_var).pack(fill="x", padx=pad)
+        ).pack(fill="x", pady=(0, theme.px(6)))
+        Segmented(send_left, theme, ACTION_OPTIONS, self.action_var).pack(fill="x")
 
+        # 目标对话和发送方式并排：一个说怎么发，一个说发到哪，本来就是一组。
         self.conversation_field = Field(
-            self.send_group,
+            send_row,
             theme,
             "目标对话",
             self.conversation_var,
             placeholder="留空则发送到当前对话",
         )
-        self.conversation_field.pack(fill="x", padx=pad, pady=(theme.px(14), 0))
+        self.conversation_field.pack(side="left", fill="x", expand=True, padx=(theme.px(12), 0))
+
+        # 卡片底部留白：最后一行紧贴边框会让人以为下面还有内容被裁掉了。
+        tk.Frame(body, bg=theme.c("surface"), height=pad).pack(fill="x")
 
         self._on_schedule_change(self.schedule_var.get())
         self._on_kind_change(self.kind_var.get())
@@ -1575,15 +1591,22 @@ class App:
             pass
 
     def _on_schedule_change(self, value: str) -> None:
+        """单次/每天显示日期时间，间隔显示分钟数；重试那两格两种模式都在。"""
+
         try:
-            self.retry_row.pack_forget()
             if value == "interval":
-                self.time_row.pack_forget()
-                self.interval_row.pack(fill="x")
+                self.date_field.pack_forget()
+                self.time_field.pack_forget()
+                self.interval_field.pack(
+                    side="left", fill="x", expand=True, before=self.retry_field
+                )
             else:
-                self.interval_row.pack_forget()
-                self.time_row.pack(fill="x")
-            self.retry_row.pack(fill="x", pady=(self.theme.px(12), 0))
+                self.interval_field.pack_forget()
+                self.date_field.pack(side="left", fill="x", expand=True, before=self.retry_field)
+                self.time_field.pack(
+                    side="left", fill="x", expand=True, padx=(self.theme.px(12), 0),
+                    before=self.retry_field,
+                )
         except (AttributeError, tk.TclError):
             pass
 
@@ -1593,34 +1616,27 @@ class App:
 
     def _build_log_view(self, parent: tk.Frame) -> None:
         theme = self.theme
-        head = tk.Frame(parent, bg=theme.c("bg"))
-        head.pack(fill="x", pady=(theme.px(16), theme.px(12)))
-        tk.Label(
-            head,
-            text="日志",
-            bg=theme.c("bg"),
-            fg=theme.c("text"),
-            font=theme.font("section"),
-        ).pack(side="left")
-        self.log_file_button = Button(head, theme, "打开日志文件", self._open_log_file, kind="ghost", size="sm")
-        self.log_file_button.pack(side="right")
-        self.log_clear_button = Button(head, theme, "清空", self._clear_current, kind="ghost", size="sm")
-        self.log_clear_button.pack(side="right", padx=(0, theme.px(8)))
+        self._page_header(
+            parent,
+            "日志",
+            "",
+            (("清空", self._clear_current, "ghost"), ("打开日志文件", self._open_log_file, "ghost")),
+        )
 
+        # 模式切换和级别筛选放同一行：它们都是"看哪一段"，分成两行只是把
+        # 内容区又压低一截。
         mode_row = tk.Frame(parent, bg=theme.c("bg"))
         mode_row.pack(fill="x", pady=(0, theme.px(12)))
         Segmented(mode_row, theme, LOG_MODE_OPTIONS, self.log_mode_var, self._on_log_mode).pack(side="left")
+        self.log_filter_seg = Segmented(
+            mode_row, theme, FILTER_OPTIONS, self.log_filter_var, self._on_log_filter
+        )
+        self.log_filter_seg.pack(side="right")
 
         # 两个面板交替显示。日志是"这一次跑了什么"，记录是"每条任务最后怎么样"，
         # 内容不同但都是"回头看"，放在同一个视图里用一段切换最省位置。
         self.log_panel = tk.Frame(parent, bg=theme.c("bg"))
         self.history_panel = tk.Frame(parent, bg=theme.c("bg"))
-
-        filters = tk.Frame(self.log_panel, bg=theme.c("bg"))
-        filters.pack(fill="x", pady=(0, theme.px(12)))
-        Segmented(filters, theme, FILTER_OPTIONS, self.log_filter_var, self._on_log_filter).pack(
-            side="left"
-        )
 
         outer, inner = card(self.log_panel, theme, "surface")
         outer.pack(fill="both", expand=True)
@@ -1662,6 +1678,14 @@ class App:
         self._log_mode = value
         if not hasattr(self, "log_panel"):
             return
+        # 级别筛选只对运行日志有意义，切到执行记录就收起来，别留一个按了没用的控件。
+        try:
+            if value == "history":
+                self.log_filter_seg.pack_forget()
+            elif not self.log_filter_seg.winfo_manager():
+                self.log_filter_seg.pack(side="right")
+        except tk.TclError:
+            pass
         if value == "history":
             self.log_panel.pack_forget()
             self.history_panel.pack(fill="both", expand=True)
@@ -1798,15 +1822,7 @@ class App:
 
     def _build_settings_view(self, parent: tk.Frame) -> None:
         theme = self.theme
-        head = tk.Frame(parent, bg=theme.c("bg"))
-        head.pack(fill="x", pady=(theme.px(16), theme.px(12)))
-        tk.Label(
-            head,
-            text="设置",
-            bg=theme.c("bg"),
-            fg=theme.c("text"),
-            font=theme.font("section"),
-        ).pack(side="left")
+        self._page_header(parent, "设置")
 
         scroll = ScrollArea(parent, theme, "bg")
         scroll.pack(fill="both", expand=True)
@@ -1822,7 +1838,7 @@ class App:
             theme,
             "窗口关键词",
             self.keywords_var,
-            hint="用逗号分隔；标题或进程名包含任一关键词即视为目标",
+            hint="逗号分隔，匹配标题或进程名",
         )
         keywords_field.pack(fill="x")
         keywords_field.entry.bind("<FocusOut>", lambda _event: self._save_keywords())
@@ -1857,7 +1873,7 @@ class App:
             theme,
             "v2rayN 路径",
             self.v2ray_path_var,
-            hint="留空则自动探测；以管理员身份运行的 v2rayN 需要在这里手填一次",
+            hint="留空自动探测；管理员权限的 v2rayN 需手填",
         )
         v2ray_field.pack(fill="x")
         v2ray_field.entry.bind("<FocusOut>", lambda _event: self._save_v2ray_path())
@@ -1883,14 +1899,6 @@ class App:
             command=self._save_autostart,
             bg_key="surface",
         ).pack(fill="x", pady=(theme.px(10), 0))
-        tk.Label(
-            inner,
-            text="定时任务只有在 CueRelay 运行时才会执行。",
-            bg=theme.c("surface"),
-            fg=theme.c("text_3"),
-            font=theme.font("tiny"),
-            anchor="w",
-        ).pack(fill="x", pady=(theme.px(5), 0))
         Switch(
             inner,
             theme,
@@ -1899,14 +1907,6 @@ class App:
             command=self._save_hotkey,
             bg_key="surface",
         ).pack(fill="x", pady=(theme.px(14), 0))
-        tk.Label(
-            inner,
-            text=f"在别的程序里按 {HOTKEY_LABEL}，把 CueRelay 叫到前台并打开命令面板。",
-            bg=theme.c("surface"),
-            fg=theme.c("text_3"),
-            font=theme.font("tiny"),
-            anchor="w",
-        ).pack(fill="x", pady=(theme.px(5), 0))
 
         # 托盘与关闭
         card_body = self._settings_card(body, "托盘与关闭")
@@ -2055,7 +2055,7 @@ class App:
         )
         tk.Label(
             inner,
-            text="界面响应慢时可以调大；识别与校验本身会自适应等待，不受此值限制。",
+            text="界面慢时调大",
             bg=theme.c("surface"),
             fg=theme.c("text_3"),
             font=theme.font("tiny"),
@@ -2066,7 +2066,7 @@ class App:
             theme,
             "补执行窗口（分钟）",
             self.catch_up_var,
-            hint="错过执行时间超过该值就跳过本次，避免旧任务突然运行",
+            hint="超时就跳过本次",
         ).pack(fill="x")
         Button(inner, theme, "保存执行设置", self._save_execution, kind="ghost", size="sm").pack(
             anchor="w", pady=(theme.px(12), 0)
@@ -2117,6 +2117,15 @@ class App:
         Button(inner, theme, "打开所在文件夹", self._open_data_dir, kind="ghost", size="sm").pack(
             anchor="w", pady=(theme.px(10), 0)
         )
+
+        tk.Label(
+            body,
+            text=f"CueRelay {config.APP_VERSION}",
+            bg=theme.c("bg"),
+            fg=theme.c("text_3"),
+            font=theme.font("tiny"),
+            anchor="w",
+        ).pack(fill="x", pady=(theme.px(16), theme.px(8)))
 
     # ------------------------------------------------------------------
     # 视图切换
@@ -2204,15 +2213,7 @@ class App:
         self._row_widgets.clear()
 
         if not tasks:
-            message = "没有匹配的任务" if keyword else "还没有任务，点右上角「新建」"
-            tk.Label(
-                self.list_body,
-                text=message,
-                bg=self.theme.c("bg"),
-                fg=self.theme.c("text_3"),
-                font=self.theme.font("small"),
-                anchor="w",
-            ).pack(fill="x", padx=self.theme.px(4), pady=self.theme.px(14))
+            self._empty_state(self.list_body, "没有匹配的任务" if keyword else "还没有任务")
         for key, items in grouped:
             expanded = self._group_open_state(key)
             # 选中的任务不能藏在收起的分组里，否则看起来像被删掉了。
@@ -2334,8 +2335,9 @@ class App:
 
         if task_state(task) == "failed":
             stamp = parse_datetime(task.get("last_run"))
-            # 没有执行记录就留空：分组名和红点已经说明失败了，不必再写一遍。
-            return config.format_short_datetime(stamp, "") if stamp is not None else ""
+            # 失败行右边写的是"什么时候失败的"。没有记录就写「失败」——空着
+            # 会让这一行看起来只填了一半。
+            return config.format_short_datetime(stamp) if stamp is not None else "失败"
         return next_run_text(task)
 
     def _render_row(self, task: dict[str, Any]) -> None:
@@ -2487,26 +2489,33 @@ class App:
         self._baseline = self._editor_signature()
         self.editor_title.configure(text="编辑任务")
         self.delete_button.set_enabled(True)
-        error = str(task.get("last_error") or "")
-        if error:
-            # 完整报错在日志里；这里只留一句，太长会顶到右边的按钮上。
-            self.editor_state.configure(text=_clip(error, 52), fg=self.theme.c("danger"))
-        else:
-            self.editor_state.configure(
-                text=_clip(self._run_summary(task), 52),
-                fg=self.theme.c("text_3"),
-            )
+        # 底栏这一格永远只说一件事：这条任务上一次跑成什么样。失败也写在
+        # 这里，只是换个颜色——单独弹一块红字会一直留在那儿，看起来像刚出错。
+        summary, failed = self._run_summary(task)
+        self.editor_state.configure(
+            text=_clip(summary, 52),
+            fg=self.theme.c("danger") if failed else self.theme.c("text_3"),
+        )
         self._set_status(f"已载入：{self.draft['name'] or '未命名任务'}")
 
     @staticmethod
-    def _run_summary(task: dict[str, Any]) -> str:
-        """编辑区底部那一行：上次什么时候跑的、跑了多久、一共几次。"""
+    def _run_summary(task: dict[str, Any]) -> tuple[str, bool]:
+        """编辑区底部那一格：上次跑成什么样。返回 (文案, 是否失败)。
+
+        失败和成功用同一个位置、同一个长度，只换颜色和句首两个字——底栏
+        不该因为出错就换一副样子。
+        """
 
         stamp = parse_datetime(task.get("last_run"))
+        failed = bool(str(task.get("last_error") or ""))
         if stamp is None:
-            return "还没有执行过"
+            return ("上次执行失败" if failed else "还没有执行过"), failed
         duration = int(task.get("last_duration_ms") or 0) / 1000.0
-        return f"上次 {config.format_short_datetime(stamp)} · {duration:.1f}s · 共 {int(task.get('run_count') or 0)} 次"
+        text = (
+            f"上次 {config.format_short_datetime(stamp)} · {duration:.1f}s"
+            f" · 共 {int(task.get('run_count') or 0)} 次"
+        )
+        return (f"失败 · {text}" if failed else text), failed
 
     def _sync_editor_from_draft(self) -> None:
         self.name_var.set(self.draft["name"])

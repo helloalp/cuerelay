@@ -10,6 +10,7 @@ CueRelay 同时存在。
 
 from __future__ import annotations
 
+import faulthandler
 import shutil
 import sys
 import tempfile
@@ -45,6 +46,9 @@ def shot(root: tk.Tk, path: Path) -> None:
 
 
 def main(argv: list[str]) -> int:
+    # 这个探针偶尔会卡住不动，一直没查出来卡在哪一步。挂一个看门狗：超过 25 秒
+    # 没动静就把所有线程的调用栈打出来，下次卡住就知道是哪个调用在等输入。
+    faulthandler.dump_traceback_later(25, repeat=True)
     winapi.set_dpi_awareness()
     out_dir = Path(argv[0]) if argv else Path(tempfile.gettempdir()) / "cuerelay-ui"
     out_dir.mkdir(parents=True, exist_ok=True)
