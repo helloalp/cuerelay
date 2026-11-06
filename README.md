@@ -116,6 +116,7 @@ tools/make_icon.py         生成 assets/cuerelay.ico（改动图标后重新运
 tools/probe_switch.py      对着真实窗口验证「切换对话」，不发送
 tools/probe_send.py        对着真实窗口跑一整条执行流程
 tools/probe_groups.py      验证任务列表的分组折叠（在数据副本上跑）
+tools/probe_boxes.py       把识别到的输入框与发送点画在目标窗口截图上，肉眼核对
 tools/shot_app.py          把主窗口截成 PNG，用来检查首屏排版
 ```
 
