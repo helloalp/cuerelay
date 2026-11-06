@@ -188,7 +188,7 @@ class Locator:
                 return rect
         return None
 
-    def composer_is_empty(self, frame: Frame) -> Optional[bool]:
+    def composer_is_empty(self, frame: Frame, composer: Optional[Rect] = None) -> Optional[bool]:
         """输入框是不是空的（占位符文字回来了）。
 
         发送成功的判据。像素"变了"靠不住：点错按钮、弹出提示、开始录音
@@ -198,14 +198,26 @@ class Locator:
 
         if not ocr.available():
             return None
-        region = Rect(0, int(frame.height * 0.55), frame.width, frame.height)
+        if composer is not None and composer.width >= 120 and composer.height >= 30:
+            # 有输入框矩形就只看它：范围越小，越不会被界面别处的文字干扰。
+            region = Rect(composer.left, composer.top, composer.right, composer.bottom)
+        else:
+            region = Rect(0, int(frame.height * 0.55), frame.width, frame.height)
         if region.height < 60:
             return None
         crop = frame.bitmap.crop(region.left, region.top, region.right, region.bottom)
         lines = ocr.recognize(crop)
         if not lines:
             return None
+        texts = [ocr.normalize(line.text) for line in lines]
         for placeholder in COMPOSER_PLACEHOLDERS:
+            target = ocr.normalize(placeholder)
+            if len(placeholder) < 10:
+                # 短词（Message 之类）只认完整出现，不做模糊匹配：它在界面别处
+                # 太容易撞上，误判成"输入框是空的"会把本来能发的消息拦下来。
+                if any(target in text for text in texts):
+                    return True
+                continue
             if ocr.find_text(lines, placeholder, 0.62) is not None:
                 return True
         return False
@@ -238,6 +250,29 @@ class Locator:
         if fallback is not None:
             return fallback, "锚点"
         return None, "失败"
+
+    def send_slot(self, frame: Frame, composer: Optional[Rect]) -> tuple[Optional[Rect], str]:
+        """发送位置上的那个方块，以及它此刻是发送箭头还是暂停键。
+
+        这个位置会随状态换图标：输入框有内容时是发送箭头，正在生成回答时是暂停。
+        外壳一样，必须分辨——点错了会打断正在生成的回答。
+        """
+
+        if composer is None or not self.recognition_enabled:
+            return None, vision.SEND_SLOT_UNKNOWN
+        try:
+            slot = vision.detect_send_slot(frame.bitmap, composer)
+        except Exception as exc:
+            self.log("warning", f"发送按钮识别异常：{exc}")
+            return None, vision.SEND_SLOT_UNKNOWN
+        if slot is None:
+            return None, vision.SEND_SLOT_UNKNOWN
+        try:
+            kind = vision.send_slot_kind(frame.bitmap, slot)
+        except Exception as exc:
+            self.log("warning", f"发送图标识别异常：{exc}")
+            kind = vision.SEND_SLOT_UNKNOWN
+        return slot, kind
 
     def send_point(self, frame: Frame, composer: Optional[Rect]) -> Optional[tuple[int, int]]:
         if composer is None:

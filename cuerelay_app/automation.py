@@ -227,7 +227,7 @@ class Runner:
             time.sleep(0.45)
         return False
 
-    def _composer_empty(self, hwnd: int) -> Optional[bool]:
+    def _composer_empty(self, hwnd: int, composer: Optional[Rect] = None) -> Optional[bool]:
         """输入框是否已经回到空状态。识别不了时返回 None。"""
 
         try:
@@ -235,9 +235,36 @@ class Runner:
         except AutomationError:
             return None
         try:
-            return self._locator().composer_is_empty(frame)
+            return self._locator().composer_is_empty(frame, composer)
         except Exception:
             return None
+
+    def _wait_send_ready(
+        self,
+        hwnd: int,
+        composer: Rect,
+        timeout: float = 20.0,
+    ) -> tuple[locator.Frame, Rect, Optional[Rect], str]:
+        """等目标应用生成完回答：发送位置从暂停键变回发送箭头。
+
+        返回刷新后的画面、输入框、发送方块和它此刻的身份。等不到就把身份
+        留在 pause，让调用方明确放弃这次发送，而不是去点那个暂停键。
+        """
+
+        deadline = time.time() + max(2.0, timeout)
+        frame = self._frame(hwnd)
+        slot, kind = self._locator().send_slot(frame, composer)
+        while kind == vision.SEND_SLOT_PAUSE and time.time() < deadline:
+            time.sleep(0.8)
+            try:
+                frame = self._frame(hwnd)
+            except AutomationError:
+                break
+            grown, _ = self._locator().composer(frame)
+            if grown is not None:
+                composer = grown
+            slot, kind = self._locator().send_slot(frame, composer)
+        return frame, composer, slot, kind
 
     def _locate_row(
         self,
@@ -408,9 +435,12 @@ class Runner:
             steps += 1
         step_index = 0
 
-        def advance(text: str, tone: str = "accent") -> None:
+        def advance(text: str, tone: str = "accent", bump: bool = True) -> None:
+            """推进一格进度。bump=False 只改文案，不占新的格数。"""
+
             nonlocal step_index
-            step_index += 1
+            if bump:
+                step_index += 1
             self._overlay_progress(step_index, steps, text, tone)
 
         old_clipboard = winapi.get_clipboard_text()
@@ -469,6 +499,34 @@ class Runner:
             grown, _ = self._locator().composer(fresh)
             if grown is None:
                 grown = composer
+
+            # 粘贴完必须确认输入框里真的有内容。空的时候同一个位置画的是麦克风，
+            # 点下去会开始录音而不是发送——这正是之前"看起来发了其实没发"的原因。
+            if self._composer_empty(hwnd, grown) is True:
+                raise AutomationError("提示词没有进入输入框，已停止发送。")
+
+            send_point = None
+            slot_kind = vision.SEND_SLOT_UNKNOWN
+            if action == "click":
+                slot, slot_kind = self._locator().send_slot(fresh, grown)
+                if slot_kind == vision.SEND_SLOT_PAUSE:
+                    # 这个位置此刻是暂停键，说明目标应用还在生成回答。等它画回
+                    # 发送箭头再点，否则这一下会把正在生成的回答掐掉。
+                    advance("等待生成结束", "warning", bump=False)
+                    self.log("info", "目标应用正在生成回答，等它结束再发送。")
+                    fresh, grown, slot, slot_kind = self._wait_send_ready(hwnd, grown)
+                if slot_kind == vision.SEND_SLOT_PAUSE:
+                    raise AutomationError(
+                        "目标应用一直在生成回答，发送位置此刻是暂停键，已跳过这次发送。"
+                    )
+                if slot is not None:
+                    send_point = slot.center
+                elif not self._locator().recognition_enabled:
+                    # 关掉了识别，只能退回校准锚点。
+                    send_point = self._locator().send_point(fresh, grown)
+                else:
+                    self.log("warning", "没认出发送按钮，改用 Enter 发送。")
+
             self._overlay_show(fresh)
             self._overlay_box(
                 fresh.to_screen(grown),
@@ -477,9 +535,6 @@ class Runner:
             )
             send_region = fresh.to_screen(grown)
 
-            send_point = None
-            if action == "click":
-                send_point = self._locator().send_point(fresh, grown)
             advance("发送")
             screen_send = None
             if send_point is not None:
@@ -493,7 +548,7 @@ class Runner:
                         screen_send[1] + half,
                     ),
                     "send",
-                    "发送按钮",
+                    "发送按钮" if slot_kind != vision.SEND_SLOT_UNKNOWN else "发送位置",
                 )
             # 发送按钮的框线可能压在输入框上，基线必须在画完框之后再取。
             before_send = self._capture(send_region)
@@ -514,11 +569,11 @@ class Runner:
                     cleared, _ = self._wait_change(send_region, before_send, 4.0)
                 # 像素变化只能说明"输入框动了"，点中麦克风开始录音也算变化。
                 # 真正的判据是占位符回来——那才代表内容被送走了。
-                if self._composer_empty(hwnd) is False:
+                if self._composer_empty(hwnd, grown) is False:
                     self.log("warning", "输入框里仍然有内容，补按一次 Enter。")
                     winapi.press_enter()
                     time.sleep(min(self._delay(), 1.2))
-                if self._composer_empty(hwnd) is False:
+                if self._composer_empty(hwnd, grown) is False:
                     raise AutomationError(
                         "发送后输入框里仍有内容，消息没有发出去。"
                         "目标应用可能暂停了这个对话，或额度已经用尽。"

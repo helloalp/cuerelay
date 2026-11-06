@@ -101,6 +101,49 @@ def test_send_button_detection() -> None:
     assert abs(point[1] - 468) <= 3, point
 
 
+def test_send_slot_icon_state() -> None:
+    """发送位置会换图标：有内容时是发送箭头，生成回答时是暂停，空的时候是麦克风。
+
+    三种状态的外壳尺寸和填充率完全一样，只看外壳会把暂停键当成发送按钮点下去，
+    结果是掐断正在生成的回答；空输入框则会把麦克风当成发送按钮，点下去开始录音。
+    """
+
+    accent = (59, 130, 246)
+    glyph = (250, 250, 250)
+    square = (560, 456, 586, 482)
+    panel = ((150, 430, 611, 500), (46, 46, 46))
+
+    def build(extra: list) -> Bitmap:
+        return make_bitmap(760, 560, (30, 30, 30), [panel, (square, accent)] + extra)
+
+    # 发送箭头：顶部人字形横条 + 中间竖杆，中间列有内容。
+    arrow = build([((563, 462, 583, 466), glyph), ((571, 462, 576, 476), glyph)])
+    composer = vision.detect_composer(arrow)
+    assert composer is not None, "箭头用例的输入框没识别出来"
+    slot = vision.detect_send_slot(arrow, composer)
+    assert slot is not None, "没有识别到发送方块"
+    assert vision.send_slot_kind(arrow, slot) == vision.SEND_SLOT_SEND
+
+    # 暂停：两根竖条，中间必然留空。
+    pause = build([((563, 463, 569, 476), glyph), ((577, 463, 583, 476), glyph)])
+    composer = vision.detect_composer(pause)
+    assert composer is not None, "暂停用例的输入框没识别出来"
+    slot = vision.detect_send_slot(pause, composer)
+    assert slot is not None, "没有识别到暂停方块"
+    assert vision.send_slot_kind(pause, slot) == vision.SEND_SLOT_PAUSE
+
+    # 麦克风：细长条，填充率低，根本不该被当成可点的按钮。
+    mic = make_bitmap(
+        760,
+        560,
+        (30, 30, 30),
+        [panel, ((570, 458, 578, 484), glyph)],
+    )
+    composer = vision.detect_composer(mic)
+    assert composer is not None, "麦克风用例的输入框没识别出来"
+    assert vision.detect_send_slot(mic, composer) is None, "麦克风不能被当成发送按钮"
+
+
 def test_change_detection() -> None:
     empty = make_bitmap(320, 80, (40, 40, 40), [])
     filled = make_bitmap(320, 80, (40, 40, 40), [((20, 20, 300, 60), (220, 220, 220))])
@@ -514,6 +557,7 @@ TESTS: List[Tuple[str, Callable[[], None]]] = [
     ("输入框识别（含文字）", test_composer_with_text_lines),
     ("发送按钮识别", test_send_button_detection),
     ("发送按钮避开麦克风", test_send_button_ignores_thin_icon),
+    ("发送位置图标状态", test_send_slot_icon_state),
     ("整窗识别", test_full_window_layout),
     ("三栏布局", test_panel_layout),
     ("面板扩展", test_panel_around_seed),

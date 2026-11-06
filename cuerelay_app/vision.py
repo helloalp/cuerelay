@@ -447,8 +447,8 @@ def detect_composer(bitmap: Bitmap) -> Optional[Rect]:
     return Rect(left, top, right + 1, bottom)
 
 
-def detect_send_button(bitmap: Bitmap, composer: Rect) -> Optional[tuple[int, int]]:
-    """在输入框右下角寻找发送按钮，返回按钮中心的客户区坐标。
+def detect_send_slot(bitmap: Bitmap, composer: Rect) -> Optional[Rect]:
+    """在输入框右下角寻找发送按钮的方块，返回它的矩形。
 
     发送按钮是输入框里最靠右、最靠下的那个"实心圆"。
     旁边常有一个麦克风（细线条图标，填充率低）和若干文字按钮，
@@ -489,7 +489,7 @@ def detect_send_button(bitmap: Bitmap, composer: Rect) -> Optional[tuple[int, in
                 mask[base + column] = 1
 
     seen = bytearray(width * height)
-    best: Optional[tuple[float, int, int]] = None
+    best: Optional[tuple[float, int, int, int, int]] = None
 
     for index in range(width * height):
         if not mask[index] or seen[index]:
@@ -545,11 +545,66 @@ def detect_send_button(bitmap: Bitmap, composer: Rect) -> Optional[tuple[int, in
         dy = (height - 1 - center_y) / height
         score = (1 - dx) * 0.55 + (1 - dy) * 0.55 + fill * 0.8 + (1 - abs(aspect - 1)) * 0.4
         if best is None or score > best[0]:
-            best = (score, left + int(center_x), top + int(center_y))
+            best = (score, left + min_x, top + min_y, left + max_x + 1, top + max_y + 1)
 
     if best is None:
         return None
-    return best[1], best[2]
+    return Rect(best[1], best[2], best[3], best[4])
+
+
+def detect_send_button(bitmap: Bitmap, composer: Rect) -> Optional[tuple[int, int]]:
+    """发送按钮的中心点。"""
+
+    slot = detect_send_slot(bitmap, composer)
+    return slot.center if slot is not None else None
+
+
+SEND_SLOT_SEND = "send"
+SEND_SLOT_PAUSE = "pause"
+SEND_SLOT_UNKNOWN = "unknown"
+
+
+def send_slot_kind(bitmap: Bitmap, slot: Rect) -> str:
+    """方块里画的是发送箭头还是暂停双竖条。
+
+    这个位置会随状态换图标：输入框有内容时是发送箭头，正在生成回答时是暂停键。
+    两者外壳是同一个实心方块，尺寸和填充率完全一样，只能看里面的浅色字形：
+
+    - 暂停是两根竖条，中间必然有一段空白列，左右两侧各有实心柱；
+    - 发送箭头是「人字形 + 竖杆」，竖杆正好落在中间，中间列不会是空的。
+    """
+
+    width, height = slot.width, slot.height
+    if width < 10 or height < 10:
+        return SEND_SLOT_UNKNOWN
+
+    points: list[Color] = []
+    for y in range(slot.top, slot.bottom, 2):
+        for x in range(slot.left, slot.right, 2):
+            points.append(bitmap.rgb(x, y))
+    fill, _ = _modal(points)
+
+    # 逐列统计字形像素。留出 1/8 边距，避开方块自身的圆角和抗锯齿。
+    margin_x = max(1, width // 8)
+    margin_y = max(1, height // 8)
+    columns = [0] * width
+    for y in range(slot.top + margin_y, slot.bottom - margin_y):
+        for x in range(slot.left + margin_x, slot.right - margin_x):
+            if _dist(bitmap.rgb(x, y), fill) >= 60:
+                columns[x - slot.left] += 1
+
+    peak = max(columns) if columns else 0
+    if peak < max(3, height // 4):
+        return SEND_SLOT_UNKNOWN
+
+    def covered(start: int, stop: int) -> bool:
+        return any(columns[x] >= peak * 0.5 for x in range(max(0, start), min(width, stop)))
+
+    mid_start, mid_stop = int(width * 0.42), int(width * 0.58)
+    mid_empty = all(columns[x] <= peak * 0.16 for x in range(mid_start, max(mid_start + 1, mid_stop)))
+    if mid_empty and covered(0, mid_start) and covered(mid_stop, width):
+        return SEND_SLOT_PAUSE
+    return SEND_SLOT_SEND
 
 
 def detect_panels(bitmap: Bitmap) -> list[int]:

@@ -89,7 +89,9 @@ def main(argv: list[str]) -> int:
         print("识别不到输入框")
         return 1
 
-    point = engine.send_point(frame, composer)
+    slot, kind = engine.send_slot(frame, composer)
+    print(f"发送方块: {slot}  图标: {kind}")
+    point = slot.center if slot is not None else None
     print(f"发送点: {point}")
 
     empty = engine.composer_is_empty(frame)
@@ -105,7 +107,6 @@ def main(argv: list[str]) -> int:
             (220, 60, 46),
             3,
         )
-
     data, width, height = frame.bitmap.to_png(max_width=9999)
     out.write_bytes(data)
     print(f"已保存 {out} ({width}x{height})")
