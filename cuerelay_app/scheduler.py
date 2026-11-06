@@ -29,6 +29,8 @@ class Scheduler:
         self._running_lock = threading.Lock()
         self._window_lock = threading.Lock()
         self._thread: Optional[threading.Thread] = None
+        # 暂停只影响"按时间自己触发"，手动执行和界面上的按钮照常。
+        self._paused = False
 
     # -- 生命周期 ------------------------------------------------------
 
@@ -49,6 +51,19 @@ class Scheduler:
     def is_busy(self) -> bool:
         with self._running_lock:
             return bool(self._running)
+
+    def is_paused(self) -> bool:
+        return bool(self._paused)
+
+    def set_paused(self, paused: bool) -> None:
+        """暂停/恢复按时间触发的任务。
+
+        暂停期间到点的任务不会补跑：恢复后它们已经超出「补执行窗口」，
+        按错过执行处理——否则暂停一整夜、恢复瞬间会一口气全发出去。
+        """
+
+        self._paused = bool(paused)
+        self._wake.set()
 
     def _catch_up(self) -> int:
         try:
@@ -141,6 +156,8 @@ class Scheduler:
             self._wake.clear()
 
     def _scan(self) -> None:
+        if self._paused:
+            return
         now = now_local()
         catch_up = self._catch_up()
         for task_id, next_run, enabled in self.store.index():

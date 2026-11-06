@@ -135,6 +135,7 @@ class App:
         self._tray: Optional[Tray] = None
         self._in_tray = False
         self._tray_hinted = False
+        self._tray_tip = ""
         self._last_history_id = ""
 
         settings = self.store.settings()
@@ -2055,6 +2056,8 @@ class App:
         total = len(self.store.tasks())
         self.count_var.set(f"{total} 个任务")
         self._apply_selection()
+        # 任务数量变了，托盘提示跟着变。内容没变时 _update_tray_tip 自己会跳过。
+        self._update_tray_tip()
 
     def _select_initial_task(self) -> bool:
         """打开窗口就落在第一个真实任务上。
@@ -3143,6 +3146,13 @@ class App:
         add("打开数据目录", self._open_data_dir, "设置", "", "data folder")
         if self._tray is not None:
             add("收进托盘", lambda: self._hide_to_tray(), "窗口", "", "tray hide 隐藏")
+        add(
+            "恢复定时任务" if self.scheduler is not None and self.scheduler.is_paused() else "暂停定时任务",
+            self._toggle_pause,
+            "窗口",
+            "",
+            "pause resume 暂停 恢复",
+        )
         add("退出 CueRelay", self._quit, "窗口", "", "quit exit 关闭")
 
         for task in self.store.tasks():
@@ -3265,14 +3275,22 @@ class App:
                         pass
                 elif event == "tray_show":
                     try:
-                        self._restore_from_tray()
+                        # 动作执行中窗口是故意藏起来的，这时从托盘叫出来会正好
+                        # 盖住目标窗口上要点的位置。
+                        if self._hidden_for_action:
+                            self.log("warning", "正在执行动作，先不唤出窗口。")
+                        else:
+                            self._restore_from_tray()
                     except tk.TclError:
                         pass
                 elif event == "tray_palette":
                     try:
-                        self._restore_from_tray()
-                        if self._palette is None:
-                            self.open_palette()
+                        if self._hidden_for_action:
+                            self.log("warning", "正在执行动作，先不唤出窗口。")
+                        else:
+                            self._restore_from_tray()
+                            if self._palette is None:
+                                self.open_palette()
                     except tk.TclError:
                         pass
                 elif event == "tray_start_codex":
@@ -3281,6 +3299,8 @@ class App:
                     self._app_close_codex()
                 elif event == "tray_run_next":
                     self._tray_run_next()
+                elif event == "tray_pause":
+                    self._toggle_pause()
                 elif event == "tray_quit":
                     self._quit()
                 elif event == "overlay":
@@ -3398,6 +3418,7 @@ class App:
             return lambda: self.emit(event, None)
 
         busy = bool(self.scheduler is not None and self.scheduler.is_busy())
+        paused = bool(self.scheduler is not None and self.scheduler.is_paused())
         items: list = [
             ("显示主窗口", emit("tray_show")),
             ("命令面板", emit("tray_palette")),
@@ -3410,6 +3431,7 @@ class App:
             items.append(("正在执行任务…", lambda: None))
         else:
             items.append(("立即运行第一个进行中任务", emit("tray_run_next")))
+        items.append(("恢复定时任务" if paused else "暂停定时任务", emit("tray_pause")))
         items.append(None)
         items.append(("退出 CueRelay", emit("tray_quit")))
         return items
@@ -3420,12 +3442,19 @@ class App:
         tasks = self.store.tasks()
         active = sum(1 for item in tasks if item.get("enabled"))
         parts = ["CueRelay"]
+        if self.scheduler is not None and self.scheduler.is_paused():
+            parts.append("已暂停")
         if self.scheduler is not None and self.scheduler.is_busy():
             parts.append("执行中")
         parts.append(f"{len(tasks)} 个任务")
         if active:
             parts.append(f"{active} 个启用")
-        self._tray.set_tooltip(" · ".join(parts))
+        text = " · ".join(parts)
+        # 每次刷新都发一条 NIM_MODIFY 太浪费，内容没变就不动它。
+        if text == self._tray_tip:
+            return
+        self._tray_tip = text
+        self._tray.set_tooltip(text)
 
     def _notify_tray(self, title: str, text: str, level: str = "info") -> None:
         if self._tray is not None:
@@ -3488,13 +3517,32 @@ class App:
         收在托盘里，弹出来就是凭空跳出一个窗口。
         """
 
-        for task in self.store.tasks():
-            if not task.get("enabled") or is_lifecycle(task):
-                continue
+        candidates = [
+            task for task in self.store.tasks() if task.get("enabled") and not is_lifecycle(task)
+        ]
+        if not candidates:
+            self._set_status("没有可立即运行的提示词任务")
+            return
+        for task in candidates:
             if self.scheduler is not None and self.scheduler.trigger(str(task.get("id")), "manual"):
                 self._set_status(f"正在执行：{task.get('name')}")
                 return
-        self._set_status("没有可立即运行的提示词任务")
+        # 每一个都 trigger 失败，说明它们都在跑。
+        self._set_status("任务都在执行中，稍后再试")
+
+    def _toggle_pause(self) -> None:
+        """暂停或恢复按时间触发的任务。手动执行不受影响。"""
+
+        if self.scheduler is None:
+            return
+        paused = not self.scheduler.is_paused()
+        self.scheduler.set_paused(paused)
+        self.engine_var.set("调度已暂停" if paused else "调度运行中")
+        self.log(
+            "warning" if paused else "success",
+            "定时任务已暂停，到点的任务不会补跑。" if paused else "定时任务已恢复。",
+        )
+        self._update_tray_tip()
 
     def _on_unmap(self, event: Any = None) -> None:
         """窗口被最小化时，按设置收进托盘。"""

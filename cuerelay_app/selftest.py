@@ -17,6 +17,7 @@ from typing import Callable, List, Tuple
 from . import apps, conversations, hotkey, ocr, templates, vision
 from .config import now_local, parse_datetime
 from .imaging import Bitmap
+from .scheduler import Scheduler
 from .store import (
     CLOSE_ACTION_LABELS,
     CLOSE_ACTIONS,
@@ -813,6 +814,36 @@ def test_template_expand() -> None:
     assert templates.expand("普通的 {花括号}", now=moment) == "普通的 {花括号}"
 
 
+def test_scheduler_pause() -> None:
+    """暂停拦的是"按时间自己触发"，不是所有执行。
+
+    用一个假 store 造一个已经到点的任务：暂停时 _scan 不该碰它，恢复后
+    应该正好触发一次。
+    """
+
+    due = now_local() - _dt.timedelta(seconds=5)
+
+    class FakeStore:
+        def index(self):
+            return [("t1", due, True)]
+
+        def setting(self, key, default=None):
+            return default
+
+    scheduler = Scheduler(FakeStore(), lambda _event, _payload: None)
+    calls: list = []
+    scheduler.trigger = lambda *args, **kwargs: calls.append(args) or True  # type: ignore[assignment]
+
+    scheduler.set_paused(True)
+    assert scheduler.is_paused() is True
+    scheduler._scan()
+    assert calls == [], "暂停时不该触发任务"
+
+    scheduler.set_paused(False)
+    scheduler._scan()
+    assert len(calls) == 1, f"恢复后应该触发一次，实际 {len(calls)} 次"
+
+
 def test_close_action() -> None:
     """关闭动作只认四个值。
 
@@ -916,6 +947,7 @@ TESTS: List[Tuple[str, Callable[[], None]]] = [
     ("开机自启命令", test_autostart_command),
     ("全局热键注册", test_hotkey_register),
     ("关闭动作", test_close_action),
+    ("调度暂停", test_scheduler_pause),
     ("提示词变量", test_template_expand),
     ("路径清理", test_tidy_path),
 ]
