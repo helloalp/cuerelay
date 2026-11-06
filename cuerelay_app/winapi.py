@@ -246,10 +246,12 @@ TH32CS_SNAPPROCESS = 0x00000002
 WM_CLOSE = 0x0010
 PROCESS_TERMINATE = 0x0001
 VK_CONTROL = 0x11
+VK_SHIFT = 0x10
 VK_A = 0x41
 VK_V = 0x56
 VK_K = 0x4B
 VK_B = 0x42
+VK_S = 0x53
 VK_RETURN = 0x0D
 VK_ESCAPE = 0x1B
 VK_MENU = 0x12
@@ -1337,6 +1339,23 @@ def ctrl_b() -> None:
     _key_down(VK_B)
     time.sleep(0.02)
     _key_up(VK_B)
+    _key_up(VK_CONTROL)
+
+
+def ctrl_shift_s() -> None:
+    """Codex 桌面版的「Toggle Sidebar」。
+
+    View 菜单里写着 Ctrl+Shift+S，这是唯一有官方出处的写法。网页版那套
+    Ctrl+B 在这里按了没反应，别拿它当主路。
+    """
+
+    _key_down(VK_CONTROL)
+    _key_down(VK_SHIFT)
+    time.sleep(0.02)
+    _key_down(VK_S)
+    time.sleep(0.02)
+    _key_up(VK_S)
+    _key_up(VK_SHIFT)
     _key_up(VK_CONTROL)
 
 

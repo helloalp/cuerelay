@@ -1020,6 +1020,124 @@ def test_window_pick_skips_tool() -> None:
         winapi.windows_for_process, winapi.is_tool_window = saved
 
 
+def test_search_panel_anchor() -> None:
+    """搜索面板靠分组标题定位，标题认错就会把整条链路带偏。
+
+    真实画面里踩过两次：
+      · 面板空着时第一行标题是「Quick actions」，输入关键词后变成「Chats」；
+      · 「ChatGPT can edit any file...」这句提示语曾经被当成「Chat」这个标题，
+        于是"输入框"被算到了窗口底部，点下去把面板关掉了。
+    """
+
+    from . import automation, locator, ocr
+
+    runner = automation.Runner(
+        {"step_delay_seconds": 0.4, "recognition_enabled": True},
+        lambda level, message: None,
+    )
+    rect = {"left": 0, "top": 0, "right": 3840, "bottom": 2115, "width": 3840, "height": 2115}
+    frame = locator.Frame(0, rect, make_bitmap(3840, 2115, (24, 24, 24), []))
+
+    def line(text: str, left: int, top: int, width: int = 120, height: int = 16) -> ocr.OcrLine:
+        return ocr.OcrLine(text, left, top, width, height)
+
+    # 正常：空面板的第一行标题
+    mark = runner._panel_anchor([line("Quick actions", 1368, 774)], frame)
+    assert mark is not None and mark.text == "Quick actions", mark
+
+    # OCR 把标题后面多认出一个字符，仍然要认出来
+    mark = runner._panel_anchor([line("Chats O", 1368, 774)], frame)
+    assert mark is not None and mark.text == "Chats O", mark
+
+    # 正文里以 ChatGPT 开头的提示语不能当成标题
+    assert runner._panel_anchor([line("ChatGPT can edit any file and run commands", 1734, 1815)], frame) is None
+
+    # 侧边栏里的文字不算：横向中段以外
+    assert runner._panel_anchor([line("Chats", 102, 774)], frame) is None
+
+    # 窗口下半部分的文字也不算
+    assert runner._panel_anchor([line("Chats", 1368, 1900)], frame) is None
+
+    # 两个标题都在时取最靠上的那个
+    both = [line("Chats", 1368, 924), line("Quick actions", 1368, 774)]
+    mark = runner._panel_anchor(both, frame)
+    assert mark is not None and mark.text == "Quick actions", mark
+
+
+def test_search_result_pick() -> None:
+    """结果行必须贴着面板左边缘，正文里同名的那一行不能算。
+
+    实测画面：面板里的结果是 `0 20261021 18`（x=1368），对话正文里另有一行
+    一模一样的 `20261021 18`（x=1677）。只按文字相似度挑，会挑中正文那一行，
+    点下去什么也不会发生。
+    """
+
+    from . import automation, ocr
+    from .vision import Rect
+
+    runner = automation.Runner(
+        {"step_delay_seconds": 0.4, "recognition_enabled": True},
+        lambda level, message: None,
+    )
+    input_box = Rect(1356, 697, 2743, 738)
+
+    def line(text: str, left: int, top: int, width: int = 153, height: int = 20) -> ocr.OcrLine:
+        return ocr.OcrLine(text, left, top, width, height)
+
+    lines = [
+        line("20261021 14", 1370, 700, 136, 32),        # 输入框里的关键词
+        line("Chats", 1368, 774, 48, 15),               # 分组标题
+        line("0 20261021 18", 1368, 817),               # 真正的结果
+        line("henu classroom", 2263, 819, 136, 15),     # 结果行右侧的项目名
+        line("20261021 18", 1677, 1968, 118, 15),       # 正文里的同名文字
+        line("All", 1369, 1397, 24, 16),                # 底部的筛选标签
+    ]
+    picked = runner._result_lines(lines, 3840, input_box)
+    texts = [item.text for item in picked]
+    assert "20261021 14" not in texts, "输入框里的关键词不是结果"
+    assert "20261021 18" not in texts, "正文里的同名文字不是结果"
+    assert "henu classroom" not in texts, "结果行右侧的项目名不是结果"
+
+    hit = runner._best_title(picked, "20261021 18")
+    assert hit is not None, "没认出结果"
+    assert hit.text == "0 20261021 18", hit.text
+    assert 1360 <= hit.left <= 1420, f"结果行应该贴着面板左边缘，实际 x={hit.left}"
+
+
+def test_magnifier_band() -> None:
+    """放大镜靠"标题栏那一行里最右边的图标"来定位。
+
+    这一行的高度不能按窗口高度算：菜单栏和标题栏都是固定像素高，
+    窗口从 3840x2115 缩到 2560x1410 时，按比例算出来的那条带会落在
+    菜单栏和标题栏之间的空白上，一个图标都扫不到。
+    """
+
+    from . import automation, locator
+
+    runner = automation.Runner(
+        {"step_delay_seconds": 0.4, "recognition_enabled": True},
+        lambda level, message: None,
+    )
+    background = (24, 24, 24)
+    glyph = (200, 200, 200)
+    # 标题栏那一行：Codex 五个字母、箭头、铃铛、放大镜。右边还有内容区的图标。
+    panels = [((103, 95, 120, 115), glyph), ((487, 92, 505, 112), glyph), ((538, 93, 556, 113), glyph)]
+    bitmap = make_bitmap(3840, 2115, background, panels)
+    rect = {"left": 0, "top": 0, "right": 3840, "bottom": 2115, "width": 3840, "height": 2115}
+    frame = locator.Frame(0, rect, bitmap)
+
+    point = runner._icon_in_band(frame, 586, *automation.Runner.HEADER_BAND)
+    assert point is not None, "标题栏里一个图标都没扫到"
+    x, y = point
+    assert 538 <= x <= 556, f"应该取最右边那个图标，实际 x={x}"
+    assert automation.Runner.HEADER_BAND[0] <= y <= automation.Runner.HEADER_BAND[1]
+
+    # 空标题栏：认不出来就返回 None，交给调用方明确放弃
+    blank = make_bitmap(3840, 2115, background, [])
+    assert runner._icon_in_band(locator.Frame(0, rect, blank), 586, *automation.Runner.HEADER_BAND) is None
+
+
+
 TESTS: List[Tuple[str, Callable[[], None]]] = [
     ("颜色众数", test_modal_color),
     ("输入框识别", test_composer_detection),
@@ -1062,6 +1180,9 @@ TESTS: List[Tuple[str, Callable[[], None]]] = [
     ("置顶窗口排查", test_topmost_scan),
     ("侧边栏开关定位", test_sidebar_toggle_points),
     ("窗口选择跳过辅助窗口", test_window_pick_skips_tool),
+    ("搜索面板定位", test_search_panel_anchor),
+    ("搜索结果挑选", test_search_result_pick),
+    ("放大镜定位", test_magnifier_band),
     ("路径清理", test_tidy_path),
 ]
 
