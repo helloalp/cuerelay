@@ -39,6 +39,17 @@ DELAY_OPTIONS = (("0.8", "0.8 秒"), ("1.2", "1.2 秒"), ("1.8", "1.8 秒"), ("2
 THEME_OPTIONS = (("light", "浅色"), ("dark", "深色"))
 FILTER_OPTIONS = (("all", "全部"), ("info", "信息"), ("success", "成功"), ("warning", "警告"), ("error", "错误"))
 
+# 分组默认展开状态。失败要立刻看到，"已停止"往往是几十条历史，默认收起，
+# 否则一打开就是一大片同名的旧任务。
+GROUP_DEFAULT_OPEN = {"active": True, "failed": True, "idle": False}
+
+
+def _clip(text: str, limit: int) -> str:
+    """压成一行并截断，用于状态行这类只有一行的位置。"""
+
+    flat = " ".join(str(text or "").split())
+    return flat if len(flat) <= limit else flat[: limit - 1] + "…"
+
 
 def _empty_draft() -> dict[str, Any]:
     now = now_local()
@@ -69,6 +80,7 @@ class App:
         self._baseline: Optional[tuple] = None
         self._row_widgets: dict[str, dict[str, Any]] = {}
         self._list_signature: Optional[tuple] = None
+        self._group_open: dict[str, bool] = {}
         self._log_lines: list[tuple[str, str]] = []
         self._log_filter = "all"
         self._calibrated_at = str(self.store.setting("calibrated_at") or "")
@@ -88,8 +100,9 @@ class App:
         self._after_ids.append(self.root.after(200, self._capture_root_hwnd))
 
         self.refresh_tasks(force=True)
-        self._sync_editor_from_draft()
-        self._set_status(f"配置文件：{config.DATA_PATH.name}")
+        if not self._select_initial_task():
+            self._sync_editor_from_draft()
+            self._set_status(f"配置文件：{config.DATA_PATH.name}")
 
     # ------------------------------------------------------------------
     # 初始化
@@ -364,14 +377,7 @@ class App:
             font=theme.font("tiny"),
             anchor="w",
         ).pack(side="left", padx=theme.px(22))
-        tk.Label(
-            bar,
-            textvariable=self.count_var,
-            bg=theme.c("bg"),
-            fg=theme.c("text_3"),
-            font=theme.font("tiny"),
-            anchor="e",
-        ).pack(side="right", padx=theme.px(22))
+        # 任务数量已经在列表表头显示，这里不再重复一遍。
         tk.Frame(self.root, bg=theme.c("border"), height=1).grid(row=3, column=0, sticky="ew")
 
     # ------------------------------------------------------------------
@@ -863,7 +869,7 @@ class App:
             (
                 key,
                 tuple(
-                    (task.get("id"), task.get("name"), next_run_text(task), content_snippet(task))
+                    (task.get("id"), task.get("name"), self._row_meta(task), content_snippet(task))
                     for task in items
                 ),
             )
@@ -888,13 +894,46 @@ class App:
                 anchor="w",
             ).pack(fill="x", padx=self.theme.px(4), pady=self.theme.px(14))
         for key, items in grouped:
-            self._render_group_head(key, len(items))
-            for task in items:
-                self._render_row(task)
+            expanded = self._group_open_state(key)
+            # 选中的任务不能藏在收起的分组里，否则看起来像被删掉了。
+            if not expanded and any(str(task.get("id")) == self.selected_id for task in items):
+                expanded = True
+            self._render_group_head(key, len(items), expanded)
+            if expanded:
+                for task in items:
+                    self._render_row(task)
 
         total = len(self.store.tasks())
         self.count_var.set(f"{total} 个任务")
         self._apply_selection()
+
+    def _select_initial_task(self) -> bool:
+        """打开窗口就落在第一个真实任务上。
+
+        空白的「新建任务」表单看不出这个工具在做什么；载入一条真实任务，
+        名称、提示词、计划、发送方式、目标对话一次全在首屏。
+        """
+
+        grouped = self._group_tasks(sorted(self.store.tasks(), key=self._sort_key))
+        if not grouped:
+            return False
+        first = grouped[0][1][0]
+        task = self.store.get(str(first.get("id")))
+        if task is None:
+            return False
+        self.selected_id = str(task.get("id"))
+        self._load_task(task)
+        self._apply_selection()
+        return True
+
+    def _group_open_state(self, key: str) -> bool:
+        if key in self._group_open:
+            return self._group_open[key]
+        return GROUP_DEFAULT_OPEN.get(key, True)
+
+    def _toggle_group(self, key: str) -> None:
+        self._group_open[key] = not self._group_open_state(key)
+        self.refresh_tasks(force=True)
 
     def _group_tasks(self, tasks: list[dict[str, Any]]) -> list[tuple[str, list[dict[str, Any]]]]:
         buckets: dict[str, list[dict[str, Any]]] = {}
@@ -906,31 +945,76 @@ class App:
             if buckets.get(key)
         ]
 
-    def _render_group_head(self, key: str, count: int) -> None:
+    def _render_group_head(self, key: str, count: int, expanded: bool = True) -> None:
         theme = self.theme
-        head = tk.Frame(self.list_body, bg=theme.c("bg"))
+        head = tk.Frame(self.list_body, bg=theme.c("bg"), cursor="hand2")
         head.pack(fill="x", padx=theme.px(4), pady=(theme.px(10), theme.px(4)))
-        tk.Label(
+
+        # 收起画向右的三角，展开画向下的三角：一个符号说清可点，不用再加说明文字。
+        caret = tk.Canvas(
+            head,
+            width=theme.px(9),
+            height=theme.px(9),
+            bg=theme.c("bg"),
+            highlightthickness=0,
+            bd=0,
+            cursor="hand2",
+        )
+        if expanded:
+            caret.create_polygon(
+                1, 2, theme.px(7), 2, theme.px(4), theme.px(7),
+                fill=theme.c("text_3"), outline="",
+            )
+        else:
+            caret.create_polygon(
+                2, 1, 2, theme.px(7), theme.px(7), theme.px(4),
+                fill=theme.c("text_3"), outline="",
+            )
+        caret.pack(side="left", pady=(theme.px(4), 0))
+
+        label = tk.Label(
             head,
             text=store_module.group_label(key),
             bg=theme.c("bg"),
             fg=theme.c("text_2"),
             font=theme.font("small_strong"),
             anchor="w",
-        ).pack(side="left")
-        tk.Label(
+            cursor="hand2",
+        )
+        label.pack(side="left", padx=(theme.px(5), 0))
+
+        count_label = tk.Label(
             head,
             text=str(count),
             bg=theme.c("bg"),
             fg=theme.c("text_3"),
             font=theme.font("tiny"),
             anchor="e",
-        ).pack(side="right")
+            cursor="hand2",
+        )
+        count_label.pack(side="right")
+
+        for widget in (head, caret, label, count_label):
+            widget.bind("<Button-1>", lambda _event, k=key: self._toggle_group(k))
 
     @staticmethod
     def _sort_key(task: dict[str, Any]) -> tuple:
         next_run = parse_datetime(task.get("next_run")) or _dt.datetime.max
         return (0 if task.get("enabled") else 1, next_run, str(task.get("name") or ""))
+
+    @staticmethod
+    def _row_meta(task: dict[str, Any]) -> str:
+        """行右侧的短标签。
+
+        在「失败」分组里每条都写一遍「失败」是废话，改成失败发生的时间；
+        其它状态照旧显示计划时间。
+        """
+
+        if task_state(task) == "failed":
+            stamp = parse_datetime(task.get("last_run"))
+            # 没有执行记录就留空：分组名和红点已经说明失败了，不必再写一遍。
+            return config.format_short_datetime(stamp, "") if stamp is not None else ""
+        return next_run_text(task)
 
     def _render_row(self, task: dict[str, Any]) -> None:
         theme = self.theme
@@ -969,7 +1053,7 @@ class App:
 
         meta_label = tk.Label(
             name_row,
-            text=next_run_text(task),
+            text=self._row_meta(task),
             bg=theme.c("bg"),
             fg=theme.c("text_3"),
             font=theme.font("tiny"),
@@ -1050,18 +1134,26 @@ class App:
         if not task:
             return
         self.selected_id = task_id
+        # 选中的任务落在收起的分组里时先展开，否则列表上看不出它被选中了。
+        group = store_module.state_group(task)
+        if not self._group_open_state(group):
+            self._group_open[group] = True
+            self.refresh_tasks(force=True)
         self._apply_selection()
         self._load_task(task)
 
     def _load_task(self, task: dict[str, Any]) -> None:
+        # 没有计划时间的任务（已完成、失败、暂停）不能回填"现在"：那个时间点往往
+        # 已经过去了，用户一保存就会被问"是否立即执行"。回填 5 分钟后更符合预期。
+        planned = parse_datetime(task.get("next_run")) or (now_local() + _dt.timedelta(minutes=5))
         self.draft = {
             "id": str(task.get("id")),
             "name": str(task.get("name") or ""),
             "content": str(task.get("content") or ""),
             "conversation": str(task.get("conversation_title") or ""),
             "schedule": str(task.get("schedule") or "once"),
-            "date": (parse_datetime(task.get("next_run")) or now_local()).strftime("%Y-%m-%d"),
-            "time": (parse_datetime(task.get("next_run")) or now_local()).strftime("%H:%M"),
+            "date": planned.strftime("%Y-%m-%d"),
+            "time": planned.strftime("%H:%M"),
             "interval": str(int(task.get("interval_minutes", 60) or 60)),
             "action": str(task.get("action") or "click"),
             "enabled": bool(task.get("enabled", True)),
@@ -1072,7 +1164,8 @@ class App:
         self.delete_button.set_enabled(True)
         error = str(task.get("last_error") or "")
         if error:
-            self.editor_state.configure(text=error, fg=self.theme.c("danger"))
+            # 完整报错在日志里；这里只留一句，太长会顶到右边的按钮上。
+            self.editor_state.configure(text=_clip(error, 52), fg=self.theme.c("danger"))
         else:
             self.editor_state.configure(
                 text=f"运行 {int(task.get('run_count', 0) or 0)} 次",

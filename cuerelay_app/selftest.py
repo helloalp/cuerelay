@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Callable, List, Tuple
 
 from . import ocr, vision
-from .config import parse_datetime
+from .config import now_local, parse_datetime
 from .imaging import Bitmap
 from .store import TaskStore, advance_next_run_past_now, duplicate_groups
 from .vision import Rect
@@ -385,6 +385,27 @@ def test_duplicate_groups() -> None:
     assert all(group["content"] for group in groups)
 
 
+def test_row_meta() -> None:
+    """列表行右侧的短标签：失败的行不能只是重复一遍「失败」。"""
+
+    from .ui.app import App
+
+    meta = App._row_meta
+    now = now_local()
+    stamp = (now - _dt.timedelta(hours=3)).strftime("%Y-%m-%d %H:%M:%S")
+
+    # 有执行记录的失败任务显示失败时间。
+    failed_with_time = meta({"status": "failed", "last_run": stamp, "enabled": False})
+    assert failed_with_time and "失败" not in failed_with_time, failed_with_time
+
+    # 没有执行记录的失败任务留空，分组名和红点已经说明问题。
+    assert meta({"status": "failed", "last_run": None, "enabled": False}) == ""
+
+    # 等待中的任务照旧显示计划时间。
+    waiting = meta({"status": "waiting", "enabled": True, "next_run": stamp, "schedule": "once"})
+    assert waiting and "失败" not in waiting, waiting
+
+
 def test_delete_many() -> None:
     with tempfile.TemporaryDirectory() as folder:
         store = TaskStore(Path(folder) / "cuerelay_data.json")
@@ -505,6 +526,7 @@ TESTS: List[Tuple[str, Callable[[], None]]] = [
     ("旧数据迁移", test_store_migration),
     ("时间解析", test_time_parsing),
     ("重复任务归组", test_duplicate_groups),
+    ("列表行标签", test_row_meta),
     ("批量删除", test_delete_many),
     ("预览图生成", test_png_preview),
     ("浮层事件翻译", test_overlay_events),
