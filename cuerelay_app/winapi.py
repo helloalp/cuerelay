@@ -95,6 +95,8 @@ if IS_WINDOWS:  # pragma: no branch - 只在 Windows 上真正执行
     user32.GetAsyncKeyState.restype = ctypes.c_short
     user32.SetForegroundWindow.argtypes = [HWND]
     user32.SetForegroundWindow.restype = wintypes.BOOL
+    user32.SwitchToThisWindow.argtypes = [HWND, wintypes.BOOL]
+    user32.SwitchToThisWindow.restype = None
     user32.BringWindowToTop.argtypes = [HWND]
     user32.BringWindowToTop.restype = wintypes.BOOL
     user32.ShowWindow.argtypes = [HWND, ctypes.c_int]
@@ -870,12 +872,17 @@ def activate_window(hwnd: int, geometry: Optional[dict[str, Any]] = None) -> boo
     elif is_minimized(hwnd):
         user32.ShowWindow(HWND(hwnd), SW_RESTORE)
 
-    # 模拟一次 Alt 可以解除 Windows 的前台切换限制。
-    user32.keybd_event(VK_MENU, 0, 0, 0)
-    user32.keybd_event(VK_MENU, 0, KEYEVENTF_KEYUP, 0)
+    # 以前这里会注入一次 Alt 来绕过 Windows 的前台切换限制。那个做法有代价：
+    # 全局按下的 Alt 会落到"当前前台的那个程序"身上，运气不好就打开了它的
+    # 菜单栏，把用户正在输入的东西打断。改用 SetForegroundWindow + 兜底的
+    # SwitchToThisWindow，只影响我们自己的窗口。
     user32.BringWindowToTop(HWND(hwnd))
-    user32.SetForegroundWindow(HWND(hwnd))
-    time.sleep(0.18)
+    if not user32.SetForegroundWindow(HWND(hwnd)):
+        try:
+            user32.SwitchToThisWindow(HWND(hwnd), True)
+        except Exception:
+            pass
+    time.sleep(0.12)
     if geometry and bool(geometry.get("maximized", False)) and not is_maximized(hwnd):
         user32.ShowWindow(HWND(hwnd), SW_MAXIMIZE)
         time.sleep(0.12)
@@ -1079,6 +1086,37 @@ def repair_topmost(exclude_pid: int = 0) -> list[dict[str, Any]]:
             item["result"] = "已取消置顶"
             changed.append(item)
     return changed
+
+
+def repaint_window(hwnd: int) -> bool:
+    """立刻把窗口重画一遍。
+
+    withdraw 之后马上 deiconify，Windows 有时只把边框画出来，客户区留白，
+    要等下一次输入才补画。这里主动发一次重绘，不等用户去点。
+    """
+
+    if not IS_WINDOWS or not hwnd or not is_window(hwnd):
+        return False
+    try:
+        user32.SetWindowPos(
+            HWND(int(hwnd)),
+            0,
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED,
+        )
+        user32.InvalidateRect(HWND(int(hwnd)), None, True)
+        user32.RedrawWindow(
+            HWND(int(hwnd)),
+            None,
+            None,
+            RDW_INVALIDATE | RDW_ALLCHILDREN | RDW_UPDATENOW | RDW_FRAME,
+        )
+        return True
+    except Exception:
+        return False
 
 
 def set_dark_frame(hwnd: int, enabled: bool) -> None:

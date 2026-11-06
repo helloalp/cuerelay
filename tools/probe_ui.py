@@ -11,9 +11,11 @@ CueRelay 同时存在。
 from __future__ import annotations
 
 import faulthandler
+import os
 import shutil
 import sys
 import tempfile
+import threading
 import time
 import tkinter as tk
 from pathlib import Path
@@ -25,6 +27,34 @@ from cuerelay_app.store import TaskStore  # noqa: E402
 from cuerelay_app.ui.app import App  # noqa: E402
 
 
+# 每完成一步就打一次卡；看门狗发现它太久没动就把进程杀掉。
+# 没有这个的话，Tk 的 update() 一旦卡在等输入上，这个探针就会变成
+# "点一下动一下"，只能手动关窗口。
+_HEARTBEAT = time.time()
+_HEARTBEAT_STALL = 40.0
+
+
+def beat() -> None:
+    global _HEARTBEAT
+    _HEARTBEAT = time.time()
+
+
+def _watchdog() -> None:
+    while True:
+        time.sleep(2.0)
+        if time.time() - _HEARTBEAT > _HEARTBEAT_STALL:
+            print(
+                f"[看门狗] 超过 {int(_HEARTBEAT_STALL)} 秒没有进展，进程退出。"
+                "下面是所有线程当时的调用栈：",
+                flush=True,
+            )
+            faulthandler.dump_traceback()
+            sys.stdout.flush()
+            sys.stderr.flush()
+            # update() 卡在系统调用里时正常退出是退不掉的，只能硬退。
+            os._exit(3)
+
+
 def pump(root: tk.Tk, rounds: int = 20) -> None:
     for _ in range(rounds):
         try:
@@ -32,6 +62,7 @@ def pump(root: tk.Tk, rounds: int = 20) -> None:
         except tk.TclError:
             return
         time.sleep(0.02)
+        beat()
 
 
 def shot(root: tk.Tk, path: Path) -> None:
@@ -49,6 +80,7 @@ def main(argv: list[str]) -> int:
     # 这个探针偶尔会卡住不动，一直没查出来卡在哪一步。挂一个看门狗：超过 25 秒
     # 没动静就把所有线程的调用栈打出来，下次卡住就知道是哪个调用在等输入。
     faulthandler.dump_traceback_later(25, repeat=True)
+    threading.Thread(target=_watchdog, name="probe-watchdog", daemon=True).start()
     winapi.set_dpi_awareness()
     out_dir = Path(argv[0]) if argv else Path(tempfile.gettempdir()) / "cuerelay-ui"
     out_dir.mkdir(parents=True, exist_ok=True)

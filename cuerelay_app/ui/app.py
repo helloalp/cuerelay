@@ -3678,16 +3678,28 @@ class App:
         self._set_status("已收进托盘")
 
     def _restore_from_tray(self) -> None:
+        """把窗口从托盘里叫回来。
+
+        这里以前调 activate_window()，它会 BringWindowToTop + SetForegroundWindow
+        + 睡一小会儿。那套在"窗口刚 withdraw 完"的时候不稳：系统要等窗口响应，
+        等不到就卡满 5 秒，而且中途来一次鼠标点击才能放行——表现就是"点一下
+        动一下"。用户点托盘图标这个动作本身已经给了我们前台权限，deiconify
+        之后补一次重绘就够了。
+        """
+
         self._in_tray = False
         try:
             self.root.deiconify()
+            if str(self.root.state()) == "withdrawn":
+                # 刚 withdraw 完马上 deiconify，Windows 偶尔不认这次恢复。
+                self.root.wm_state("normal")
             self.root.lift()
             self._apply_topmost()
         except tk.TclError:
             return
-        hwnd = self.root_hwnd
-        if hwnd:
-            winapi.activate_window(hwnd)
+        # 只重画自己的窗口，不碰别人的前台状态。
+        if self.root_hwnd:
+            winapi.repaint_window(self.root_hwnd)
 
     def _check_tray_failure(self) -> None:
         """任务失败、而且窗口收在托盘里时，弹一条气泡。
