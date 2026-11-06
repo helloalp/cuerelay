@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Optional
 
-from . import apps, conversations, imaging, locator, ocr, vision, winapi
+from . import apps, conversations, imaging, locator, ocr, templates, vision, winapi
 from .vision import Rect
 
 
@@ -555,6 +555,9 @@ class Runner:
             locator.remember_composer(self.settings, frame, composer)
 
             screen_composer = frame.to_screen(composer)
+            # 变量在最后一刻展开：定时任务里的 {{date}} 要的是"执行那天"，
+            # 而不是当初保存任务那天。{{clipboard}} 用的是替换剪贴板之前的值。
+            content = templates.expand(content, clipboard=old_clipboard or "")
             winapi.set_clipboard_text(content)
 
             advance("粘贴提示词")
@@ -861,6 +864,7 @@ class Runner:
 
             screen_composer = frame.to_screen(composer)
             baseline = self._capture(screen_composer)
+            content = templates.expand(content, clipboard=old_clipboard or "")
             winapi.set_clipboard_text(content)
             self._paste(hwnd, frame, composer)
             changed, _ = self._wait_change(screen_composer, baseline, 4.0)

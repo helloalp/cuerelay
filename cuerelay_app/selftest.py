@@ -14,7 +14,7 @@ import threading
 from pathlib import Path
 from typing import Callable, List, Tuple
 
-from . import apps, conversations, hotkey, ocr, vision
+from . import apps, conversations, hotkey, ocr, templates, vision
 from .config import now_local, parse_datetime
 from .imaging import Bitmap
 from .store import (
@@ -788,6 +788,28 @@ def test_tidy_path() -> None:
     assert apps.tidy_path("") == ""
 
 
+def test_template_expand() -> None:
+    """提示词里的变量在最后一刻展开。
+
+    定时任务里的 {{date}} 要的是"执行那天"，所以这里不能提前替换；认不出的
+    占位符必须原样留下——写错一个词不该让整条提示词变成空白。
+    """
+
+    moment = _dt.datetime(2026, 11, 7, 9, 5)  # 周六
+    text = "总结 {{date}} 的日志，现在是 {{ time }}，{{weekday}}。"
+    out = templates.expand(text, now=moment)
+    assert out == "总结 2026-11-07 的日志，现在是 09:05，周六。", out
+    assert templates.expand("{{datetime}}", now=moment) == "2026-11-07 09:05"
+    # 占位符大小写不敏感，内部空格容忍
+    assert templates.expand("{{ DATE }}", now=moment) == "2026-11-07"
+    # 剪贴板内容原样嵌入
+    assert templates.expand("看看：{{clipboard}}", now=moment, clipboard="abc") == "看看：abc"
+    # 认不出的原样保留
+    assert templates.expand("{{unknown}}", now=moment) == "{{unknown}}"
+    # 没有占位符时不做任何改动（包括不该被当成模板的普通花括号）
+    assert templates.expand("普通的 {花括号}", now=moment) == "普通的 {花括号}"
+
+
 def test_hotkey_register() -> None:
     """真的注册一次全局热键再注销。
 
@@ -874,6 +896,7 @@ TESTS: List[Tuple[str, Callable[[], None]]] = [
     ("右边界分隔线", test_panels_near_right_edge),
     ("开机自启命令", test_autostart_command),
     ("全局热键注册", test_hotkey_register),
+    ("提示词变量", test_template_expand),
     ("路径清理", test_tidy_path),
 ]
 

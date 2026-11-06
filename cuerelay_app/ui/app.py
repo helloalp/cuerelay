@@ -17,7 +17,7 @@ from tkinter import messagebox, ttk
 from typing import Any, Callable, Optional
 
 from .. import apps as apps_module
-from .. import config, locator, store as store_module, winapi
+from .. import config, locator, store as store_module, templates, winapi
 from ..automation import AutomationError
 from ..config import friendly_error, iso_datetime, now_local, parse_datetime
 from ..conversations import Conversation
@@ -573,7 +573,15 @@ class App:
         self.snippet_name_field = Field(body, theme, "名称", self.snippet_name_var)
         self.snippet_name_field.pack(fill="x", padx=pad, pady=(pad, 0))
         self.snippet_area = TextArea(body, theme, "内容", height=8)
-        self.snippet_area.pack(fill="both", expand=True, padx=pad, pady=(theme.px(14), pad))
+        self.snippet_area.pack(fill="both", expand=True, padx=pad, pady=(theme.px(14), theme.px(6)))
+        tk.Label(
+            body,
+            text=f"变量：{templates.HELP}",
+            bg=theme.c("surface"),
+            fg=theme.c("text_3"),
+            font=theme.font("tiny"),
+            anchor="w",
+        ).pack(fill="x", padx=pad, pady=(0, pad))
 
         actions = tk.Frame(right, bg=theme.c("bg"))
         actions.grid(row=1, column=0, sticky="ew", pady=(theme.px(12), 0))
@@ -1276,8 +1284,16 @@ class App:
 
         # 提示词不再吃掉全部剩余高度：把计划、发送方式、目标对话留在首屏可见，
         # 用户一眼就能看完整条流程（写什么 -> 发到哪 -> 什么时候发 -> 怎么发）。
-        self.prompt_area = TextArea(self.prompt_group, theme, "提示词", height=7)
+        self.prompt_area = TextArea(self.prompt_group, theme, "提示词", height=6)
         self.prompt_area.pack(fill="x", padx=pad, pady=(theme.px(14), 0))
+        tk.Label(
+            self.prompt_group,
+            text=f"变量：{templates.HELP}",
+            bg=theme.c("surface"),
+            fg=theme.c("text_3"),
+            font=theme.font("tiny"),
+            anchor="w",
+        ).pack(fill="x", padx=pad, pady=(theme.px(6), 0))
 
         schedule_head = tk.Label(
             body,
