@@ -331,6 +331,61 @@ def _panel_extent(
 # ---------------------------------------------------------------------------
 
 
+def detect_panel_around(
+    bitmap: Bitmap,
+    seed_x: int,
+    seed_y: int,
+    probe_y: int = 0,
+    tolerance: int = 12,
+    max_scan: int = 460,
+) -> Optional[Rect]:
+    """从一个确定位于面板内部的点出发，向四周扩展到面板边界。
+
+    已知"某个像素属于输入框"时，这比在整窗上猜面板稳得多：
+    输入框宽窄、偏左偏右、窗口几栏布局，都不影响这一步。
+    """
+
+    width, height = bitmap.width, bitmap.height
+    if width < 40 or height < 40:
+        return None
+    seed_x = max(1, min(width - 2, int(seed_x)))
+    seed_y = max(1, min(height - 2, int(seed_y)))
+    base = bitmap.rgb(seed_x, seed_y)
+
+    # 横向用一条"干净"的行来量：种子行可能正好穿过文字或按钮，字符间隙会让
+    # 扩展提前停下。多试几行取最宽的那次——被挡住的行只会更窄，不会更宽。
+    rows: list[int] = []
+    for delta in (0, -8, 8, -16, 16, -26, 26, -38, 38):
+        candidate = int(probe_y or seed_y) + delta
+        if 1 <= candidate < height - 1:
+            rows.append(candidate)
+    left, right = seed_x, seed_x
+    for row in rows:
+        if _dist(bitmap.rgb(seed_x, row), base) > tolerance:
+            continue  # 这一行已经不在面板里了
+        row_left, row_right = _horizontal_extent(bitmap, row, base, seed_x=seed_x, tolerance=tolerance)
+        if row_left < left:
+            left = row_left
+        if row_right > right:
+            right = row_right
+
+    top = seed_y
+    for y in range(seed_y - 1, max(0, seed_y - max_scan), -1):
+        if _dist(bitmap.rgb(seed_x, y), base) > tolerance:
+            top = y + 1
+            break
+
+    bottom = seed_y
+    for y in range(seed_y + 1, min(height - 1, seed_y + max_scan)):
+        if _dist(bitmap.rgb(seed_x, y), base) > tolerance:
+            bottom = y - 1
+            break
+
+    if right - left < 120 or bottom - top < 30:
+        return None
+    return Rect(left, top, right + 1, bottom + 1)
+
+
 def detect_composer(bitmap: Bitmap) -> Optional[Rect]:
     """识别对话输入框。返回客户区坐标系下的矩形。"""
 
@@ -338,7 +393,16 @@ def detect_composer(bitmap: Bitmap) -> Optional[Rect]:
     if width < 360 or height < 320:
         return None
 
-    xs = _spread_xs(width, 0.30, 0.80, 11)
+    # 采样列必须落在消息区内部：右侧一旦展开代码面板，输入框就不再居中，
+    # 按整窗宽度取样会有一半落在面板上，边缘检测自然失败。
+    chat_left, chat_right = detect_chat_bounds(bitmap)
+    span = max(80, chat_right - chat_left)
+    xs = _spread_between(
+        chat_left + int(span * 0.16),
+        chat_right - int(span * 0.16),
+        11,
+        width,
+    )
     if len(xs) < 5:
         return None
 
@@ -348,36 +412,60 @@ def detect_composer(bitmap: Bitmap) -> Optional[Rect]:
         int(height * 0.42),
         height - 2,
         min_height=34,
-        max_height=int(height * 0.42),
+        # 输入框是个矮面板。上限放宽到 28% 是为了容纳多行内容，
+        # 但不能更大：否则"整个下半屏的空白"会被当成候选，把真正的输入框挤掉。
+        max_height=int(height * 0.28),
+        # 候选按"高度加分"排序，长条空白排在前面，真正的输入框往往在名单末尾。
+        # 这里必须多留一些候选，交给下面的边缘校验去筛。
+        limit=24,
     )
-    min_width = int(width * 0.28)
+    min_width = int(span * 0.34)
+    scored: list[tuple[float, int, int, int, int]] = []
     for top, bottom, inside in candidates:
         if bottom < int(height * 0.55):
             continue
         left, right = _panel_extent(bitmap, top, bottom, inside)
         if right - left < min_width:
             continue
+        # 输入框是消息区里的一块面板，不可能从窗口左边一直铺到右边。
+        # 少了这道校验，"下半屏的空白"会被当成输入框，点击位置就全错了。
+        if left < chat_left - 8 or right > chat_right + 8:
+            continue
         # 真正的面板上下两条边缘必须横贯面板本身，否则只是内容块之间的空白。
         if _edge_support(bitmap, top, left, right) < 0.60:
             continue
         if _edge_support(bitmap, bottom, left, right) < 0.60:
             continue
-        return Rect(left, top, right + 1, bottom)
-    return None
+        # 输入框贴着窗口底部，而且是个矮面板：底边越靠下越像，高度越大越不像。
+        score = (bottom / max(1, height)) * 100.0 - (bottom - top) * 0.08
+        scored.append((score, top, bottom, left, right))
+
+    if not scored:
+        return None
+    scored.sort(key=lambda item: item[0], reverse=True)
+    _score, top, bottom, left, right = scored[0]
+    return Rect(left, top, right + 1, bottom)
 
 
 def detect_send_button(bitmap: Bitmap, composer: Rect) -> Optional[tuple[int, int]]:
-    """在输入框右下角寻找发送按钮，返回按钮中心的客户区坐标。"""
+    """在输入框右下角寻找发送按钮，返回按钮中心的客户区坐标。
+
+    发送按钮是输入框里最靠右、最靠下的那个"实心圆"。
+    旁边常有一个麦克风（细线条图标，填充率低）和若干文字按钮，
+    所以除了位置，还要看形状：必须是接近正圆、内部被填满的色块。
+    """
 
     if composer.width < 140 or composer.height < 42:
         return None
 
-    roi_width = max(80, min(160, int(composer.width * 0.24)))
-    roi_height = max(44, min(120, int(composer.height * 0.90)))
+    roi_width = max(110, min(200, int(composer.width * 0.22)))
+    roi_height = max(56, min(130, int(composer.height * 0.75)))
     left = max(composer.left + 4, composer.right - roi_width)
     top = max(composer.top + 4, composer.bottom - roi_height)
-    right = min(bitmap.width - 2, composer.right - 3)
-    bottom = min(bitmap.height - 2, composer.bottom - 3)
+    # 识别出的输入框可能比真实面板矮一点，ROI 往下、往右各多留一点余量，
+    # 否则按钮下半截被切掉，会退而选中旁边的麦克风。
+    right = min(bitmap.width - 2, composer.right + 8)
+    bottom = min(bitmap.height - 2, composer.bottom + 12)
     width = right - left
     height = bottom - top
     if width < 30 or height < 30:
@@ -438,13 +526,14 @@ def detect_send_button(bitmap: Bitmap, composer: Rect) -> Optional[tuple[int, in
 
         box_width = max_x - min_x + 1
         box_height = max_y - min_y + 1
-        if box_width < 9 or box_height < 9 or box_width > 72 or box_height > 72:
+        if box_width < 12 or box_height < 12 or box_width > 76 or box_height > 76:
             continue
         aspect = box_width / box_height
-        if aspect < 0.5 or aspect > 2.0:
+        # 发送按钮是实心圆；麦克风、加号这些细线条图标过不了这两关。
+        if aspect < 0.72 or aspect > 1.4:
             continue
         fill = area / (box_width * box_height)
-        if fill < 0.28:
+        if fill < 0.5:
             continue
         # 贴住 ROI 边缘的色块多半是输入框圆角外侧的背景，不能当成按钮。
         if min_x <= 0 or max_x >= width - 1 or min_y <= 0 or max_y >= height - 1:
@@ -461,6 +550,72 @@ def detect_send_button(bitmap: Bitmap, composer: Rect) -> Optional[tuple[int, in
     if best is None:
         return None
     return best[1], best[2]
+
+
+def detect_panels(bitmap: Bitmap) -> list[int]:
+    """窗口里所有稳定的竖直分隔线（升序）。
+
+    侧边栏、消息区、右侧代码面板之间各有一条 1px 的亮线，几乎每个纵向位置
+    都存在，所以按"出现次数接近峰值的那几列"来判定。滚动条、输入框边这些
+    只在一小段高度上出现的线，出现次数远低于峰值，会被过滤掉。
+    """
+
+    width, height = bitmap.width, bitmap.height
+    if width < 240 or height < 120:
+        return []
+    step_y = max(2, height // 48)
+    counts: dict[int, int] = {}
+    for y in range(4, height - 4, step_y):
+        row = [bitmap.lum(x, y) for x in range(0, width - 2)]
+        for x in range(40, width - 2):
+            here = row[x]
+            # 分隔线可能是 1px 也可能是 2px（不同缩放比例下不一样），
+            # 所以比的是"线的左侧"和"线的右侧"，而不是紧挨着的两列。
+            if here - row[x - 1] >= 6 and here - row[x + 2] >= 6:
+                counts[x] = counts.get(x, 0) + 1
+
+    if not counts:
+        return []
+    peak = max(counts.values())
+    if peak < max(3, (height // step_y) // 4):
+        return []
+    strong = sorted(x for x, hits in counts.items() if hits >= peak * 0.9)
+    # 相邻两列常常是同一条线的抗锯齿残留，合并成一个
+    merged: list[int] = []
+    for x in strong:
+        if merged and x - merged[-1] <= 2:
+            continue
+        merged.append(x)
+    return merged
+
+
+def detect_chat_bounds(bitmap: Bitmap) -> tuple[int, int]:
+    """消息区的左右边界。左侧是侧边栏，右侧可能是代码面板。"""
+
+    width = bitmap.width
+    dividers = detect_panels(bitmap)
+    left = 0
+    for x in dividers:
+        if x >= width * 0.09:
+            left = x
+            break
+    right = width
+    for x in dividers:
+        if x > left + max(160, int(width * 0.06)):
+            right = x
+            break
+    return left, right
+
+
+def detect_sidebar_right(bitmap: Bitmap, limit: int = 0) -> Optional[int]:
+    """侧边栏右边界的横坐标。找不到时返回 None，由调用方兜底。"""
+
+    for x in detect_panels(bitmap):
+        if limit and x >= limit:
+            break
+        if x >= bitmap.width * 0.09:
+            return x
+    return None
 
 
 def detect_search_field(bitmap: Bitmap, sidebar_right: int) -> Optional[Rect]:

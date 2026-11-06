@@ -197,6 +197,7 @@ GA_ROOT = 2
 VK_CONTROL = 0x11
 VK_A = 0x41
 VK_V = 0x56
+VK_K = 0x4B
 VK_RETURN = 0x0D
 VK_ESCAPE = 0x1B
 VK_MENU = 0x12
@@ -204,6 +205,8 @@ VK_F8 = 0x77
 KEYEVENTF_KEYUP = 0x0002
 MOUSEEVENTF_LEFTDOWN = 0x0002
 MOUSEEVENTF_LEFTUP = 0x0004
+MOUSEEVENTF_WHEEL = 0x0800
+WHEEL_DELTA = 120
 CF_UNICODETEXT = 13
 GMEM_MOVEABLE = 0x0002
 ERROR_ALREADY_EXISTS = 183
@@ -678,6 +681,17 @@ def click(point: tuple[int, int]) -> None:
     user32.mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, None)
 
 
+def scroll(point: tuple[int, int], notches: int) -> None:
+    """在指定位置滚动滚轮。notches 为正表示向下滚。"""
+
+    _require()
+    move_cursor(point)
+    time.sleep(0.05)
+    # dwData 是 32 位无符号，负数要先按补码转过去
+    delta = (-int(notches) * WHEEL_DELTA) & 0xFFFFFFFF
+    user32.mouse_event(MOUSEEVENTF_WHEEL, 0, 0, delta, None)
+
+
 def _key_down(vk: int) -> None:
     user32.keybd_event(vk, 0, 0, 0)
 
@@ -707,6 +721,17 @@ def ctrl_a() -> None:
 
 def press_enter() -> None:
     tap(VK_RETURN)
+
+
+def ctrl_k() -> None:
+    """多数对话式应用用 Ctrl+K 唤出搜索。"""
+
+    _key_down(VK_CONTROL)
+    time.sleep(0.02)
+    _key_down(VK_K)
+    time.sleep(0.02)
+    _key_up(VK_K)
+    _key_up(VK_CONTROL)
 
 
 def press_escape() -> None:

@@ -12,7 +12,7 @@ import time
 from dataclasses import dataclass
 from typing import Any, Callable, Optional
 
-from . import imaging, locator, vision, winapi
+from . import imaging, locator, ocr, vision, winapi
 from .vision import Rect
 
 
@@ -95,6 +95,7 @@ class Runner:
         baseline,
         timeout: float,
         threshold: float = 3.0,
+        min_ratio: float = 0.0,
     ) -> tuple[bool, Any]:
         deadline = time.monotonic() + max(0.2, timeout)
         latest = baseline
@@ -104,10 +105,27 @@ class Runner:
                 time.sleep(0.12)
                 continue
             latest = current
-            if vision.looks_changed(baseline, current, threshold):
+            if min_ratio > 0:
+                # 要求"变化面积足够大"，用来区分"面板真的换了"和"某个控件闪了一下"
+                if vision.changed_ratio(baseline, current) >= min_ratio:
+                    return True, current
+            elif vision.looks_changed(baseline, current, threshold):
                 return True, current
             time.sleep(0.12)
         return False, latest
+
+    def _stable_baseline(self, rect: Rect, tries: int = 4):
+        """等画面稳定下来再取基线，避免滚动动画的余波被当成"界面变了"。"""
+
+        previous = self._capture(rect)
+        for _ in range(max(1, tries)):
+            time.sleep(0.25)
+            current = self._capture(rect)
+            if previous is not None and current is not None:
+                if vision.changed_ratio(previous, current) < 0.004:
+                    return current
+            previous = current
+        return previous
 
     def _find_window(self) -> dict[str, Any]:
         keywords = winapi.parse_keywords(str(self.settings.get("target_keywords") or ""))
@@ -139,59 +157,222 @@ class Runner:
 
     # -- 对话切换 ------------------------------------------------------
 
+    def _sidebar_right(self, frame: locator.Frame, composer: Optional[Rect]) -> int:
+        """左侧面板的右边界。识别不出来时按窗口宽度取一个保守值。"""
+
+        limit = composer.left if composer is not None else 0
+        try:
+            edge = vision.detect_sidebar_right(frame.bitmap, limit)
+        except Exception:
+            edge = None
+        if edge and edge > 160:
+            return int(edge)
+        return max(200, int(frame.width * 0.16))
+
+    def _list_region(self, frame: locator.Frame, composer: Optional[Rect]) -> Rect:
+        """侧边栏里"对话列表"所在的那块区域，去掉左侧图标栏。"""
+
+        edge = self._sidebar_right(frame, composer)
+        left = max(0, edge * 13 // 100)
+        bottom = composer.top if composer is not None else int(frame.height * 0.88)
+        return Rect(left, 0, edge, max(left + 60, bottom))
+
+    def _list_rows(self, frame: locator.Frame, composer: Optional[Rect]) -> list[ocr.OcrLine]:
+        """把侧边栏列表读成文字行，坐标换回客户区。"""
+
+        region = self._list_region(frame, composer)
+        crop = frame.bitmap.crop(region.left, region.top, region.right, region.bottom)
+        rows: list[ocr.OcrLine] = []
+        for line in ocr.recognize(crop):
+            if line.width < 24:  # 图标被识别成的单个字符，跳过
+                continue
+            rows.append(
+                ocr.OcrLine(
+                    line.text,
+                    region.left + line.left,
+                    region.top + line.top,
+                    line.width,
+                    line.height,
+                )
+            )
+        return rows
+
+    def _chat_title_lines(self, frame: locator.Frame) -> list[ocr.OcrLine]:
+        """消息区顶部显示的当前对话名。"""
+
+        edge = self._sidebar_right(frame, None)
+        region = Rect(edge + 2, 0, min(frame.width, edge + 1200), 170)
+        crop = frame.bitmap.crop(region.left, region.top, region.right, region.bottom)
+        lines = [line for line in ocr.recognize(crop) if line.width >= 40]
+        return [
+            ocr.OcrLine(line.text, region.left + line.left, region.top + line.top, line.width, line.height)
+            for line in lines
+        ]
+
+    def _conversation_matches(self, frame: locator.Frame, title: str) -> bool:
+        if not title:
+            return True
+        lines = self._chat_title_lines(frame)
+        return ocr.find_line(lines, title, 0.9, strict=True) is not None
+
+    def _verify_conversation(self, hwnd: int, title: str, timeout: float) -> bool:
+        deadline = time.monotonic() + max(0.5, timeout)
+        while time.monotonic() < deadline:
+            try:
+                frame = self._frame(hwnd)
+            except AutomationError:
+                return False
+            if self._conversation_matches(frame, title):
+                return True
+            time.sleep(0.45)
+        return False
+
+    def _composer_empty(self, hwnd: int) -> Optional[bool]:
+        """输入框是否已经回到空状态。识别不了时返回 None。"""
+
+        try:
+            frame = self._frame(hwnd)
+        except AutomationError:
+            return None
+        try:
+            return self._locator().composer_is_empty(frame)
+        except Exception:
+            return None
+
+    def _locate_row(
+        self,
+        hwnd: int,
+        composer: Optional[Rect],
+        title: str,
+        scrolls: int = 8,
+    ) -> tuple[locator.Frame, Optional[ocr.OcrLine]]:
+        """在侧边栏列表里找到标题对应的那一行，必要时滚动列表。
+
+        列表只会往下滚，所以先回到顶部再一屏一屏往下找，
+        否则上一轮留下的滚动位置会让靠上的对话永远找不到。
+        """
+
+        frame = self._frame(hwnd)
+        rows = self._list_rows(frame, composer)
+        row = ocr.find_line(rows, title, 0.9, strict=True)
+        if row is not None:
+            return frame, row
+
+        region = self._list_region(frame, composer)
+        point = frame.point_to_screen(region.center)
+        signature = tuple(item.text for item in rows)
+
+        # 回到顶部：连续上滚，直到列表内容不再变化
+        for _ in range(6):
+            winapi.scroll(point, -10)
+            time.sleep(0.35)
+            frame = self._frame(hwnd)
+            rows = self._list_rows(frame, composer)
+            row = ocr.find_line(rows, title, 0.9, strict=True)
+            if row is not None:
+                return frame, row
+            current = tuple(item.text for item in rows)
+            if current == signature:
+                break
+            signature = current
+
+        # 逐屏向下找
+        for _ in range(max(1, scrolls)):
+            winapi.scroll(point, 6)
+            time.sleep(0.4)
+            frame = self._frame(hwnd)
+            rows = self._list_rows(frame, composer)
+            row = ocr.find_line(rows, title, 0.9, strict=True)
+            if row is not None:
+                return frame, row
+            current = tuple(item.text for item in rows)
+            if current == signature:
+                break
+            signature = current
+            self.log("info", f"列表里没有「{title}」，往下翻一屏继续找。")
+        return frame, None
+
+    def _open_search(self, hwnd: int, frame: locator.Frame, composer: Optional[Rect]) -> bool:
+        """尝试唤出搜索框。先按快捷键，再点记录下来的放大镜位置。
+
+        判定标准是"侧边栏内容大范围变了"：点中某一行的效果只是那一行高亮，
+        面积远小于整个列表被搜索结果替换，两者不会混淆。
+        """
+
+        region = self._list_region(frame, composer)
+        screen_region = frame.to_screen(region)
+        baseline = self._stable_baseline(screen_region)
+        if baseline is None:
+            return False
+
+        winapi.ctrl_k()
+        if self._wait_change(screen_region, baseline, 1.4, min_ratio=0.08)[0]:
+            self.log("info", "搜索框已打开（Ctrl+K）")
+            return True
+
+        point = locator.anchor_point(
+            self.settings.get("anchor_search"),
+            frame.rect,
+            winapi.get_window_rect(hwnd),
+        )
+        if point is None:
+            return False
+        winapi.click(point)
+        if self._wait_change(screen_region, baseline, 1.8, min_ratio=0.08)[0]:
+            self.log("info", "搜索框已打开（放大镜）")
+            return True
+        return False
+
     def _switch_conversation(self, hwnd: int, title: str) -> None:
+        strict = bool(self.settings.get("strict_conversation", True))
         frame = self._frame(hwnd)
         composer, _ = self._locator().composer(frame)
-        point = self._locator().search_point(frame, composer)
-        if point is None:
-            if self.settings.get("strict_conversation", True):
-                raise AutomationError("无法定位左侧搜索框，已停止。可在设置中关闭“对话切换失败时中止”。")
-            self.log("warning", "无法定位左侧搜索框，改为在当前对话发送。")
-            return
-
-        # 切换前先记住右侧消息区的样子：切没切过去，看它变没变。
-        # 搜索不到对话时右侧不会有任何变化，据此可以拦住"发错对话"。
-        region = None
-        baseline = None
-        sidebar_region = None
-        sidebar_baseline = None
-        if composer is not None:
-            region = vision.Rect(composer.left, 0, frame.width, max(1, composer.top))
-            baseline = self._capture(frame.to_screen(region))
-            sidebar_region = vision.Rect(0, 0, max(1, composer.left), max(1, composer.top))
-            sidebar_baseline = self._capture(frame.to_screen(sidebar_region))
-
         self.log("info", f"切换对话：{title}")
-        winapi.click(frame.point_to_screen(point))
-        # 搜索框往往要点一下放大镜才出现，等它真的出来再输入，
-        # 否则这些按键会落到别的控件上。没变化说明搜索框本来就可见，直接输入。
-        if sidebar_region is not None and sidebar_baseline is not None:
-            opened, _ = self._wait_change(frame.to_screen(sidebar_region), sidebar_baseline, 1.5)
-            if opened:
-                self.log("info", "搜索框已打开")
-                time.sleep(0.25)
-        else:
-            time.sleep(self._delay())
-        winapi.ctrl_a()
-        winapi.set_clipboard_text(title)
-        winapi.ctrl_v()
-        time.sleep(self._delay())
-        winapi.press_enter()
-        time.sleep(self._delay())
-        if winapi.foreground_window() != hwnd:
-            raise AutomationError("切换对话后目标窗口失去焦点。")
 
-        if region is None or baseline is None:
-            return
-        switched, _ = self._wait_change(frame.to_screen(region), baseline, 6.0)
-        if switched:
-            return
-        # 目标对话本来就是当前对话时，消息区不会变化，所以这里只提示不中止，
-        # 避免把"本来就在这个对话里"的正常任务拦下来。
-        self.log(
-            "warning",
-            f"没有检测到对话切换：{title}。如果该对话名不存在，消息会发到当前对话。",
-        )
+        # 首选路径：侧边栏列表里本来就有这个对话，直接点它。
+        # 这条路不依赖搜索框，也不用关心应用当前停在哪个对话上。
+        frame, row = self._locate_row(hwnd, composer, title)
+        if row is not None:
+            self._overlay_box(
+                frame.to_screen(Rect(row.left, row.top, row.right, row.bottom)),
+                "search",
+                f"对话 · {row.text}",
+            )
+            winapi.click(frame.point_to_screen(row.center))
+            time.sleep(min(self._delay(), 1.2))
+            if self._verify_conversation(hwnd, title, 6.0):
+                self.log("info", f"已切换到：{title}")
+                return
+            self.log("warning", f"点了「{row.text}」，但标题栏没有变成「{title}」。")
+
+        # 兜底路径：列表里没有（可能折在项目分组里），改用搜索框。
+        if self._open_search(hwnd, frame, composer):
+            region = frame.to_screen(self._list_region(frame, composer))
+            before_typing = self._capture(region)
+            winapi.ctrl_a()
+            winapi.set_clipboard_text(title)
+            winapi.ctrl_v()
+            # 只有确认文字真的进了搜索框，才敢按回车；否则回车可能把别处的
+            # 内容发出去，宁可不切也不发错对话。
+            typed = before_typing is not None and self._wait_change(
+                region, before_typing, 2.0, min_ratio=0.004
+            )[0]
+            if typed:
+                time.sleep(min(self._delay(), 1.0))
+                winapi.press_enter()
+                time.sleep(min(self._delay(), 1.5))
+                if winapi.foreground_window() != hwnd:
+                    raise AutomationError("切换对话后目标窗口失去焦点。")
+                if self._verify_conversation(hwnd, title, 5.0):
+                    self.log("info", f"已切换到：{title}")
+                    return
+            else:
+                self.log("warning", "搜索框没有接收输入，已放弃这次切换。")
+
+        message = f"没能切换到「{title}」，消息会发到当前对话。"
+        if strict:
+            raise AutomationError(f"找不到对话「{title}」，已停止发送。")
+        self.log("warning", message)
 
     # -- 粘贴 ----------------------------------------------------------
 
@@ -331,6 +512,17 @@ class Runner:
                     self.log("warning", "输入框没有清空，补按一次 Enter。")
                     winapi.press_enter()
                     cleared, _ = self._wait_change(send_region, before_send, 4.0)
+                # 像素变化只能说明"输入框动了"，点中麦克风开始录音也算变化。
+                # 真正的判据是占位符回来——那才代表内容被送走了。
+                if self._composer_empty(hwnd) is False:
+                    self.log("warning", "输入框里仍然有内容，补按一次 Enter。")
+                    winapi.press_enter()
+                    time.sleep(min(self._delay(), 1.2))
+                if self._composer_empty(hwnd) is False:
+                    raise AutomationError(
+                        "发送后输入框里仍有内容，消息没有发出去。"
+                        "目标应用可能暂停了这个对话，或额度已经用尽。"
+                    )
                 if not cleared:
                     raise AutomationError("发送后输入框没有清空，消息可能没有发出去。")
             else:

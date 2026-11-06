@@ -134,13 +134,19 @@ class CalibrationDialog(tk.Toplevel):
             self.composer = vision.detect_composer(bitmap)
         except Exception:
             self.composer = None
+        if self.composer is None:
+            try:
+                self.composer = locator.Locator({}, lambda *_: None).composer_by_text(self.frame)
+            except Exception:
+                self.composer = None
         if self.composer is not None:
             try:
                 self.send = vision.detect_send_button(bitmap, self.composer)
             except Exception:
                 self.send = None
             try:
-                self.search = vision.detect_search_field(bitmap, self.composer.left)
+                edge = vision.detect_sidebar_right(bitmap, self.composer.left) or self.composer.left
+                self.search = vision.detect_search_field(bitmap, edge)
             except Exception:
                 self.search = None
         else:

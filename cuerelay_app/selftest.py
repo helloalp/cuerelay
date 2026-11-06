@@ -13,7 +13,7 @@ import tempfile
 from pathlib import Path
 from typing import Callable, List, Tuple
 
-from . import vision
+from . import ocr, vision
 from .config import parse_datetime
 from .imaging import Bitmap
 from .store import TaskStore, advance_next_run_past_now, duplicate_groups
@@ -168,6 +168,112 @@ def test_full_window_layout() -> None:
     assert search is not None, "整窗识别没有找到搜索框"
     assert abs(search.top - 60) <= 2, search
     assert abs(search.bottom - 96) <= 2, search
+
+
+def test_panel_layout() -> None:
+    """三栏布局下，消息区边界和输入框都必须落在正确位置。
+
+    右侧展开代码面板时，输入框不再居中；如果还按整窗宽度取样，
+    采样列会有一半落到面板上，输入框就识别不出来。
+    """
+
+    panels: List[Tuple[Tuple[int, int, int, int], Color]] = [
+        ((0, 0, 40, 600), (26, 26, 26)),  # 图标栏
+        ((40, 0, 240, 600), (28, 28, 28)),  # 侧边栏
+        ((240, 0, 242, 600), (52, 52, 54)),  # 侧边栏分隔线
+        ((900, 0, 902, 600), (52, 52, 54)),  # 消息区 / 代码面板分隔线
+        ((300, 470, 800, 560), (48, 48, 48)),  # 输入框（偏左，不居中）
+        ((760, 500, 792, 532), (60, 90, 220)),  # 发送按钮
+    ]
+    bitmap = make_bitmap(1000, 600, (24, 24, 24), panels)
+
+    dividers = vision.detect_panels(bitmap)
+    assert 240 in dividers and 900 in dividers, dividers
+
+    left, right = vision.detect_chat_bounds(bitmap)
+    assert left == 240, (left, right)
+    assert right == 900, (left, right)
+    assert vision.detect_sidebar_right(bitmap) == 240
+
+    composer = vision.detect_composer(bitmap)
+    assert composer is not None, "三栏布局下没有识别到输入框"
+    assert abs(composer.left - 300) <= 2, composer
+    assert abs(composer.right - 800) <= 2, composer
+
+    point = vision.detect_send_button(bitmap, composer)
+    assert point is not None, "三栏布局下没有识别到发送按钮"
+    assert abs(point[0] - 776) <= 3, point
+
+
+def test_send_button_ignores_thin_icon() -> None:
+    """麦克风这种细线条图标不能被当成发送按钮。
+
+    真机上曾经出现过：识别出的输入框比实际矮一点，发送按钮下半截被 ROI 切掉，
+    于是退而选中了左边的麦克风，一点就开始录音。
+    """
+
+    panels: List[Tuple[Tuple[int, int, int, int], Color]] = [
+        ((150, 430, 611, 500), (46, 46, 46)),
+        ((520, 456, 528, 482), (200, 200, 200)),  # 麦克风：窄条
+        ((560, 456, 586, 482), (60, 90, 220)),  # 发送：实心圆
+    ]
+    bitmap = make_bitmap(760, 560, (30, 30, 30), panels)
+    composer = vision.Rect(150, 430, 611, 500)
+    point = vision.detect_send_button(bitmap, composer)
+    assert point is not None, "没有识别到发送按钮"
+    assert abs(point[0] - 572) <= 3, point
+
+    # 输入框识别得偏矮时，仍然要选中发送按钮，而不是麦克风
+    short = vision.Rect(150, 430, 611, 490)
+    point = vision.detect_send_button(bitmap, short)
+    assert point is not None, "输入框偏矮时没有识别到发送按钮"
+    assert abs(point[0] - 572) <= 3, point
+
+
+def test_panel_around_seed() -> None:
+    """从一个已知属于输入框的点出发，能扩出整个输入框。"""
+
+    bitmap = make_bitmap(
+        800,
+        600,
+        (24, 24, 24),
+        [((200, 470, 700, 560), (48, 48, 48))],
+    )
+    rect = vision.detect_panel_around(bitmap, 220, 500)
+    assert rect is not None, "没有从种子点扩出面板"
+    assert abs(rect.left - 200) <= 2, rect
+    assert abs(rect.right - 700) <= 2, rect
+    assert abs(rect.top - 470) <= 2, rect
+    assert abs(rect.bottom - 560) <= 2, rect
+
+
+def test_title_matching_is_strict() -> None:
+    """对话标题只能"完全一致"或"一方包含另一方"。
+
+    两个只差几个数字的标题字符相似度能到 0.9，用编辑距离会把消息发错对话。
+    """
+
+    assert ocr.title_similarity("Clarify say", "Clarify say") == 1.0
+    assert ocr.title_similarity("B 20261103 31 Big LiquidGlass", "20261103 31 Big LiquidGlass") > 0.9
+    assert ocr.title_similarity("Helloalp Read 20261012 1", "Helloalp Read 20261010 1") == 0.0
+    assert ocr.title_similarity("Helloalp Website 20261023 1", "Helloalp Resume 20261105 1") == 0.0
+
+    lines = [
+        ocr.OcrLine("Helloalp Read 20261010 1", 10, 10, 200, 20),
+        ocr.OcrLine("Helloalp Read 20261012 1", 10, 40, 200, 20),
+    ]
+    found = ocr.find_line(lines, "Helloalp Read 20261012 1", 0.9, strict=True)
+    assert found is not None and found.text == "Helloalp Read 20261012 1", found
+    assert ocr.find_line(lines, "Helloalp Read 20261011 1", 0.9, strict=True) is None
+
+
+def test_placeholder_matching_is_lenient() -> None:
+    """占位符允许 OCR 出错：with 常被读成 vvith。"""
+
+    assert ocr.similarity("work vvith Codex", "Work with Codex") > 0.62
+    assert ocr.find_text([ocr.OcrLine("work vvith Codex", 10, 10, 150, 20)], "Work with Codex", 0.62)
+    # 但"Reset usage"这种短词不能算成 "Message"
+    assert ocr.similarity("Reset usage", "Message") < 0.78
 
 
 def test_rect_scaling() -> None:
@@ -386,7 +492,12 @@ TESTS: List[Tuple[str, Callable[[], None]]] = [
     ("输入框识别", test_composer_detection),
     ("输入框识别（含文字）", test_composer_with_text_lines),
     ("发送按钮识别", test_send_button_detection),
+    ("发送按钮避开麦克风", test_send_button_ignores_thin_icon),
     ("整窗识别", test_full_window_layout),
+    ("三栏布局", test_panel_layout),
+    ("面板扩展", test_panel_around_seed),
+    ("标题严格匹配", test_title_matching_is_strict),
+    ("占位符宽松匹配", test_placeholder_matching_is_lenient),
     ("界面变化检测", test_change_detection),
     ("短消息变化检测", test_sparse_change_detection),
     ("矩形缩放", test_rect_scaling),

@@ -9,9 +9,23 @@ from __future__ import annotations
 
 from typing import Callable, Optional
 
-from . import imaging, vision, winapi
+from . import imaging, ocr, vision, winapi
 from .imaging import Bitmap
 from .vision import Rect
+
+# 输入框空着时，它里面那行占位文字是最可靠的锚点。
+# 面板识别靠"均匀色块 + 上下长边缘"，一旦窗口变成三栏、或者输入框不再居中，
+# 采样列就会落到面板外面；而占位文字永远在输入框里。
+# 顺序有意义：先试应用专属的长文案，最后才是 "Message" 这种到处都是的短词。
+COMPOSER_PLACEHOLDERS = (
+    "Work with Codex",
+    "Ask anything",
+    "Do anything",
+    "Send a message",
+    "随便说点什么",
+    "给 Codex 发送消息",
+    "Message",
+)
 
 
 class Frame:
@@ -123,8 +137,91 @@ class Locator:
     def recognition_enabled(self) -> bool:
         return bool(self.settings.get("recognition_enabled", True))
 
+    def composer_by_text(self, frame: Frame) -> Optional[Rect]:
+        """输入框为空时，用占位符文字反推整个输入框的位置。"""
+
+        if not ocr.available():
+            return None
+        # 只看窗口最下面这一条：占位符一定在这里，正文里偶然出现的同名词不会混进来。
+        region = Rect(0, int(frame.height * 0.65), frame.width, frame.height)
+        if region.height < 60:
+            return None
+        crop = frame.bitmap.crop(region.left, region.top, region.right, region.bottom)
+        lines = ocr.recognize(crop)
+        if not lines:
+            return None
+
+        chat_left, chat_right = vision.detect_chat_bounds(frame.bitmap)
+
+        def derive(line: ocr.OcrLine) -> Optional[Rect]:
+            rect = vision.detect_panel_around(
+                frame.bitmap,
+                region.left + max(1, line.left - 12),
+                region.top + line.center[1],
+                probe_y=region.top + line.bottom + 6,
+            )
+            if rect is None:
+                return None
+            # 输入框必须贴着窗口底部、有正常宽度，而且落在消息区里面。
+            # 少了最后这条，横幅按钮上的"Reset usage"之类会被当成占位符。
+            if rect.bottom < frame.height * 0.85 or rect.width < 200:
+                return None
+            if rect.left < chat_left - 8 or rect.right > chat_right + 8:
+                return None
+            return rect
+
+        for placeholder in COMPOSER_PLACEHOLDERS:
+            line = ocr.find_text(lines, placeholder, 0.62)
+            if line is None:
+                continue
+            rect = derive(line)
+            if rect is not None:
+                return rect
+
+        # 没有占位符说明输入框里已经有内容了。这时候窗口里最靠下的那段文字
+        # 一定在输入框里（消息区的内容不会贴到窗口底边），拿它当锚点一样准。
+        # 输入框右下角那排小字（模型名、权限）常常也落在候选里，所以多试几行。
+        candidates = [line for line in lines if region.left + line.left >= chat_left]
+        for line in sorted(candidates, key=lambda item: item.bottom, reverse=True)[:8]:
+            rect = derive(line)
+            if rect is not None:
+                return rect
+        return None
+
+    def composer_is_empty(self, frame: Frame) -> Optional[bool]:
+        """输入框是不是空的（占位符文字回来了）。
+
+        发送成功的判据。像素"变了"靠不住：点错按钮、弹出提示、开始录音
+        都会让输入框变化，只有占位符回来才说明内容真的被送走了。
+        识别不了时返回 None，由调用方决定怎么处理。
+        """
+
+        if not ocr.available():
+            return None
+        region = Rect(0, int(frame.height * 0.55), frame.width, frame.height)
+        if region.height < 60:
+            return None
+        crop = frame.bitmap.crop(region.left, region.top, region.right, region.bottom)
+        lines = ocr.recognize(crop)
+        if not lines:
+            return None
+        for placeholder in COMPOSER_PLACEHOLDERS:
+            if ocr.find_text(lines, placeholder, 0.62) is not None:
+                return True
+        return False
+
     def composer(self, frame: Frame) -> tuple[Optional[Rect], str]:
         if self.recognition_enabled:
+            # 先看占位符：它是"这里确实是输入框"的直接证据。像素面板识别在
+            # 空白较多的界面上容易把一大片背景当成输入框，点下去就全错了。
+            try:
+                from_text = self.composer_by_text(frame)
+            except Exception as exc:
+                self.log("warning", f"输入框文字识别异常：{exc}")
+                from_text = None
+            if from_text is not None:
+                return from_text, "识别"
+
             try:
                 detected = vision.detect_composer(frame.bitmap)
             except Exception as exc:  # 识别永远不应该让任务直接崩掉
@@ -142,7 +239,9 @@ class Locator:
             return fallback, "锚点"
         return None, "失败"
 
-    def send_point(self, frame: Frame, composer: Rect) -> Optional[tuple[int, int]]:
+    def send_point(self, frame: Frame, composer: Optional[Rect]) -> Optional[tuple[int, int]]:
+        if composer is None:
+            return None
         if self.recognition_enabled:
             try:
                 detected = vision.detect_send_button(frame.bitmap, composer)
@@ -164,7 +263,8 @@ class Locator:
     def search_point(self, frame: Frame, composer: Optional[Rect]) -> Optional[tuple[int, int]]:
         if self.recognition_enabled and composer is not None:
             try:
-                field = vision.detect_search_field(frame.bitmap, composer.left)
+                edge = vision.detect_sidebar_right(frame.bitmap, composer.left) or composer.left
+                field = vision.detect_search_field(frame.bitmap, edge)
             except Exception as exc:
                 self.log("warning", f"搜索框识别异常：{exc}")
                 field = None
