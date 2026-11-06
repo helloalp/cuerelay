@@ -428,8 +428,9 @@ class Runner:
             time.sleep(min(self._delay(), 1.2))
             self.log("info", f"点开了「{stripped}」，继续找。")
             return True
-        return False    # 搜索面板里的分组标题。有它们就说明面板开着。
-    # 面板空着的时候是「Quick actions」，输入关键词之后变成「Chats」。
+        return False    # 搜索面板是**分组**的：命令在「Quick actions」下，对话在「Chats」下，
+    # 文件在「Recent files」下。搜一个词往往三边都有结果，所以"认出一行字
+    # 像目标标题"远远不够——必须先确定这一行属于哪个分组。
     SEARCH_HEADERS = frozenset(
         ocr.normalize(item)
         for item in (
@@ -442,12 +443,64 @@ class Runner:
         )
     )
 
+    # 只有这些分组里装的是对话。切对话只在这里面找，文件、命令一律不碰。
+    CHAT_SECTIONS = frozenset(ocr.normalize(item) for item in ("Chats", "聊天"))
+
+    # 面板里可能出现的其它分组标题。它们不装对话，但用来划出「Chats」
+    # 这个分组的下边界——不然文件行会被当成对话。
+    OTHER_SECTIONS = frozenset(
+        ocr.normalize(item)
+        for item in (
+            "Files",
+            "Recent files",
+            "Actions",
+            "Text",
+            "Projects",
+            "Snippets",
+            "Messages",
+            "文件",
+            "最近文件",
+            "操作",
+            "项目",
+            "片段",
+        )
+    )
+
     # 面板浮在窗口水平方向的正中，左边那一窄条是原来的对话列表。只在这个
     # 范围里找，侧边栏里同名的行就不会被当成面板的一部分。
     PANEL_SPAN = (0.22, 0.78)
 
     def _panel_span(self, frame: locator.Frame) -> tuple[float, float]:
         return frame.width * self.PANEL_SPAN[0], frame.width * self.PANEL_SPAN[1]
+
+    @staticmethod
+    def _is_title(text: str, titles: frozenset[str]) -> bool:
+        """这段文字是不是其中一个分组标题。
+
+        后面最多容忍两个字符：OCR 会把「Chats」读成「Chats O」。再长就不认
+        了——「ChatGPT can edit any file...」绝不能当成「Chat」这个标题。
+        """
+
+        key = ocr.normalize(text)
+        if not key:
+            return False
+        for head in titles:
+            if key == head:
+                return True
+            if key.startswith(head) and len(key) <= len(head) + 2:
+                return True
+        return False
+
+    @staticmethod
+    def _at_panel_left(line: ocr.OcrLine, column: int) -> bool:
+        """这一行是不是贴着面板左边缘排的。
+
+        面板底部那排筛选标签（All / Actions / Chats / Files / Text）是横着
+        排开的一排，「All」贴着左边缘，后面的依次右移。分组标题永远贴着左
+        边缘，靠这一点把"分组标题"和"筛选标签里那个同名标签"分开。
+        """
+
+        return column - 40 <= line.left <= column + 60
 
     def _panel_anchor(self, lines: list[ocr.OcrLine], frame: locator.Frame) -> Optional[ocr.OcrLine]:
         """面板最上面那个分组标题。
@@ -457,63 +510,145 @@ class Runner:
 
         三条限制都是被真实画面逼出来的：
           · 只在中段找，左边侧边栏和右边面板的文字一律不算；
-          · 只在上半部分找，对话正文里的「Chats ...」不会跑进来；
-          · 标题后面最多容忍两个字符，OCR 会把「Chats」读成「Chats O」，
-            但绝不能把「ChatGPT can edit any file...」当成标题。
+          · 只在上半部分找：面板是垂直居中的，第一个分组标题一定在面板
+            上半截里。这条同时把面板底部那排筛选标签排掉了——那排里也有
+            一个「Chats」，认错它会把"输入框"算到面板底部去；
+          · 标题后面最多容忍两个字符，见 _is_title。
         """
 
         low, high = self._panel_span(frame)
-        ceiling = frame.height * 0.7
+        ceiling = frame.height * 0.55
         inside = [
             line for line in lines if 40 < line.top < ceiling and low < line.left < high
         ]
         inside.sort(key=lambda line: line.top)
         for line in inside:
-            key = ocr.normalize(line.text)
-            for head in self.SEARCH_HEADERS:
-                if key == head:
-                    return line
-                if key.startswith(head) and len(key) <= len(head) + 2:
-                    return line
+            if self._is_title(line.text, self.SEARCH_HEADERS):
+                return line
+        return None
+
+    def _chat_section(
+        self, lines: list[ocr.OcrLine], column: int
+    ) -> Optional[ocr.OcrLine]:
+        """面板里装对话的那个分组标题。
+
+        贴着面板左边缘、认成「Chats」的那一行才算。底部筛选标签里也有一个
+        「Chats」，它在面板中间偏右，不会被认成这里的分组标题。
+        """
+
+        for line in sorted(lines, key=lambda item: item.top):
+            if line.top <= 40:
+                continue
+            if not self._at_panel_left(line, column):
+                continue
+            if self._is_title(line.text, self.CHAT_SECTIONS):
+                return line
+        return None
+
+    def _section_bounds(
+        self, lines: list[ocr.OcrLine], header: ocr.OcrLine, column: int, floor: int = 0
+    ) -> tuple[int, int]:
+        """一个分组的上边界和下边界。
+
+        下一个贴着左边缘的标题就是它的结尾；最后一个分组没有下一个标题，
+        就用面板底部那排筛选标签的位置收尾。两个都没有才按固定高度兜底。
+        """
+
+        titles = self.SEARCH_HEADERS | self.OTHER_SECTIONS
+        ends = [
+            line.top
+            for line in lines
+            if line.top > header.top + 6
+            and self._at_panel_left(line, column)
+            and self._is_title(line.text, titles)
+        ]
+        if floor > header.top:
+            ends.append(floor)
+        return header.top + 6, min(ends) if ends else header.top + 900
+
+    # 面板底部那排筛选标签。面板一打开它就在，加载中、没结果时都在，
+    # 所以它是"面板开着"最稳的证据。分组标题反而要等结果出来才有。
+    FILTER_LABELS = frozenset(
+        ocr.normalize(item)
+        for item in ("All", "Actions", "Chats", "Files", "Text", "全部", "操作", "聊天", "文件", "文本")
+    )
+
+    def _filter_row(self, lines: list[ocr.OcrLine], frame: locator.Frame) -> list[ocr.OcrLine]:
+        """面板底部那排筛选标签，从左到右。
+
+        只认"同一行上至少三个标签"的组合：单独一个「Chats」可能只是分组
+        标题，三个以上挨着排开才说明这是那排标签。
+        """
+
+        low, high = self._panel_span(frame)
+        candidates = [
+            line for line in lines if low < line.left < high and ocr.normalize(line.text) in self.FILTER_LABELS
+        ]
+        groups: list[list[ocr.OcrLine]] = []
+        for line in candidates:
+            for group in groups:
+                if abs(line.top - group[0].top) <= 8:
+                    group.append(line)
+                    break
+            else:
+                groups.append([line])
+        if not groups:
+            return []
+        best = max(groups, key=len)
+        if len(best) < 3:
+            return []
+        return sorted(best, key=lambda item: item.left)
+
+    def _panel_column(
+        self, lines: list[ocr.OcrLine], frame: locator.Frame
+    ) -> Optional[int]:
+        """面板的左边缘对齐在哪一列。
+
+        底部那排筛选标签最可靠：面板一打开它就在，加载中、没结果时都在，
+        五个标签的第一个就贴着面板的左边缘。分组标题只在有结果时才有，
+        拿它当备选。
+        """
+
+        row = self._filter_row(lines, frame)
+        if row:
+            return row[0].left
+        anchor = self._panel_anchor(lines, frame)
+        if anchor is not None:
+            return anchor.left
         return None
 
     def _search_input(self, hwnd: int) -> tuple[locator.Frame, Optional[Rect]]:
         """找搜索面板的输入框，返回它在客户区里的矩形。
 
-        面板浮在窗口正中：最上面是输入框，下面是一行分组标题（空着的时候是
-        「Quick actions」，输入之后是「Chats」）。所以先认分组标题确认面板开着，
-        输入框就是它上面那一行。
+        输入框是面板最上面那一行字，而且贴着面板的左边缘。所以先确定面板
+        左边缘在哪一列，再取那一列里最靠上的一行。
 
         不靠占位文字认输入框：搜过一次之后词会留在框里，占位文字就没了，
         按"Search ChatGPT"去找会一直找不到——明明面板就在眼前。
+
+        面板是居中的，所以右边缘可以按"和左边缘对称"算出来，比拿某一行的
+        右端去量准：面板右边还压着对话正文，正文里那些长行会把框拉出去。
         """
 
         frame = self._frame(hwnd)
         lines = ocr.recognize(frame.bitmap)
-        mark = self._panel_anchor(lines, frame)
-        if mark is None:
+        column = self._panel_column(lines, frame)
+        if column is None:
             return frame, None
 
-        # 面板里所有的字，用来量面板有多宽：最左的那行是行首图标，最右的
-        # 那行是右侧的快捷键（Ctrl+N）或项目名。
-        inside = [
-            line
-            for line in lines
-            if mark.top - 100 <= line.top <= mark.top + 700 and line.left >= mark.left - 40
+        row = self._filter_row(lines, frame)
+        floor = row[0].top - 40 if row else frame.height
+        column_lines = [
+            line for line in lines if column - 20 <= line.left <= column + 40 and line.top < floor
         ]
-        left = min((line.left for line in inside), default=mark.left) - 12
-        right = max((line.right for line in inside), default=mark.right) + 12
+        if not column_lines:
+            return frame, None
+        first = min(column_lines, key=lambda line: line.top)
 
-        # 输入框里那一行字：标题正上方最近的一行
-        above = [line for line in inside if line.bottom < mark.top - 6 and line.top > mark.top - 100]
-        if above:
-            top = min(line.top for line in above) - 12
-            bottom = max(line.bottom for line in above) + 12
-        else:
-            # 输入框空着，认不到字：按标题的位置往上退一行。
-            top = mark.top - 62
-            bottom = mark.top - 22
-        return frame, Rect(left, max(0, top), right, bottom)
+        low, high = self._panel_span(frame)
+        left_edge = max(low, min(column - 30, high - 200))
+        right_edge = min(high, max(frame.width - left_edge, left_edge + 200))
+        return frame, Rect(left_edge + 12, max(0, first.top - 12), right_edge - 12, first.bottom + 12)
 
     # 标题栏那一行（「Codex ⌄」+ 铃铛 + 放大镜）的垂直位置。窗口大小变了、
     # 缩放比例变了它都不动，所以先按这个固定范围扫，扫不到再用 OCR 认「Codex」。
@@ -579,46 +714,107 @@ class Runner:
         left, end = icons[-1]
         return ((left + end) // 2, (top + bottom) // 2)
 
-    def _result_lines(
-        self, lines: list[ocr.OcrLine], width: int, below: Rect
-    ) -> list[ocr.OcrLine]:
-        """搜索面板结果区里的候选行。
+    def _section_rows(
+        self, lines: list[ocr.OcrLine], top: int, bottom: int, column: int
+    ) -> list[list[ocr.OcrLine]]:
+        """把一个分组里的文字按"行"归并起来。
 
-        三个条件：在输入框下面、贴着面板的左边缘、在窗口水平方向的中段。
+        OCR 经常把一行拆成好几段：行首图标一段、标题一段、右边还有项目名和
+        快捷键一段（`0 20261107` + `32 Big LiquidGlass` + `henu classroom`）。
+        按纵向位置叠在一起的就当成同一行。
 
-        「贴着面板左边缘」是最要紧的一条。搜索面板是浮在对话正文上面的，
-        正文里完全可能出现一行字就叫「20261021 18」——只按文字相似度挑，
-        会挑中正文里那一行，点下去等于什么都没做（真的踩过）。结果行的行首
-        永远和输入框里的字对齐，正文的行首要靠右得多。
+        两边的都不要：右边是项目名和快捷键，太远会把标题淹掉；左边那一栏是
+        原来的对话列表，标题长得一模一样——它不在面板里，点它等于没搜索。
         """
 
-        low = width * self.PANEL_SPAN[0]
-        high = width * self.PANEL_SPAN[1]
-        return [
+        inside = [
             line
             for line in lines
-            if line.top > below.bottom + 8
-            and low < line.left < high
-            and below.left - 20 <= line.left <= below.left + 140
+            if top < line.top < bottom and column - 60 <= line.left <= column + 200
         ]
+        inside.sort(key=lambda line: (line.top, line.left))
+        rows: list[list[ocr.OcrLine]] = []
+        for line in inside:
+            for row in rows:
+                head = row[0]
+                overlap = min(head.bottom, line.bottom) - max(head.top, line.top)
+                if overlap >= 0.4 * min(head.height, line.height):
+                    row.append(line)
+                    break
+            else:
+                rows.append([line])
+        for row in rows:
+            row.sort(key=lambda item: item.left)
+        return rows
 
-    def _search_result(
-        self, hwnd: int, title: str, below: Rect
-    ) -> tuple[locator.Frame, Optional[ocr.OcrLine]]:
-        """在搜索面板的结果列表里找标题那一行。
+    def _best_row(
+        self, rows: list[list[ocr.OcrLine]], title: str
+    ) -> Optional[ocr.OcrLine]:
+        """挑出最像目标标题的那一行，返回能点的那一块。
 
-        结果不是瞬间出来的：等不到就再看一眼，最多三眼。
+        一行的几段文字要合起来比：标题被拆成两段时，单独一段都不像，拼起来
+        才像。但右边的项目名拼进去反而会把相似度拉低，所以按"从左边开始的
+        前几段"逐个比，取最好的那个，不做整行硬拼。
+
+        不要求一模一样：结果行前面常带着一个图标，OCR 会把它读成 "0" 或者
+        一个字母（`0 20261021 18`）。阈值放在 0.75——低于这个就宁可认成没
+        找到，也不乱点一条别的对话。
         """
 
-        for attempt in range(3):
+        best: Optional[ocr.OcrLine] = None
+        score = 0.0
+        for row in rows:
+            for take in range(1, len(row) + 1):
+                head = row[:take]
+                text = " ".join(item.text for item in head)
+                value = ocr.title_similarity(text, title)
+                if value <= score:
+                    continue
+                left = min(item.left for item in head)
+                top = min(item.top for item in head)
+                right = max(item.right for item in head)
+                bottom = max(item.bottom for item in head)
+                best = ocr.OcrLine(text, left, top, right - left, bottom - top)
+                score = value
+        return best if score >= 0.75 else None
+
+
+    def _search_result(
+        self, hwnd: int, title: str, timeout: float = 4.0
+    ) -> tuple[locator.Frame, Optional[ocr.OcrLine]]:
+        """在搜索面板「Chats」那个分组里找标题那一行。
+
+        面板是分组的，同一个词会同时搜出对话、文件和命令。切对话只认
+        「Chats」分组里的行——文件行长得再像也不行，点下去打开的是文件。
+
+        分组要等结果出来才有，所以"没看到分组"不等于"没有结果"：可能还在
+        加载。给它几秒，最后仍然没有「Chats」分组，才下结论说这个词在对话里
+        没有结果。
+        """
+
+        deadline = time.monotonic() + max(1.0, timeout)
+        frame = self._frame(hwnd)
+        while True:
             frame = self._frame(hwnd)
-            lines = self._result_lines(ocr.recognize(frame.bitmap), frame.width, below)
-            hit = self._best_title(lines, title)
-            if hit is not None:
-                return frame, hit
-            if attempt < 2:
-                time.sleep(0.6)
-        return self._frame(hwnd), None
+            lines = ocr.recognize(frame.bitmap)
+            column = self._panel_column(lines, frame)
+            chat = self._chat_section(lines, column) if column is not None else None
+            if chat is not None:
+                row = self._filter_row(lines, frame)
+                floor = row[0].top - 40 if row else 0
+                top, bottom = self._section_bounds(lines, chat, column, floor)
+                hit = self._best_row(self._section_rows(lines, top, bottom, column), title)
+                if hit is not None:
+                    return frame, hit
+            if time.monotonic() >= deadline:
+                break
+            time.sleep(0.6)
+
+        if chat is None:
+            self.log("info", f"搜索结果里没有对话分组，「{title}」不是一个对话。")
+        return frame, None
+
+
 
 
 
@@ -639,30 +835,14 @@ class Runner:
             return rest
         return cleaned
 
-    @staticmethod
-    def _best_title(lines: list[ocr.OcrLine], title: str) -> Optional[ocr.OcrLine]:
-        """挑出最像目标标题的那一行。
-
-        不要求一模一样：搜索结果前面常带着一个图标，OCR 会把它读成 "0" 或者
-        一个字母（"0 20261021 18"）。按相似度取最高的那一行，阈值放在
-        0.75——低于这个就宁可认成没找到，也不乱点一条别的对话。
-        """
-
-        best = None
-        score = 0.0
-        for line in lines:
-            value = ocr.title_similarity(line.text, title)
-            if value > score:
-                best, score = line, value
-        return best if score >= 0.75 else None
-
     def _open_search(
         self, hwnd: int, frame: locator.Frame, note: Optional[Callable[[str], None]] = None
     ) -> tuple[Optional[locator.Frame], Optional[Rect]]:
         """点放大镜打开搜索面板，返回面板所在画面和输入框的矩形。
 
         只走放大镜这一条路：标题栏里那个图标点下去，面板浮到窗口正中。
-        开没开不看像素变化，看画面上有没有分组标题——面板在，标题就在。
+        开没开不看像素变化，看画面上有没有面板自己的东西——分组标题或者
+        底部那排筛选标签，有一样在就说明面板在。
         """
 
         if winapi.foreground_window() != int(hwnd):
@@ -757,7 +937,9 @@ class Runner:
         if box is not None and fresh is not None:
             note("输入关键词")
             time.sleep(self.BOX_DWELL)
-            winapi.click(fresh.point_to_screen(box.center))
+            # 点输入框靠左的位置，不点正中：面板右边还压着对话正文，框量得
+            # 宽一点窄一点都可能，但贴着左边缘的这一段一定在输入框里。
+            winapi.click(fresh.point_to_screen((box.left + 120, box.center[1])))
             time.sleep(0.3)
             winapi.ctrl_a()
             winapi.set_clipboard_text(title)
@@ -768,7 +950,7 @@ class Runner:
             # 结果就在输入框下面。认出哪一行是目标，框住它，再点——
             # 比按回车稳：回车落在"当前高亮的那一条"，而高亮在哪并不确定。
             note("选中结果")
-            frame, hit = self._search_result(hwnd, title, box)
+            frame, hit = self._search_result(hwnd, title)
             if hit is not None:
                 shown = self._result_label(hit.text, title)
                 self._overlay_box(

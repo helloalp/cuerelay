@@ -1020,13 +1020,45 @@ def test_window_pick_skips_tool() -> None:
         winapi.windows_for_process, winapi.is_tool_window = saved
 
 
-def test_search_panel_anchor() -> None:
-    """搜索面板靠分组标题定位，标题认错就会把整条链路带偏。
+def _panel_lines() -> list:
+    """一段真实的搜索面板识别结果（3840x2115 客户区，搜 "20261107"）。
 
-    真实画面里踩过两次：
+    面板同时有两个分组：上面是对话，下面是文件。截图核对过。
+    """
+
+    from . import ocr
+
+    def line(text: str, left: int, top: int, width: int, height: int) -> ocr.OcrLine:
+        return ocr.OcrLine(text, left, top, width, height)
+
+    return [
+        line("20261107", 1370, 700, 104, 32),                    # 输入框里的关键词
+        line("Chats n", 1368, 774, 74, 15),                      # 对话分组（旁边有个转圈图标）
+        line("0 20261107", 1368, 817, 124, 20),                  # 对话结果：标题前半段
+        line("32 Big LiquidGlass", 1499, 820, 167, 21),          # 对话结果：标题后半段
+        line("henu classroom", 2263, 819, 136, 15),              # 对话结果：右侧项目名
+        line("Files", 1369, 872, 36, 15),                        # 文件分组
+        line("2026-11", 1402, 920, 73, 15),                      # 文件结果
+        line("07-liquid-glass-c52.md docs/history", 1487, 918, 332, 22),
+        line("2026-11", 1402, 972, 73, 15),
+        line("07-liquid-glass-c52-review.md docs/history", 1487, 970, 399, 22),
+        line("All", 1369, 1397, 24, 16),                         # 底部筛选标签
+        line("Actions", 1431, 1397, 71, 16),
+        line("Chats", 1540, 1397, 53, 16),
+        line("Files", 1632, 1397, 40, 16),
+        line("Text", 1709, 1398, 40, 15),
+    ]
+
+
+def test_search_panel_anchor() -> None:
+    """搜索面板靠分组标题和底部标签定位，认错就会把整条链路带偏。
+
+    真实画面里踩过三次：
       · 面板空着时第一行标题是「Quick actions」，输入关键词后变成「Chats」；
       · 「ChatGPT can edit any file...」这句提示语曾经被当成「Chat」这个标题，
-        于是"输入框"被算到了窗口底部，点下去把面板关掉了。
+        于是"输入框"被算到了窗口底部，点下去把面板关掉了；
+      · 面板底部那排筛选标签里也有一个「Chats」，它比真标题低得多，被当成
+        标题之后"输入框"被算到了面板最下面。
     """
 
     from . import automation, locator, ocr
@@ -1050,13 +1082,14 @@ def test_search_panel_anchor() -> None:
     assert mark is not None and mark.text == "Chats O", mark
 
     # 正文里以 ChatGPT 开头的提示语不能当成标题
-    assert runner._panel_anchor([line("ChatGPT can edit any file and run commands", 1734, 1815)], frame) is None
+    body = line("ChatGPT can edit any file and run commands", 1734, 1815)
+    assert runner._panel_anchor([body], frame) is None
 
     # 侧边栏里的文字不算：横向中段以外
     assert runner._panel_anchor([line("Chats", 102, 774)], frame) is None
 
-    # 窗口下半部分的文字也不算
-    assert runner._panel_anchor([line("Chats", 1368, 1900)], frame) is None
+    # 面板底部那排筛选标签里的「Chats」不能当成标题
+    assert runner._panel_anchor([line("Chats", 1540, 1397)], frame) is None
 
     # 两个标题都在时取最靠上的那个
     both = [line("Chats", 1368, 924), line("Quick actions", 1368, 774)]
@@ -1064,48 +1097,72 @@ def test_search_panel_anchor() -> None:
     assert mark is not None and mark.text == "Quick actions", mark
 
 
-def test_search_result_pick() -> None:
-    """结果行必须贴着面板左边缘，正文里同名的那一行不能算。
+def test_search_panel_column() -> None:
+    """面板左边缘靠底部那排筛选标签来定，加载中和没结果时也定得住。"""
 
-    实测画面：面板里的结果是 `0 20261021 18`（x=1368），对话正文里另有一行
-    一模一样的 `20261021 18`（x=1677）。只按文字相似度挑，会挑中正文那一行，
-    点下去什么也不会发生。
-    """
-
-    from . import automation, ocr
-    from .vision import Rect
+    from . import automation, locator, ocr
 
     runner = automation.Runner(
         {"step_delay_seconds": 0.4, "recognition_enabled": True},
         lambda level, message: None,
     )
-    input_box = Rect(1356, 697, 2743, 738)
+    rect = {"left": 0, "top": 0, "right": 3840, "bottom": 2115, "width": 3840, "height": 2115}
+    frame = locator.Frame(0, rect, make_bitmap(3840, 2115, (24, 24, 24), []))
+    lines = _panel_lines()
 
-    def line(text: str, left: int, top: int, width: int = 153, height: int = 20) -> ocr.OcrLine:
-        return ocr.OcrLine(text, left, top, width, height)
+    row = runner._filter_row(lines, frame)
+    assert [item.text for item in row] == ["All", "Actions", "Chats", "Files", "Text"], row
+    assert runner._panel_column(lines, frame) == 1369
 
-    lines = [
-        line("20261021 14", 1370, 700, 136, 32),        # 输入框里的关键词
-        line("Chats", 1368, 774, 48, 15),               # 分组标题
-        line("0 20261021 18", 1368, 817),               # 真正的结果
-        line("henu classroom", 2263, 819, 136, 15),     # 结果行右侧的项目名
-        line("20261021 18", 1677, 1968, 118, 15),       # 正文里的同名文字
-        line("All", 1369, 1397, 24, 16),                # 底部的筛选标签
-    ]
-    picked = runner._result_lines(lines, 3840, input_box)
-    texts = [item.text for item in picked]
-    assert "20261021 14" not in texts, "输入框里的关键词不是结果"
-    assert "20261021 18" not in texts, "正文里的同名文字不是结果"
-    assert "henu classroom" not in texts, "结果行右侧的项目名不是结果"
+    # 只剩一个标签的时候不算——单独一个「Chats」可能只是分组标题
+    assert runner._filter_row([ocr.OcrLine("Chats", 1368, 1397, 53, 16)], frame) == []
 
-    hit = runner._best_title(picked, "20261021 18")
-    assert hit is not None, "没认出结果"
-    assert hit.text == "0 20261021 18", hit.text
-    assert 1360 <= hit.left <= 1420, f"结果行应该贴着面板左边缘，实际 x={hit.left}"
+    # 面板没开：一条也认不出来
+    assert runner._panel_column([], frame) is None
+
+
+def test_search_result_pick() -> None:
+    """结果只在「Chats」分组里找，文件分组里长得再像也不算。
+
+    搜 "20261107" 时面板同时给出一个对话和四个文件。文件行 `2026-11-07-
+    liquid-glass-c52.md` 和目标标题 `2026-11-07-liquid-glass-c52` 几乎一样，
+    按文字相似度挑一定会挑中它——点下去打开的是文件，不是对话。
+
+    另外 OCR 会把长标题拆成两段（`0 20261107` + `32 Big LiquidGlass`），
+    单独一段都不像，拼起来才像。
+    """
+
+    from . import automation
+
+    runner = automation.Runner(
+        {"step_delay_seconds": 0.4, "recognition_enabled": True},
+        lambda level, message: None,
+    )
+    lines = _panel_lines()
+
+    column = 1369
+    chat = runner._chat_section(lines, column)
+    assert chat is not None and chat.text == "Chats n", chat
+    top, bottom = runner._section_bounds(lines, chat, column)
+    assert 780 <= top <= 790, top
+    assert bottom == 872, f"「Chats」分组应该在「Files」标题处结束，实际 {bottom}"
+
+    rows = runner._section_rows(lines, top, bottom, column)
+    texts = [" ".join(item.text for item in row) for row in rows]
+    assert any("32 Big LiquidGlass" in text for text in texts), texts
+    assert not any("liquid-glass-c52.md" in text for text in texts), "文件行不该进对话分组"
+
+    hit = runner._best_row(rows, "20261107 32 Big LiquidGlass")
+    assert hit is not None, "长标题被拆成两段后应该能拼回来"
+    assert 1368 <= hit.left <= 1500, hit.left
+    assert 810 <= hit.top <= 825, hit.top
+
+    # 只匹配到文件的词：对话分组里没有，必须返回 None，不能退而求其次
+    assert runner._best_row(rows, "2026-11-07-liquid-glass-c52-review") is None
 
     # 浮层上显示时要把行首那个被读成字符的图标去掉
-    assert runner._result_label(hit.text, "20261021 18") == "20261021 18"
-    assert runner._result_label("Clarify say", "Clarify say") == "Clarify say"
+    label = runner._result_label(hit.text, "20261107 32 Big LiquidGlass")
+    assert label == "20261107 32 Big LiquidGlass", label
 
 
 def test_magnifier_band() -> None:
@@ -1185,7 +1242,8 @@ TESTS: List[Tuple[str, Callable[[], None]]] = [
     ("侧边栏开关定位", test_sidebar_toggle_points),
     ("窗口选择跳过辅助窗口", test_window_pick_skips_tool),
     ("搜索面板定位", test_search_panel_anchor),
-    ("搜索结果挑选", test_search_result_pick),
+    ("搜索面板左边缘", test_search_panel_column),
+    ("搜索结果分组", test_search_result_pick),
     ("放大镜定位", test_magnifier_band),
     ("路径清理", test_tidy_path),
 ]

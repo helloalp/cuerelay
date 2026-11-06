@@ -75,7 +75,7 @@ def main(argv: list[str]) -> int:
     print("2 已输入，面板里现在有：")
     panel_text(after)
 
-    frame, hit = runner._search_result(hwnd, title, box)
+    frame, hit = runner._search_result(hwnd, title)
     print(f"3 结果 {hit}")
     if hit is None:
         shot(frame, "fail_result")

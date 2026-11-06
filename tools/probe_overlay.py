@@ -69,8 +69,12 @@ def main() -> int:
     if box is not None:
         steps.append(("搜索框", fresh.to_screen(box)))
         lines = ocr.recognize(fresh.bitmap)
-        candidates = runner._result_lines(lines, fresh.width, box)
-        hit = runner._best_title(candidates, "20261021 18")
+        column = runner._panel_column(lines, fresh)
+        chat = runner._chat_section(lines, column) if column is not None else None
+        hit = None
+        if chat is not None:
+            top, bottom = runner._section_bounds(lines, chat, column)
+            hit = runner._best_row(runner._section_rows(lines, top, bottom, column), "20261021 18")
         if hit is not None:
             steps.append(
                 (
