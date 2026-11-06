@@ -106,6 +106,9 @@ class Scheduler:
             self.emit("restore", None)
             self._window_lock.release()
             self.emit("refresh", None)
+            # 界面靠这个事件收尾：动作失败了也要把"正在读取…"这类临时状态复位，
+            # 否则一次拿不到锁就会让按钮永远卡在进行中。
+            self.emit("action_done", label)
 
     def test_paste(self, content: str) -> bool:
         """只粘贴不发送，用来验证识别结果；和正式任务共用同一把窗口锁。"""

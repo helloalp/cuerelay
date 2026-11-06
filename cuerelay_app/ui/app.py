@@ -2991,6 +2991,14 @@ class App:
                         self._apply_conversations(payload)
                     except tk.TclError:
                         pass
+                elif event == "action_done":
+                    if self._conversation_scanning:
+                        self._conversation_scanning = False
+                        self.chat_status_var.set("扫描没有完成")
+                        try:
+                            self._render_chats()
+                        except tk.TclError:
+                            pass
                 elif event == "history":
                     try:
                         if self.view == "log":

@@ -29,7 +29,9 @@ def dispatch_wheel(event):
         delta = int(event.delta)
     except (AttributeError, TypeError, ValueError):
         return None
-    for area in list(_AREAS):
+    # 倒着找：后创建的区域盖在先创建的上面（命令面板就是后创建的）。
+    # 正着找会把滚轮交给被面板挡住的那个列表。
+    for area in reversed(list(_AREAS)):
         try:
             if area.contains(x_root, y_root):
                 area.scroll_by(delta)
