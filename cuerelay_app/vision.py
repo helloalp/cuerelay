@@ -600,9 +600,24 @@ def send_slot_kind(bitmap: Bitmap, slot: Rect) -> str:
     def covered(start: int, stop: int) -> bool:
         return any(columns[x] >= peak * 0.5 for x in range(max(0, start), min(width, stop)))
 
-    mid_start, mid_stop = int(width * 0.42), int(width * 0.58)
-    mid_empty = all(columns[x] <= peak * 0.16 for x in range(mid_start, max(mid_start + 1, mid_stop)))
-    if mid_empty and covered(0, mid_start) and covered(mid_stop, width):
+    # 暂停的两根竖条之间必然有一段空白列，且这段空白要跨过中心。
+    # 直接量这段连续空列的宽度，比套一个固定的中间窗口更稳：竖条画得宽一点、
+    # 窄一点都不会踩到边界上。
+    quiet = peak * 0.16
+    center = width // 2
+    if columns[center] > quiet:
+        return SEND_SLOT_SEND
+    left = center
+    while left > 0 and columns[left - 1] <= quiet:
+        left -= 1
+    right = center
+    while right < width - 1 and columns[right + 1] <= quiet:
+        right += 1
+    gap = right - left + 1
+    # 只有一两列空白多半是抗锯齿，不能当成暂停。
+    if gap < 2:
+        return SEND_SLOT_SEND
+    if covered(0, left) and covered(right + 1, width):
         return SEND_SLOT_PAUSE
     return SEND_SLOT_SEND
 

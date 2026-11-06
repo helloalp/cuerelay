@@ -132,6 +132,14 @@ def test_send_slot_icon_state() -> None:
     assert slot is not None, "没有识别到暂停方块"
     assert vision.send_slot_kind(pause, slot) == vision.SEND_SLOT_PAUSE
 
+    # 竖条画得粗一点、缝窄一点，也必须认成暂停。
+    tight = build([((564, 463, 572, 476), glyph), ((574, 463, 582, 476), glyph)])
+    composer = vision.detect_composer(tight)
+    assert composer is not None
+    slot = vision.detect_send_slot(tight, composer)
+    assert slot is not None
+    assert vision.send_slot_kind(tight, slot) == vision.SEND_SLOT_PAUSE, "窄缝的暂停被漏判了"
+
     # 麦克风：细长条，填充率低，根本不该被当成可点的按钮。
     mic = make_bitmap(
         760,
