@@ -10,20 +10,25 @@ from __future__ import annotations
 import datetime as _dt
 import os
 import queue
+import threading
 import time
 import tkinter as tk
 from tkinter import messagebox, ttk
 from typing import Any, Callable, Optional
 
+from .. import apps as apps_module
 from .. import config, locator, store as store_module, winapi
 from ..automation import AutomationError
 from ..config import friendly_error, iso_datetime, now_local, parse_datetime
 from ..hotkey import VirtualCapture
 from ..scheduler import Scheduler
 from ..store import (
+    KIND_LABELS,
     TaskStore,
     advance_next_run_past_now,
     content_snippet,
+    is_lifecycle,
+    kind_label,
     next_run_text,
     task_state,
 )
@@ -35,6 +40,7 @@ from .widgets import Button, Field, ScrollArea, Segmented, Switch, TextArea, car
 
 ACTION_OPTIONS = (("click", "点击发送"), ("enter", "Enter 发送"))
 SCHEDULE_OPTIONS = (("once", "单次"), ("daily", "每天"), ("interval", "间隔"))
+KIND_OPTIONS = (("prompt", "发送提示词"), ("launch", "启动应用"), ("close", "关闭应用"))
 DELAY_OPTIONS = (("0.8", "0.8 秒"), ("1.2", "1.2 秒"), ("1.8", "1.8 秒"), ("2.5", "2.5 秒"))
 THEME_OPTIONS = (("light", "浅色"), ("dark", "深色"))
 FILTER_OPTIONS = (("all", "全部"), ("info", "信息"), ("success", "成功"), ("warning", "警告"), ("error", "错误"))
@@ -55,6 +61,7 @@ def _empty_draft() -> dict[str, Any]:
     now = now_local()
     return {
         "id": None,
+        "kind": "prompt",
         "name": "",
         "content": "",
         "conversation": "",
@@ -103,6 +110,11 @@ class App:
         if not self._select_initial_task():
             self._sync_editor_from_draft()
             self._set_status(f"配置文件：{config.DATA_PATH.name}")
+        self._refresh_apps()
+        self._after_ids.append(self.root.after(2500, self._poll_apps))
+        if not str(self.store.setting("v2ray_path") or ""):
+            # 第一次打开就顺手找一下 v2rayN，省得用户还要自己去点「自动检测」。
+            threading.Thread(target=self._autodetect_v2ray, daemon=True).start()
 
     # ------------------------------------------------------------------
     # 初始化
@@ -110,6 +122,7 @@ class App:
 
     def _create_variables(self, settings: dict[str, Any]) -> None:
         self.name_var = tk.StringVar(value=self.draft["name"])
+        self.kind_var = tk.StringVar(value=self.draft["kind"])
         self.conversation_var = tk.StringVar(value=self.draft["conversation"])
         self.schedule_var = tk.StringVar(value=self.draft["schedule"])
         self.date_var = tk.StringVar(value=self.draft["date"])
@@ -129,6 +142,9 @@ class App:
         self.strict_var = tk.BooleanVar(value=bool(settings.get("strict_conversation", True)))
         self.overlay_var = tk.BooleanVar(value=bool(settings.get("show_overlay", True)))
         self.keywords_var = tk.StringVar(value=str(settings.get("target_keywords") or ""))
+        self.auto_launch_var = tk.BooleanVar(value=bool(settings.get("auto_launch_target", True)))
+        self.v2ray_path_var = tk.StringVar(value=str(settings.get("v2ray_path") or ""))
+        self.launch_v2ray_var = tk.BooleanVar(value=bool(settings.get("launch_v2ray_first", True)))
         self.catch_up_var = tk.StringVar(value=str(int(settings.get("catch_up_seconds", 300) or 300) // 60))
         try:
             saved_delay = float(settings.get("step_delay_seconds", 1.2))
@@ -306,7 +322,7 @@ class App:
         items.pack(fill="x", pady=(theme.px(16), 0))
 
         self.rail_items: dict[str, dict[str, Any]] = {}
-        for key, text in (("tasks", "任务"), ("log", "日志"), ("settings", "设置")):
+        for key, text in (("tasks", "任务"), ("apps", "应用"), ("log", "日志"), ("settings", "设置")):
             item = tk.Frame(items, bg=theme.c("bg"), cursor="hand2")
             item.pack(fill="x", pady=(0, theme.px(2)))
             bar = tk.Frame(item, bg=theme.c("bg"), width=theme.px(3))
@@ -355,12 +371,13 @@ class App:
         content.grid_columnconfigure(0, weight=1)
 
         self.views: dict[str, tk.Frame] = {}
-        for key in ("tasks", "log", "settings"):
+        for key in ("tasks", "apps", "log", "settings"):
             frame = tk.Frame(content, bg=theme.c("bg"))
             frame.grid(row=0, column=0, sticky="nsew")
             self.views[key] = frame
 
         self._build_tasks_view(self.views["tasks"])
+        self._build_apps_view(self.views["apps"])
         self._build_log_view(self.views["log"])
         self._build_settings_view(self.views["settings"])
 
@@ -443,6 +460,259 @@ class App:
         )
         self.editor_state.pack(side="left", padx=(theme.px(12), 0))
 
+    # ------------------------------------------------------------------
+    # 应用视图
+    # ------------------------------------------------------------------
+
+    def _build_apps_view(self, parent: tk.Frame) -> None:
+        theme = self.theme
+        scroll = ScrollArea(parent, theme, "bg")
+        scroll.pack(fill="both", expand=True)
+        body = scroll.body
+
+        self.app_cards: dict[str, dict[str, Any]] = {}
+        self._app_card(
+            body,
+            "codex",
+            "Codex",
+            "消息最终发到这里。没开的时候执行任务会先把它拉起来。",
+            [
+                ("启动", lambda: self._app_launch_codex(), "primary"),
+                ("关闭", lambda: self._app_close_codex(), "ghost"),
+            ],
+        )
+        self._app_card(
+            body,
+            "v2ray",
+            "v2rayN",
+            "先起代理再起 Codex，避免 Codex 打开后连不上。",
+            [
+                ("启动", lambda: self._app_launch_v2ray(), "primary"),
+                ("重新检测", lambda: self._app_detect_v2ray(), "ghost"),
+            ],
+        )
+
+        quick = tk.Frame(body, bg=theme.c("bg"))
+        quick.pack(fill="x", pady=(theme.px(4), theme.px(16)))
+        Button(
+            quick,
+            theme,
+            "一键启动：v2rayN → Codex",
+            self._app_start_chain,
+            kind="primary",
+        ).pack(side="left")
+
+        tk.Label(
+            body,
+            text="定时开关",
+            bg=theme.c("bg"),
+            fg=theme.c("text_2"),
+            font=theme.font("small_strong"),
+            anchor="w",
+        ).pack(fill="x", pady=(0, theme.px(8)))
+
+        schedule_row = tk.Frame(body, bg=theme.c("bg"))
+        schedule_row.pack(fill="x")
+        Button(
+            schedule_row,
+            theme,
+            "新建「启动 Codex」任务",
+            lambda: self.new_lifecycle_task("launch"),
+        ).pack(side="left")
+        Button(
+            schedule_row,
+            theme,
+            "新建「关闭 Codex」任务",
+            lambda: self.new_lifecycle_task("close"),
+        ).pack(side="left", padx=(theme.px(8), 0))
+
+    def _app_card(
+        self,
+        parent: tk.Frame,
+        key: str,
+        title: str,
+        hint: str,
+        actions: list[tuple[str, Callable[[], None], str]],
+    ) -> None:
+        theme = self.theme
+        outer, body = card(parent, theme, "surface")
+        outer.pack(fill="x", pady=(theme.px(12), 0))
+        pad = theme.px(20)
+
+        head = tk.Frame(body, bg=theme.c("surface"))
+        head.pack(fill="x", padx=pad, pady=(pad, 0))
+        tk.Label(
+            head,
+            text=title,
+            bg=theme.c("surface"),
+            fg=theme.c("text"),
+            font=theme.font("title"),
+            anchor="w",
+        ).pack(side="left")
+        status = tk.Label(
+            head,
+            text="—",
+            bg=theme.c("surface"),
+            fg=theme.c("text_3"),
+            font=theme.font("small"),
+            anchor="w",
+        )
+        status.pack(side="left", padx=(theme.px(12), 0))
+        for text, command, kind in reversed(actions):
+            Button(head, theme, text, command, kind=kind, size="sm").pack(
+                side="right", padx=(theme.px(6), 0)
+            )
+
+        path = tk.Label(
+            body,
+            text=hint,
+            bg=theme.c("surface"),
+            fg=theme.c("text_3"),
+            font=theme.font("small"),
+            anchor="w",
+            justify="left",
+            wraplength=theme.px(620),
+        )
+        path.pack(fill="x", padx=pad, pady=(theme.px(8), pad))
+        self.app_cards[key] = {"status": status, "path": path, "hint": hint}
+
+    def _refresh_apps(self) -> None:
+        if not hasattr(self, "app_cards") or not self.app_cards:
+            return
+        theme = self.theme
+        settings = self.store.settings()
+        tones = {"运行中": "success", "在后台": "warning", "未运行": "text_3"}
+        try:
+            codex = apps_module.codex_app(settings)
+            status = codex.status()
+            card = self.app_cards.get("codex")
+            if card:
+                card["status"].configure(text=status, fg=theme.tone(tones.get(status, "text_3")))
+                card["path"].configure(text=f"{card['hint']}   {codex.launch_target()}")
+
+            path = str(settings.get("v2ray_path") or "")
+            v2ray = apps_module.v2ray_app(settings)
+            status = v2ray.status()
+            if not path and status != "未运行":
+                status = f"{status} · 未绑定"
+            card = self.app_cards.get("v2ray")
+            if card:
+                card["status"].configure(text=status, fg=theme.tone(tones.get(status.split(" ")[0], "text_3")))
+                card["path"].configure(
+                    text=f"{path}" if path else "还没有绑定路径，点「重新检测」自动找，或到设置里手填。"
+                )
+            if path and self.v2ray_path_var.get() != path:
+                self.v2ray_path_var.set(path)
+        except Exception:
+            pass
+
+    # -- 应用动作 ------------------------------------------------------
+
+    def _app_worker(self, label: str, worker: Callable[[], str]) -> None:
+        """启动/关闭可能要几秒，放到后台线程，结果通过事件队列回到界面。"""
+
+        self._set_status(f"{label}…")
+
+        def run() -> None:
+            try:
+                message = worker()
+                self.emit("log", ("success", message or f"{label}完成"))
+            except Exception as exc:
+                self.emit("log", ("error", f"{label}失败：{friendly_error(exc)}"))
+            finally:
+                self.emit("apps", None)
+
+        threading.Thread(target=run, daemon=True).start()
+
+    def _app_launch_codex(self) -> None:
+        def worker() -> str:
+            window = apps_module.codex_app(self.store.settings(), self.log_async).ensure_visible()
+            if window is None:
+                raise RuntimeError("没能把 Codex 拉到前台")
+            return "Codex 已在前台"
+
+        self._app_worker("启动 Codex", worker)
+
+    def _app_close_codex(self) -> None:
+        def worker() -> str:
+            spec = apps_module.codex_app(self.store.settings(), self.log_async)
+            if spec.status() == "未运行":
+                return "Codex 本来就没有运行"
+            if not spec.close(force=True):
+                raise RuntimeError("进程还在运行")
+            return "Codex 已关闭"
+
+        self._app_worker("关闭 Codex", worker)
+
+    def _app_launch_v2ray(self) -> None:
+        def worker() -> str:
+            ok, message = apps_module.ensure_proxy(self.store.settings(), self.log_async)
+            if not ok:
+                raise RuntimeError(message)
+            return message
+
+        self._app_worker("启动 v2rayN", worker)
+
+    def _app_start_chain(self) -> None:
+        def worker() -> str:
+            window = apps_module.start_codex(self.store.settings(), self.log_async)
+            if window is None:
+                raise RuntimeError("Codex 没能起来")
+            return "v2rayN 与 Codex 都已就绪"
+
+        self._app_worker("一键启动", worker)
+
+    def _app_detect_v2ray(self) -> None:
+        def worker() -> str:
+            path = apps_module.detect_v2ray_path()
+            if not path:
+                raise RuntimeError("没找到 v2rayN.exe，请到设置里手动指定")
+            self.store.update_settings(v2ray_path=path)
+            return f"已绑定 v2rayN：{path}"
+
+        self._app_worker("检测 v2rayN", worker)
+
+    def log_async(self, level: str, message: str) -> None:
+        """后台线程里记日志，走事件队列，不直接碰 Tk。"""
+
+        self.emit("log", (level, message))
+
+    def _autodetect_v2ray(self) -> None:
+        """启动时自动绑定 v2rayN。找不到就安静地算了，用户还能手填。"""
+
+        try:
+            path = apps_module.detect_v2ray_path()
+        except Exception:
+            return
+        if not path:
+            return
+        self.store.update_settings(v2ray_path=path)
+        self.emit("log", ("info", f"已自动绑定 v2rayN：{path}"))
+        self.emit("apps", None)
+
+    def new_lifecycle_task(self, kind: str) -> None:
+        """从「应用」页直接建一个定时开关任务。"""
+
+        if not self._confirm_discard():
+            return
+        self.selected_id = None
+        self.draft = _empty_draft()
+        self.draft["kind"] = kind
+        self.draft["name"] = "启动 Codex" if kind == "launch" else "关闭 Codex"
+        self.draft["schedule"] = "daily"
+        self._sync_editor_from_draft()
+        self._baseline = self._editor_signature()
+        self.editor_title.configure(text="新建任务")
+        self.delete_button.set_enabled(False)
+        self.editor_state.configure(text="", fg=self.theme.c("text_3"))
+        self._apply_selection()
+        self.show_view("tasks")
+        self._set_status(f"新建：{self.draft['name']}，设好时间后保存")
+
+    # ------------------------------------------------------------------
+    # 编辑区
+    # ------------------------------------------------------------------
+
     def _build_editor(self, parent: tk.Frame) -> None:
         theme = self.theme
         pad = theme.px(20)
@@ -462,12 +732,22 @@ class App:
         self.editor_title.pack(side="left")
         Switch(head, theme, "启用", self.enabled_var, bg_key="surface").pack(side="right")
 
+        # 类型决定下面出现哪些字段：发送提示词要写内容、选发送方式；开关应用不需要。
+        Segmented(body, theme, KIND_OPTIONS, self.kind_var, self._on_kind_change).pack(
+            fill="x", padx=pad, pady=(0, theme.px(14))
+        )
+
         self.name_field = Field(body, theme, "名称", self.name_var)
         self.name_field.pack(fill="x", padx=pad)
 
+        # 只属于「发送提示词」的字段各自装进一个分组。开关类任务把分组整块收起，
+        # 剩下的就是：类型 -> 名称 -> 计划，一屏看完。
+        self.prompt_group = tk.Frame(body, bg=theme.c("surface"))
+        self.prompt_group.pack(fill="x", after=self.name_field)
+
         # 提示词不再吃掉全部剩余高度：把计划、发送方式、目标对话留在首屏可见，
         # 用户一眼就能看完整条流程（写什么 -> 发到哪 -> 什么时候发 -> 怎么发）。
-        self.prompt_area = TextArea(body, theme, "提示词", height=7)
+        self.prompt_area = TextArea(self.prompt_group, theme, "提示词", height=7)
         self.prompt_area.pack(fill="x", padx=pad, pady=(theme.px(14), 0))
 
         schedule_head = tk.Label(
@@ -479,9 +759,10 @@ class App:
             anchor="w",
         )
         schedule_head.pack(fill="x", padx=pad, pady=(theme.px(16), theme.px(6)))
-        Segmented(body, theme, SCHEDULE_OPTIONS, self.schedule_var, self._on_schedule_change).pack(
-            fill="x", padx=pad
+        self.schedule_segment = Segmented(
+            body, theme, SCHEDULE_OPTIONS, self.schedule_var, self._on_schedule_change
         )
+        self.schedule_segment.pack(fill="x", padx=pad)
 
         self.schedule_holder = tk.Frame(body, bg=theme.c("surface"))
         self.schedule_holder.pack(fill="x", padx=pad, pady=(theme.px(10), 0))
@@ -495,27 +776,51 @@ class App:
         self.interval_row = tk.Frame(self.schedule_holder, bg=theme.c("surface"))
         Field(self.interval_row, theme, "间隔分钟", self.interval_var).pack(fill="x")
 
-        action_head = tk.Label(
-            body,
+        self.send_group = tk.Frame(body, bg=theme.c("surface"))
+        self.send_group.pack(fill="x", after=self.schedule_holder)
+
+        tk.Label(
+            self.send_group,
             text="发送方式",
             bg=theme.c("surface"),
             fg=theme.c("text_2"),
             font=theme.font("small"),
             anchor="w",
-        )
-        action_head.pack(fill="x", padx=pad, pady=(theme.px(16), theme.px(6)))
-        Segmented(body, theme, ACTION_OPTIONS, self.action_var).pack(fill="x", padx=pad)
+        ).pack(fill="x", padx=pad, pady=(theme.px(16), theme.px(6)))
+        Segmented(self.send_group, theme, ACTION_OPTIONS, self.action_var).pack(fill="x", padx=pad)
 
         self.conversation_field = Field(
-            body,
+            self.send_group,
             theme,
             "目标对话",
             self.conversation_var,
             placeholder="留空则发送到当前对话",
         )
-        self.conversation_field.pack(fill="x", padx=pad, pady=(theme.px(14), pad))
+        self.conversation_field.pack(fill="x", padx=pad, pady=(theme.px(14), 0))
 
         self._on_schedule_change(self.schedule_var.get())
+        self._on_kind_change(self.kind_var.get())
+
+    def _on_kind_change(self, value: str) -> None:
+        """开关类任务不需要提示词、发送方式和目标对话，把这两组整块收起。"""
+
+        lifecycle = value in ("launch", "close")
+        for group in (self.prompt_group, self.send_group):
+            try:
+                if lifecycle:
+                    group.pack_forget()
+            except tk.TclError:
+                pass
+        if not lifecycle:
+            # 收起再放回时 pack 会排到末尾，用 after= 摆回原来的位置。
+            self.prompt_group.pack(fill="x", after=self.name_field)
+            self.send_group.pack(fill="x", after=self.schedule_holder)
+        # 收起后最后一排是日期/时间，卡片底部要靠它自己留出内边距。
+        pad = self.theme.px(20)
+        try:
+            self.schedule_holder.pack_configure(pady=(self.theme.px(10), pad if lifecycle else 0))
+        except tk.TclError:
+            pass
 
     def _on_schedule_change(self, value: str) -> None:
         if value == "interval":
@@ -670,6 +975,44 @@ class App:
             anchor="w",
         ).pack(side="left")
         Button(row, theme, "识别目标窗口", self.detect_target, kind="ghost", size="sm").pack(side="right")
+
+        Switch(
+            inner,
+            theme,
+            "执行前自动拉起目标应用",
+            self.auto_launch_var,
+            command=self._save_auto_launch,
+            bg_key="surface",
+        ).pack(fill="x", pady=(theme.px(14), 0))
+
+        # 代理与启动
+        card_body = self._settings_card(body, "启动与代理")
+        inner = tk.Frame(card_body, bg=theme.c("surface"))
+        inner.pack(fill="x", padx=theme.px(20), pady=(0, theme.px(18)))
+
+        v2ray_field = Field(
+            inner,
+            theme,
+            "v2rayN 路径",
+            self.v2ray_path_var,
+            hint="留空则自动探测；以管理员身份运行的 v2rayN 需要在这里手填一次",
+        )
+        v2ray_field.pack(fill="x")
+        v2ray_field.entry.bind("<FocusOut>", lambda _event: self._save_v2ray_path())
+        row = tk.Frame(inner, bg=theme.c("surface"))
+        row.pack(fill="x", pady=(theme.px(10), 0))
+        Button(row, theme, "自动检测", self._app_detect_v2ray, kind="ghost", size="sm").pack(side="left")
+        Button(row, theme, "打开所在文件夹", self._open_v2ray_folder, kind="ghost", size="sm").pack(
+            side="left", padx=(theme.px(8), 0)
+        )
+        Switch(
+            inner,
+            theme,
+            "启动 Codex 前先确保 v2rayN 已运行",
+            self.launch_v2ray_var,
+            command=self._save_launch_v2ray,
+            bg_key="surface",
+        ).pack(fill="x", pady=(theme.px(14), 0))
 
         # 识别与校准
         card_body = self._settings_card(body, "识别与校准")
@@ -845,6 +1188,21 @@ class App:
                 font=theme.font("strong") if active else theme.font("body"),
             )
             parts["bar"].configure(bg=theme.c("accent") if active else theme.c("bg"))
+        if self.view == "apps":
+            self._refresh_apps()
+
+    def _poll_apps(self) -> None:
+        """应用页的状态会随外部变化（用户自己关掉、托盘恢复），定时刷一下。"""
+
+        try:
+            if self.view == "apps":
+                self._refresh_apps()
+        except tk.TclError:
+            return
+        try:
+            self._after_ids.append(self.root.after(2500, self._poll_apps))
+        except tk.TclError:
+            return
 
     # ------------------------------------------------------------------
     # 任务列表
@@ -1148,6 +1506,7 @@ class App:
         planned = parse_datetime(task.get("next_run")) or (now_local() + _dt.timedelta(minutes=5))
         self.draft = {
             "id": str(task.get("id")),
+            "kind": str(task.get("kind") or "prompt"),
             "name": str(task.get("name") or ""),
             "content": str(task.get("content") or ""),
             "conversation": str(task.get("conversation_title") or ""),
@@ -1175,6 +1534,7 @@ class App:
 
     def _sync_editor_from_draft(self) -> None:
         self.name_var.set(self.draft["name"])
+        self.kind_var.set(self.draft["kind"])
         self.conversation_var.set(self.draft["conversation"])
         self.schedule_var.set(self.draft["schedule"])
         self.date_var.set(self.draft["date"])
@@ -1185,9 +1545,11 @@ class App:
         if hasattr(self, "prompt_area"):
             self.prompt_area.set(self.draft["content"])
             self._on_schedule_change(self.draft["schedule"])
+            self._on_kind_change(self.draft["kind"])
 
     def _sync_draft_from_editor(self) -> None:
         self.draft["name"] = self.name_var.get().strip()
+        self.draft["kind"] = self.kind_var.get() or "prompt"
         self.draft["conversation"] = self.conversation_var.get().strip()
         self.draft["schedule"] = self.schedule_var.get()
         self.draft["date"] = self.date_var.get().strip()
@@ -1200,6 +1562,7 @@ class App:
 
     def _editor_signature(self) -> tuple:
         return (
+            self.draft["kind"],
             self.draft["name"],
             self.draft["content"],
             self.draft["conversation"],
@@ -1245,10 +1608,11 @@ class App:
 
     def _build_task_payload(self) -> Optional[dict[str, Any]]:
         self._sync_draft_from_editor()
-        if not self.draft["content"].strip():
+        kind = self.draft["kind"]
+        if kind == "prompt" and not self.draft["content"].strip():
             messagebox.showwarning("无法保存", "提示词内容不能为空。", parent=self.root)
             return None
-        name = self.draft["name"] or "未命名任务"
+        name = self.draft["name"] or KIND_LABELS.get(kind, "未命名任务")
 
         schedule = self.draft["schedule"]
         current = now_local()
@@ -1280,6 +1644,7 @@ class App:
             return None
 
         return {
+            "kind": kind,
             "name": name[:80],
             "content": self.draft["content"],
             "conversation_title": self.draft["conversation"][:200],
@@ -1482,6 +1847,32 @@ class App:
 
     def _save_keywords(self) -> None:
         self.store.update_settings(target_keywords=self.keywords_var.get().strip())
+
+    def _save_auto_launch(self) -> None:
+        self.store.update_settings(auto_launch_target=bool(self.auto_launch_var.get()))
+        self._set_status("执行前自动拉起：" + ("开" if self.auto_launch_var.get() else "关"))
+
+    def _save_v2ray_path(self) -> None:
+        path = apps_module.tidy_path(self.v2ray_path_var.get())
+        self.v2ray_path_var.set(path)
+        self.store.update_settings(v2ray_path=path)
+        self._refresh_apps()
+
+    def _save_launch_v2ray(self) -> None:
+        self.store.update_settings(launch_v2ray_first=bool(self.launch_v2ray_var.get()))
+
+    def _open_v2ray_folder(self) -> None:
+        path = apps_module.tidy_path(self.v2ray_path_var.get())
+        if not path:
+            path = apps_module.detect_v2ray_path()
+        if not path:
+            self._set_status("还没有绑定 v2rayN，先点「自动检测」")
+            return
+        folder = os.path.dirname(path)
+        try:
+            os.startfile(folder)  # type: ignore[attr-defined]
+        except Exception as exc:
+            self._set_status(f"无法打开：{friendly_error(exc)}")
 
     def _save_recognition(self) -> None:
         self.store.update_settings(
@@ -1743,6 +2134,11 @@ class App:
                 elif event == "overlay":
                     try:
                         apply_event(self.overlay, payload)
+                    except tk.TclError:
+                        pass
+                elif event == "apps":
+                    try:
+                        self._refresh_apps()
                     except tk.TclError:
                         pass
         except queue.Empty:

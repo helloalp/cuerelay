@@ -41,6 +41,13 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "verify_paste": True,
     "verify_send": True,
     "strict_conversation": True,
+    # 执行前如果目标应用没开，自动把它拉起来再发。
+    "auto_launch_target": True,
+    # 留空表示按 Codex 处理；填了 exe 路径就按普通桌面程序启动。
+    "target_path": "",
+    "codex_aumid": "",
+    "v2ray_path": "",
+    "launch_v2ray_first": True,
     # 执行时在目标窗口上盖一层框线浮层，标出识别到的输入框与发送按钮。
     "show_overlay": True,
     "default_action": "click",
@@ -52,6 +59,20 @@ DEFAULT_SETTINGS: dict[str, Any] = {
 SCHEDULE_VALUES = ("once", "daily", "interval")
 ACTION_VALUES = ("click", "enter")
 STATUS_VALUES = ("waiting", "running", "failed", "paused", "done", "expired")
+# 任务类型：发送提示词 / 启动应用 / 关闭应用。后两种不需要提示词内容。
+KIND_VALUES = ("prompt", "launch", "close")
+
+KIND_LABELS = {
+    "prompt": "发送提示词",
+    "launch": "启动应用",
+    "close": "关闭应用",
+}
+
+KIND_SHORT = {
+    "prompt": "提示词",
+    "launch": "启动",
+    "close": "关闭",
+}
 
 LEGACY_STATUS = {
     "等待中": "waiting",
@@ -126,6 +147,15 @@ def _coerce_bool(value: Any, default: bool) -> bool:
     return default
 
 
+def _coerce_kind(value: Any) -> str:
+    text = str(value or "").strip().lower()
+    if text in ("launch", "start", "open", "启动"):
+        return "launch"
+    if text in ("close", "stop", "quit", "关闭"):
+        return "close"
+    return "prompt"
+
+
 def normalize_task(item: dict[str, Any]) -> dict[str, Any]:
     schedule = _coerce_schedule(item.get("schedule"))
     next_run = parse_datetime(item.get("next_run"))
@@ -133,6 +163,7 @@ def normalize_task(item: dict[str, Any]) -> dict[str, Any]:
     return {
         "id": str(item.get("id") or uuid.uuid4().hex[:10]),
         "name": str(item.get("name") or "未命名任务")[:80],
+        "kind": _coerce_kind(item.get("kind")),
         "content": str(item.get("content") or ""),
         "conversation_title": str(item.get("conversation_title") or "")[:200],
         "schedule": schedule,
@@ -221,11 +252,24 @@ def task_summary(task: dict[str, Any]) -> str:
     return f"{schedule_text(task)} · {next_run_text(task)}"
 
 
+def kind_label(task: dict[str, Any]) -> str:
+    return KIND_LABELS.get(str(task.get("kind") or "prompt"), KIND_LABELS["prompt"])
+
+
+def is_lifecycle(task: dict[str, Any]) -> bool:
+    """启动/关闭这类任务不需要提示词，执行流程也不同。"""
+
+    return str(task.get("kind") or "prompt") in ("launch", "close")
+
+
 def content_snippet(task: dict[str, Any], limit: int = 46) -> str:
     """列表里用来区分同名任务的一行内容摘要。"""
 
     text = " ".join(str(task.get("content") or "").split())
     if not text:
+        if is_lifecycle(task):
+            # 开关类任务没有提示词，用类型名占住这一行，避免列表高低不一。
+            return kind_label(task)
         return "（空内容）"
     return text if len(text) <= limit else text[: limit - 1] + "…"
 

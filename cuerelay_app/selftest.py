@@ -13,10 +13,17 @@ import tempfile
 from pathlib import Path
 from typing import Callable, List, Tuple
 
-from . import ocr, vision
+from . import apps, ocr, vision
 from .config import now_local, parse_datetime
 from .imaging import Bitmap
-from .store import TaskStore, advance_next_run_past_now, duplicate_groups
+from .store import (
+    TaskStore,
+    advance_next_run_past_now,
+    content_snippet,
+    duplicate_groups,
+    is_lifecycle,
+    normalize_task,
+)
 from .vision import Rect
 
 Color = Tuple[int, int, int]
@@ -559,6 +566,51 @@ def test_settings_bool_coercion() -> None:
         assert settings["strict_conversation"] is True
 
 
+def test_msix_launch_target() -> None:
+    """Codex 是 MSIX 包，启动要走 shell:AppsFolder，包族名从安装路径反推。
+
+    安装目录名是 `<Name>_<Version>_<Arch>__<PublisherId>`，包族名是
+    `<Name>_<PublisherId>`。这里不能按 `_` 简单切：Name 里有点，版本段自己带下划线。
+    """
+
+    path = (
+        r"C:\Program Files\WindowsApps"
+        r"\OpenAI.Codex_26.1029.7803.0_x64__2p2nqsd0c76g0\app\ChatGPT.exe"
+    )
+    assert apps.family_from_install_path(path) == "OpenAI.Codex_2p2nqsd0c76g0"
+    assert apps.aumid_from_install_path(path) == "OpenAI.Codex_2p2nqsd0c76g0!App"
+    # 自定义 AppId 要跟着走，否则会启动到包的默认入口。
+    assert apps.aumid_from_install_path(path, "Codex") == "OpenAI.Codex_2p2nqsd0c76g0!Codex"
+    # 不是 MSIX 布局的路径不能瞎猜：猜出来的 AUMID 指向别的应用，比启动失败更糟。
+    assert apps.family_from_install_path(r"C:\Program Files\v2rayN\v2rayN.exe") == ""
+    assert apps.family_from_install_path("") == ""
+    assert apps.family_from_install_path(r"D:\tools\some_app_1.0\app.exe") == ""
+    # 只有分隔符没有发布者的残缺目录名也要放过。
+    assert apps.family_from_install_path(r"D:\x\Foo_1.0__\a.exe") == ""
+
+
+def test_task_kind_coercion() -> None:
+    """类型可能来自手改过的 JSON，脏值必须落回「发送提示词」。
+
+    猜错方向很危险：把一条普通提示词任务当成「关闭应用」，执行时会把目标应用关掉。
+    """
+
+    assert normalize_task({"kind": "launch"})["kind"] == "launch"
+    assert normalize_task({"kind": " 关闭 "})["kind"] == "close"
+    assert normalize_task({"kind": "Start"})["kind"] == "launch"
+    assert normalize_task({"kind": "乱写"})["kind"] == "prompt"
+    assert normalize_task({})["kind"] == "prompt"
+
+    launch = {"kind": "launch", "content": ""}
+    assert is_lifecycle(launch) is True
+    assert is_lifecycle({"kind": "prompt", "content": "hi"}) is False
+    # 开关类任务没有提示词，列表那一行要写类型名，否则每条都是「（空内容）」。
+    assert content_snippet(launch) == "启动应用"
+    assert content_snippet({"kind": "close", "content": ""}) == "关闭应用"
+    assert content_snippet({"kind": "prompt", "content": "   "}) == "（空内容）"
+    assert content_snippet({"kind": "prompt", "content": "写" * 60}).endswith("…")
+
+
 TESTS: List[Tuple[str, Callable[[], None]]] = [
     ("颜色众数", test_modal_color),
     ("输入框识别", test_composer_detection),
@@ -583,6 +635,8 @@ TESTS: List[Tuple[str, Callable[[], None]]] = [
     ("预览图生成", test_png_preview),
     ("浮层事件翻译", test_overlay_events),
     ("设置布尔纠正", test_settings_bool_coercion),
+    ("MSIX 启动目标", test_msix_launch_target),
+    ("任务类型纠正", test_task_kind_coercion),
 ]
 
 

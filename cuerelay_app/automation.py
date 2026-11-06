@@ -10,9 +10,10 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Callable, Optional
 
-from . import imaging, locator, ocr, vision, winapi
+from . import apps, imaging, locator, ocr, vision, winapi
 from .vision import Rect
 
 
@@ -127,16 +128,58 @@ class Runner:
             previous = current
         return previous
 
-    def _find_window(self) -> dict[str, Any]:
+    def _locate_target(self) -> Optional[dict[str, Any]]:
+        """按关键词找当前可见的目标窗口。"""
+
         keywords = winapi.parse_keywords(str(self.settings.get("target_keywords") or ""))
-        window = winapi.find_target_window(
+        return winapi.find_target_window(
             keywords,
             exclude_hwnd=self.exclude_hwnd,
             title_hint=str(self.settings.get("target_title") or ""),
             process_hint=str(self.settings.get("target_process") or ""),
         )
-        if not window:
+
+    def _target_app(self) -> Optional[apps.AppSpec]:
+        """目标应用的启动方式。填了自定义路径就按路径启动，否则按 Codex 处理。"""
+
+        path = str(self.settings.get("target_path") or "").strip()
+        if path:
+            stem = Path(path).stem or "target"
+            return apps.AppSpec(
+                key="target",
+                label=stem,
+                process=stem,
+                path=path,
+                log=self.log,
+            )
+        return apps.codex_app(self.settings, self.log)
+
+    def _find_window(self) -> dict[str, Any]:
+        """找目标窗口；没开就按设置把它拉起来。
+
+        用户要的是"到点就把消息发出去"，不该因为应用没打开就失败。所以这里
+        先看有没有窗口，再退一步看进程在不在（收进托盘的窗口不可见），
+        最后才启动一个新实例。
+        """
+
+        window = self._locate_target()
+        if window is not None:
+            return window
+
+        if not bool(self.settings.get("auto_launch_target", True)):
             raise AutomationError("没有找到目标窗口。请先打开目标应用，或在设置中调整关键词。")
+
+        spec = self._target_app()
+        if spec is None:
+            raise AutomationError("没有找到目标窗口，也没有可用的启动方式。")
+        self.log("info", f"目标应用没有在前台可见，正在拉起 {spec.label}。")
+        window = spec.ensure_visible()
+        if window is None:
+            raise AutomationError(
+                f"没能把 {spec.label} 拉到前台，已停止以避免误输入。"
+                "如果它需要管理员权限，请先手动启动一次。"
+            )
+        self.log("info", f"已前置 {spec.label}：{window.get('title') or ''}")
         return window
 
     def _activate(self, window: dict[str, Any]) -> int:
@@ -415,9 +458,46 @@ class Runner:
         winapi.ctrl_v()
         time.sleep(0.12)
 
+    # -- 应用开关 ------------------------------------------------------
+
+    def _run_launch(self, task: dict[str, Any]) -> RunOutcome:
+        """定时启动：先把代理确保起来，再把目标拉到前台。"""
+
+        started = time.monotonic()
+        window = apps.start_codex(self.settings, self.log)
+        duration = int((time.monotonic() - started) * 1000)
+        if window is None:
+            raise AutomationError("没能把目标应用拉到前台。")
+        title = str(window.get("title") or "")
+        message = f"已启动并前置{f'：{title}' if title else ''}"
+        self.log("success", message)
+        return RunOutcome(ok=True, message=message, duration_ms=duration)
+
+    def _run_close(self, task: dict[str, Any]) -> RunOutcome:
+        """定时关闭：真的退出，而不是收进托盘。"""
+
+        started = time.monotonic()
+        spec = apps.codex_app(self.settings, self.log)
+        if spec.status() == "未运行":
+            message = "目标应用本来就没有运行"
+            self.log("info", message)
+            return RunOutcome(ok=True, message=message, duration_ms=0)
+        if not spec.close(force=True):
+            raise AutomationError("关闭目标应用失败，进程还在运行。")
+        duration = int((time.monotonic() - started) * 1000)
+        message = f"已关闭 {spec.label}"
+        self.log("success", message)
+        return RunOutcome(ok=True, message=message, duration_ms=duration)
+
     # -- 主流程 --------------------------------------------------------
 
     def run_task(self, task: dict[str, Any]) -> RunOutcome:
+        kind = str(task.get("kind") or "prompt")
+        if kind == "launch":
+            return self._run_launch(task)
+        if kind == "close":
+            return self._run_close(task)
+
         started = time.monotonic()
         content = str(task.get("content") or "")
         if not content.strip():

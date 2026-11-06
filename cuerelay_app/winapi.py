@@ -188,12 +188,46 @@ if IS_WINDOWS:  # pragma: no branch - 只在 Windows 上真正执行
     kernel32.GlobalFree.restype = ctypes.c_void_p
     kernel32.CreateMutexW.argtypes = [ctypes.c_void_p, wintypes.BOOL, wintypes.LPCWSTR]
     kernel32.CreateMutexW.restype = wintypes.HANDLE
+    # 返回的是 HANDLE，不声明 restype 会在 64 位上被截断成 32 位。
+    kernel32.CreateToolhelp32Snapshot.argtypes = [DWORD, DWORD]
+    kernel32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+    kernel32.TerminateProcess.argtypes = [wintypes.HANDLE, wintypes.UINT]
+    kernel32.TerminateProcess.restype = wintypes.BOOL
+
+    user32.PostMessageW.argtypes = [HWND, wintypes.UINT, WPARAM, LPARAM]
+    user32.PostMessageW.restype = wintypes.BOOL
+
+    class PROCESSENTRY32W(ctypes.Structure):
+        _fields_ = [
+            ("dwSize", wintypes.DWORD),
+            ("cntUsage", wintypes.DWORD),
+            ("th32ProcessID", wintypes.DWORD),
+            ("th32DefaultHeapID", ctypes.c_void_p),
+            ("th32ModuleID", wintypes.DWORD),
+            ("cntThreads", wintypes.DWORD),
+            ("th32ParentProcessID", wintypes.DWORD),
+            ("pcPriClassBase", wintypes.LONG),
+            ("dwFlags", wintypes.DWORD),
+            ("szExeFile", wintypes.WCHAR * 260),
+        ]
+
+    kernel32.Process32FirstW.argtypes = [wintypes.HANDLE, ctypes.c_void_p]
+    kernel32.Process32FirstW.restype = wintypes.BOOL
+    kernel32.Process32NextW.argtypes = [wintypes.HANDLE, ctypes.c_void_p]
+    kernel32.Process32NextW.restype = wintypes.BOOL
 
 
 # 常量集中放在这里，避免散落在各处。
+SW_HIDE = 0
+SW_SHOWNORMAL = 1
+SW_SHOW = 5
+SW_MINIMIZE = 6
 SW_RESTORE = 9
 SW_MAXIMIZE = 3
 GA_ROOT = 2
+TH32CS_SNAPPROCESS = 0x00000002
+WM_CLOSE = 0x0010
+PROCESS_TERMINATE = 0x0001
 VK_CONTROL = 0x11
 VK_A = 0x41
 VK_V = 0x56
@@ -322,6 +356,176 @@ def window_info(hwnd: int) -> dict[str, Any]:
         "process_path": path,
         "process_name": Path(path).name if path else "",
     }
+
+
+# ---------------------------------------------------------------------------
+# 进程快照与生命周期
+# ---------------------------------------------------------------------------
+
+
+def _snapshot_processes() -> list[dict[str, Any]]:
+    """一次进程快照，只带 pid 与可执行文件名（不解析路径，快）。"""
+
+    _require()
+    snapshot = kernel32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
+    if not snapshot or snapshot == ctypes.c_void_p(-1).value:
+        return []
+    processes: list[dict[str, Any]] = []
+    try:
+        entry = PROCESSENTRY32W()
+        entry.dwSize = ctypes.sizeof(PROCESSENTRY32W)
+        if not kernel32.Process32FirstW(snapshot, ctypes.byref(entry)):
+            return []
+        while True:
+            name = str(entry.szExeFile or "")
+            processes.append(
+                {
+                    "pid": int(entry.th32ProcessID),
+                    "name": name,
+                    "stem": Path(name).stem.lower() if name else "",
+                }
+            )
+            if not kernel32.Process32NextW(snapshot, ctypes.byref(entry)):
+                break
+    finally:
+        kernel32.CloseHandle(snapshot)
+    return processes
+
+
+def find_processes(stem: str, path_contains: str = "") -> list[dict[str, Any]]:
+    """按进程名（不含 .exe，忽略大小写）找进程，可选按路径片段过滤。
+
+    以管理员身份运行的进程，普通权限读不到路径；这种情况 path 为空字符串，
+    此时不做路径过滤——名字对上了就算对上。
+    """
+
+    target = (stem or "").strip().lower()
+    if target.endswith(".exe"):
+        target = target[:-4]
+    if not target:
+        return []
+    needle = (path_contains or "").lower()
+    found: list[dict[str, Any]] = []
+    for entry in _snapshot_processes():
+        if entry["stem"] != target:
+            continue
+        path = _process_path_by_pid(entry["pid"])
+        if needle and path and needle not in path.lower():
+            continue
+        found.append({**entry, "path": path})
+    return found
+
+
+def process_running(stem: str, path_contains: str = "") -> bool:
+    return bool(find_processes(stem, path_contains))
+
+
+def _process_path_by_pid(pid: int) -> str:
+    if not pid or not IS_WINDOWS:
+        return ""
+    handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+    if not handle:
+        return ""
+    try:
+        size = DWORD(1024)
+        buffer = ctypes.create_unicode_buffer(size.value)
+        if kernel32.QueryFullProcessImageNameW(handle, 0, buffer, ctypes.byref(size)):
+            return buffer.value
+    finally:
+        kernel32.CloseHandle(handle)
+    return ""
+
+
+def terminate_process(pid: int, exit_code: int = 1) -> bool:
+    if not pid or not IS_WINDOWS:
+        return False
+    handle = kernel32.OpenProcess(PROCESS_TERMINATE, False, pid)
+    if not handle:
+        return False
+    try:
+        return bool(kernel32.TerminateProcess(handle, exit_code))
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+def close_window(hwnd: int) -> bool:
+    """请求窗口正常关闭。很多应用会把它当成"收进托盘"而不是退出。"""
+
+    if not hwnd or not IS_WINDOWS:
+        return False
+    return bool(user32.PostMessageW(HWND(hwnd), WM_CLOSE, 0, 0))
+
+
+def show_window(hwnd: int, command: int = SW_SHOW) -> bool:
+    if not hwnd or not IS_WINDOWS:
+        return False
+    return bool(user32.ShowWindow(HWND(hwnd), command))
+
+
+def is_window_visible(hwnd: int) -> bool:
+    if not hwnd or not IS_WINDOWS:
+        return False
+    return bool(user32.IsWindowVisible(HWND(hwnd)))
+
+
+def windows_for_process(
+    stem: str,
+    path_contains: str = "",
+    include_hidden: bool = False,
+) -> list[dict[str, Any]]:
+    """某个进程的顶层窗口。默认只要可见的；include_hidden 时把收进托盘的也算上。"""
+
+    _require()
+    pids = {int(item["pid"]) for item in find_processes(stem, path_contains)}
+    if not pids:
+        return []
+    found: list[dict[str, Any]] = []
+
+    @ctypes.WINFUNCTYPE(wintypes.BOOL, HWND, LPARAM)
+    def callback(hwnd: int, _lparam: int) -> bool:
+        try:
+            pid = DWORD(0)
+            user32.GetWindowThreadProcessId(HWND(hwnd), ctypes.byref(pid))
+            if int(pid.value) not in pids:
+                return True
+            if not include_hidden and not user32.IsWindowVisible(HWND(hwnd)):
+                return True
+            if not get_window_title(hwnd):
+                return True
+            rect = get_window_rect(hwnd)
+            if rect is None or rect["width"] < 320 or rect["height"] < 240:
+                return True
+            info = window_info(hwnd)
+            info["rect"] = rect
+            info["visible"] = bool(user32.IsWindowVisible(HWND(hwnd)))
+            found.append(info)
+        except Exception:
+            pass
+        return True
+
+    user32.EnumWindows(callback, 0)
+    return found
+
+
+def shell_open(target: str, verb: str = "open") -> bool:
+    """用系统默认方式打开路径或 shell: 地址。返回值 >32 才算成功。"""
+
+    _require()
+    if not target:
+        return False
+    shell32 = ctypes.WinDLL("shell32", use_last_error=True)
+    shell32.ShellExecuteW.argtypes = [
+        wintypes.HWND,
+        wintypes.LPCWSTR,
+        wintypes.LPCWSTR,
+        wintypes.LPCWSTR,
+        wintypes.LPCWSTR,
+        ctypes.c_int,
+    ]
+    shell32.ShellExecuteW.restype = ctypes.c_void_p
+    result = shell32.ShellExecuteW(None, verb, target, None, None, SW_SHOWNORMAL)
+    code = ctypes.cast(result, ctypes.c_void_p).value or 0
+    return int(code) > 32
 
 
 def _rect_dict(rect: RECT) -> dict[str, int]:
