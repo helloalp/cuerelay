@@ -303,6 +303,7 @@ tools/probe_tray.py        起一个真托盘图标、弹一条气泡，再截�
 tools/probe_topmost.py     造一个置顶窗口，验证能扫出来、能修掉、修完还在
 tools/probe_sidebar.py     只读：打印侧边栏状态与左上角墨迹分布，加 --expand 试一次自动展开
 tools/try_search.py        现场跑一遍放大镜链路（放大镜→输入框→关键词→结果→点开→核对标题），只切对话、不发送
+tools/probe_overlay.py     把识别到的框真的画在窗口上并截屏，加 --search 连搜索面板的三个框一起画
 tools/shot_app.py          把主窗口截成 PNG，用来检查首屏排版
 ```
 

@@ -624,6 +624,22 @@ class Runner:
 
 
     @staticmethod
+    def _result_label(text: str, title: str) -> str:
+        """结果行在浮层上显示什么。
+
+        OCR 常把行首那个对话气泡图标读成一个字符（`0 20261021 18`）。去掉
+        之后剩下的部分还能和标题对上，就按剩下的显示——否则原样显示，别
+        为了好看把真正认到的内容改掉。
+        """
+
+        cleaned = text.strip()
+        first, _, rest = cleaned.partition(" ")
+        rest = rest.strip()
+        if len(first) <= 2 and rest and ocr.title_similarity(rest, title) >= 0.9:
+            return rest
+        return cleaned
+
+    @staticmethod
     def _best_title(lines: list[ocr.OcrLine], title: str) -> Optional[ocr.OcrLine]:
         """挑出最像目标标题的那一行。
 
@@ -754,21 +770,22 @@ class Runner:
             note("选中结果")
             frame, hit = self._search_result(hwnd, title, box)
             if hit is not None:
+                shown = self._result_label(hit.text, title)
                 self._overlay_box(
                     frame.to_screen(
                         Rect(hit.left - 8, hit.top - 8, hit.right + 8, hit.bottom + 8)
                     ),
                     "search",
-                    f"搜索结果 · {hit.text}",
+                    f"搜索结果 · {shown}",
                 )
-                self.log("info", f"搜索结果里认出了「{hit.text}」，点它。")
+                self.log("info", f"搜索结果里认出了「{shown}」，点它。")
                 time.sleep(self.BOX_DWELL)
                 winapi.click(frame.point_to_screen(hit.center))
                 time.sleep(min(self._delay(), 1.2))
                 if self._verify_conversation(hwnd, title, 6.0):
                     self.log("info", f"已切换到：{title}")
                     return
-                self.log("warning", f"点了搜索结果「{hit.text}」，标题栏没有变成「{title}」。")
+                self.log("warning", f"点了搜索结果「{shown}」，标题栏没有变成「{title}」。")
             else:
                 self.log("warning", f"搜索结果里没认出「{title}」这一条。")
                 winapi.press_escape()

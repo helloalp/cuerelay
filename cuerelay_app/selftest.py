@@ -1103,6 +1103,10 @@ def test_search_result_pick() -> None:
     assert hit.text == "0 20261021 18", hit.text
     assert 1360 <= hit.left <= 1420, f"结果行应该贴着面板左边缘，实际 x={hit.left}"
 
+    # 浮层上显示时要把行首那个被读成字符的图标去掉
+    assert runner._result_label(hit.text, "20261021 18") == "20261021 18"
+    assert runner._result_label("Clarify say", "Clarify say") == "Clarify say"
+
 
 def test_magnifier_band() -> None:
     """放大镜靠"标题栏那一行里最右边的图标"来定位。
