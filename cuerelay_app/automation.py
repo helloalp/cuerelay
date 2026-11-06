@@ -726,6 +726,15 @@ class Runner:
         point = frame.point_to_screen(region.center)
         signature = tuple(row.text for row in rows)
 
+        # 滚动之前先确认两件事：目标窗口在前台，而且那个点确实落在它的客户区
+        # 里。滚轮是发给"鼠标底下那个窗口"的，窗口一旦被挡住，这一串滚动就会
+        # 落到别人的界面上——用户看到的是自己的页面莫名其妙一直在往上翻。
+        if winapi.foreground_window() != int(hwnd):
+            raise AutomationError("目标窗口不在前台，已停止滚动，避免滚到别的窗口上。")
+        if not (0 <= point[0] - frame.rect["left"] < frame.width
+                and 0 <= point[1] - frame.rect["top"] < frame.height):
+            raise AutomationError("侧边栏位置异常，已停止滚动。")
+
         # 先回到顶部：上一轮留下的滚动位置会让靠上的对话永远扫不到。
         for _ in range(6):
             winapi.scroll(point, -10)

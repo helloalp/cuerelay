@@ -107,11 +107,45 @@ def capture_screen(left: int, top: int, width: int, height: int) -> Optional[Bit
     return Bitmap(width, height, data)
 
 
+def _blank(bitmap: Bitmap) -> bool:
+    """整张图是不是一个颜色（全黑/全白）。
+
+    PrintWindow 对少数窗口会"成功"但画出全黑，这种情况要当成失败，
+    否则后面 OCR 不到东西，报错会指向识别算法而不是截图。
+    """
+
+    if bitmap.width < 4 or bitmap.height < 4:
+        return True
+    first = bitmap.data[0:4]
+    step = max(4, (bitmap.width * bitmap.height // 512)) * 4
+    for index in range(0, len(bitmap.data) - 4, step):
+        if bitmap.data[index : index + 4] != first:
+            return False
+    return True
+
+
 def capture_client(hwnd: int) -> Optional[tuple[Bitmap, dict[str, int]]]:
-    """抓取窗口客户区，返回位图与客户区的屏幕矩形。"""
+    """抓取窗口客户区，返回位图与客户区的屏幕矩形。
+
+    优先让窗口把自己画到离屏位图上（PrintWindow）：被别的窗口挡住也能拿到
+    它自己的画面。只有离屏渲染失败时才退回截屏，而截屏前必须确认这个位置
+    最上面确实是目标窗口——不然截到的是别人，后面的识别全是错的。
+    """
 
     rect = winapi.get_client_rect(hwnd)
-    if not rect:
+    if not rect or rect["width"] <= 0 or rect["height"] <= 0:
+        return None
+    try:
+        data = winapi.capture_window_bgra(hwnd, rect["width"], rect["height"])
+    except Exception:
+        data = None
+    if data:
+        bitmap = Bitmap(rect["width"], rect["height"], data)
+        if not _blank(bitmap):
+            return bitmap, rect
+    center = (rect["left"] + rect["width"] // 2, rect["top"] + rect["height"] // 2)
+    if winapi.point_to_root_window(*center) != int(hwnd):
+        # 目标窗口不在这个位置的最上层，截屏只会截到挡着它的那个程序。
         return None
     bitmap = capture_screen(rect["left"], rect["top"], rect["width"], rect["height"])
     if bitmap is None:

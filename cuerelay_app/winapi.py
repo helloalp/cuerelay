@@ -138,6 +138,8 @@ if IS_WINDOWS:  # pragma: no branch - 只在 Windows 上真正执行
         wintypes.UINT,
     ]
     user32.SetWindowPos.restype = wintypes.BOOL
+    user32.PrintWindow.argtypes = [HWND, wintypes.HDC, wintypes.UINT]
+    user32.PrintWindow.restype = wintypes.BOOL
     user32.GetDC.argtypes = [HWND]
     user32.GetDC.restype = wintypes.HDC
     user32.ReleaseDC.argtypes = [HWND, wintypes.HDC]
@@ -262,6 +264,10 @@ GMEM_MOVEABLE = 0x0002
 ERROR_ALREADY_EXISTS = 183
 PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
 SRCCOPY = 0x00CC0020
+# PrintWindow 的两种额外模式：只要客户区，以及让 Chromium/Electron 这类
+# 自己画自己的窗口也走离屏渲染（否则拿到的是黑图）。
+PW_CLIENTONLY = 0x00000001
+PW_RENDERFULLCONTENT = 0x00000002
 DIB_RGB_COLORS = 0
 LOGPIXELSX = 88
 SWP_NOSIZE = 0x0001
@@ -1361,6 +1367,76 @@ def create_single_instance(name: str) -> tuple[Optional[Any], bool]:
 # ---------------------------------------------------------------------------
 
 
+def capture_window_bgra(hwnd: int, width: int, height: int) -> bytes:
+    """让窗口把自己画到一张离屏位图上，返回 BGRA 字节串。
+
+    和截屏的区别：窗口被别的程序挡住、甚至被压在最下面，这里拿到的仍然是
+    它自己的画面。以前只截屏，一旦目标窗口没真的在最上面，截到的就是挡在
+    它前面的那个程序——OCR 出来的标题全是别人的对话，滚动也滚错了地方。
+    """
+
+    _require()
+    width = int(width)
+    height = int(height)
+    if not hwnd or width <= 0 or height <= 0:
+        raise Win32Error("窗口区域为空。")
+    if width * height > 24_000_000:
+        raise Win32Error("窗口区域过大。")
+
+    screen = user32.GetDC(None)
+    if not screen:
+        raise Win32Error("无法获取屏幕设备上下文。")
+    memory = None
+    bitmap = None
+    old_object = None
+    try:
+        memory = gdi32.CreateCompatibleDC(screen)
+        if not memory:
+            raise Win32Error("无法创建兼容设备上下文。")
+        bitmap = gdi32.CreateCompatibleBitmap(screen, width, height)
+        if not bitmap:
+            raise Win32Error("无法创建兼容位图。")
+        old_object = gdi32.SelectObject(memory, bitmap)
+        flags = PW_CLIENTONLY | PW_RENDERFULLCONTENT
+        if not user32.PrintWindow(HWND(int(hwnd)), memory, flags):
+            if not user32.PrintWindow(HWND(int(hwnd)), memory, PW_CLIENTONLY):
+                raise Win32Error("窗口拒绝离屏渲染。")
+        gdi32.SelectObject(memory, old_object)
+        old_object = None
+        return _dib_bgra(memory, bitmap, width, height)
+    finally:
+        if old_object:
+            gdi32.SelectObject(memory, old_object)
+        if bitmap:
+            gdi32.DeleteObject(bitmap)
+        if memory:
+            gdi32.DeleteDC(memory)
+        user32.ReleaseDC(None, screen)
+
+
+def _dib_bgra(memory, bitmap, width: int, height: int) -> bytes:
+    header = BITMAPINFOHEADER()
+    header.biSize = ctypes.sizeof(BITMAPINFOHEADER)
+    header.biWidth = width
+    header.biHeight = -height  # 负值表示自上而下
+    header.biPlanes = 1
+    header.biBitCount = 32
+    header.biCompression = 0
+    buffer = ctypes.create_string_buffer(width * height * 4)
+    lines = gdi32.GetDIBits(
+        memory,
+        bitmap,
+        0,
+        height,
+        ctypes.cast(buffer, ctypes.c_void_p),
+        ctypes.byref(header),
+        DIB_RGB_COLORS,
+    )
+    if lines == 0:
+        raise Win32Error("读取位图数据失败。")
+    return buffer.raw
+
+
 def capture_screen_bgra(x: int, y: int, width: int, height: int) -> bytes:
     """抓取屏幕矩形，返回自上而下的 BGRA 字节串。"""
 
@@ -1390,27 +1466,7 @@ def capture_screen_bgra(x: int, y: int, width: int, height: int) -> bytes:
             raise Win32Error("屏幕截图失败。")
         gdi32.SelectObject(memory, old_object)
         old_object = None
-
-        header = BITMAPINFOHEADER()
-        header.biSize = ctypes.sizeof(BITMAPINFOHEADER)
-        header.biWidth = width
-        header.biHeight = -height  # 负值表示自上而下
-        header.biPlanes = 1
-        header.biBitCount = 32
-        header.biCompression = 0
-        buffer = ctypes.create_string_buffer(width * height * 4)
-        lines = gdi32.GetDIBits(
-            memory,
-            bitmap,
-            0,
-            height,
-            ctypes.cast(buffer, ctypes.c_void_p),
-            ctypes.byref(header),
-            DIB_RGB_COLORS,
-        )
-        if lines == 0:
-            raise Win32Error("读取位图数据失败。")
-        return buffer.raw
+        return _dib_bgra(memory, bitmap, width, height)
     finally:
         if old_object:
             gdi32.SelectObject(memory, old_object)
