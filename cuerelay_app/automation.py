@@ -198,7 +198,12 @@ class Runner:
         frame = self._frame(hwnd)
         composer, source = self._locator().composer(frame)
         if composer is None:
-            raise AutomationError("无法定位输入框。请在设置中重新识别目标。")
+            # 生成回答时输入框会被"停止"按钮顶掉，这时候报"重新识别目标"
+            # 会把人引到错误的方向。先说清楚可能是哪种情况。
+            raise AutomationError(
+                "没有找到输入框：目标可能正在生成回复，或者界面还没加载完。"
+                "等它停下来再试；如果一直这样，再到设置里重新识别目标。"
+            )
         return frame, composer, source
 
     # -- 对话切换 ------------------------------------------------------
