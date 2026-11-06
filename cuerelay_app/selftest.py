@@ -953,6 +953,73 @@ def test_panels_near_right_edge() -> None:
     assert vision.detect_sidebar_right(bitmap) == 380
 
 
+def test_sidebar_toggle_points() -> None:
+    """标题栏里从左往右数第三个图标是侧边栏开关。
+
+    写死坐标在不同缩放下会偏，所以现场数图标。这里用一张画着三个图标
+    加两段菜单文字的假标题栏验证：选中的必须落在第三个图标上。
+    """
+
+    from . import automation, locator
+
+    runner = automation.Runner(
+        {"step_delay_seconds": 0.4, "recognition_enabled": True},
+        lambda level, message: None,
+    )
+    background = (24, 24, 28)
+    glyph = (200, 200, 200)
+    panels = [
+        ((22, 10, 38, 40), glyph),    # 返回
+        ((72, 10, 88, 40), glyph),    # 前进
+        ((118, 8, 148, 44), glyph),   # 侧边栏开关
+        ((190, 14, 230, 34), glyph),  # File
+        ((250, 14, 290, 34), glyph),  # Edit
+    ]
+    bitmap = make_bitmap(3840, 1410, background, panels)
+    rect = {"left": 0, "top": 0, "right": 3840, "bottom": 1410, "width": 3840, "height": 1410}
+    points = runner._sidebar_toggle_points(locator.Frame(0, rect, bitmap))
+    assert points, "一个候选点都没有"
+    x, y = points[0]
+    assert 118 <= x <= 148, f"应该点第三个图标，实际落在 x={x}"
+    assert 8 <= y <= 44, f"纵向应该落在标题栏图标的高度上，实际 y={y}"
+
+    # 找不到图标时退回量好的坐标，而不是返回空列表——空列表意味着"什么也不做"。
+    blank = make_bitmap(3840, 1410, background, [])
+    fallback = runner._sidebar_toggle_points(locator.Frame(0, rect, blank))
+    assert fallback == [automation.Runner.SIDEBAR_TOGGLE_HINT], fallback
+
+
+def test_window_pick_skips_tool() -> None:
+    """选窗口时不能把应用的辅助窗口当成主窗口。
+
+    Codex 常驻一个 1225x2115 的 TOOLWINDOW：有标题、比主窗口还大，用户却
+    看不见也点不进去。按面积排序会把它选中，之后每一步都在往空气里点。
+    """
+
+    wide_tool = {
+        "hwnd": 2,
+        "title": "ChatGPT",
+        "rect": {"left": 0, "top": 0, "right": 3840, "bottom": 2115, "width": 3840, "height": 2115},
+        "visible": True,
+    }
+    main = {
+        "hwnd": 3,
+        "title": "ChatGPT",
+        "rect": {"left": 0, "top": 0, "right": 1200, "bottom": 800, "width": 1200, "height": 800},
+        "visible": True,
+    }
+    spec = apps.codex_app({})
+    saved = (winapi.windows_for_process, winapi.is_tool_window)
+    try:
+        winapi.windows_for_process = lambda *args, **kwargs: [dict(wide_tool), dict(main)]
+        winapi.is_tool_window = lambda hwnd: int(hwnd) == 2
+        assert spec.window()["hwnd"] == 3, "工具窗口再大也不能被当成主窗口"
+        winapi.is_tool_window = lambda hwnd: True
+        assert spec.window() is None, "只剩工具窗口时应该当作没有窗口"
+    finally:
+        winapi.windows_for_process, winapi.is_tool_window = saved
+
+
 TESTS: List[Tuple[str, Callable[[], None]]] = [
     ("颜色众数", test_modal_color),
     ("输入框识别", test_composer_detection),
@@ -993,6 +1060,8 @@ TESTS: List[Tuple[str, Callable[[], None]]] = [
     ("调度暂停", test_scheduler_pause),
     ("提示词变量", test_template_expand),
     ("置顶窗口排查", test_topmost_scan),
+    ("侧边栏开关定位", test_sidebar_toggle_points),
+    ("窗口选择跳过辅助窗口", test_window_pick_skips_tool),
     ("路径清理", test_tidy_path),
 ]
 

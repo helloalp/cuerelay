@@ -322,12 +322,18 @@ class Runner:
         hwnd: int,
         composer: Optional[Rect],
         title: str,
-        scrolls: int = 8,
+        scrolls: int = 40,
     ) -> tuple[locator.Frame, Optional[ocr.OcrLine]]:
         """在侧边栏列表里找到标题对应的那一行，必要时滚动列表。
 
-        列表只会往下滚，所以先回到顶部再一屏一屏往下找，
-        否则上一轮留下的滚动位置会让靠上的对话永远找不到。
+        三层，从便宜到贵：
+          1. 当前这一屏里就有；
+          2. 回到顶部，再一屏一屏往下翻，直到列表不再变化（翻到底了）；
+          3. 交给调用方去用搜索框。
+
+        第 2 层不写死"翻几屏就放弃"——历史长的账号一屏一屏数根本数不完，
+        固定屏数等于给"能不能找到"设了个跟账号内容有关的赌注。这里只在列表
+        真的滚不动时停，另外留一个安全上限防止卡死。
         """
 
         frame = self._frame(hwnd)
@@ -341,7 +347,7 @@ class Runner:
         signature = tuple(item.text for item in rows)
 
         # 回到顶部：连续上滚，直到列表内容不再变化
-        for _ in range(6):
+        for _ in range(12):
             winapi.scroll(point, -10)
             time.sleep(0.35)
             frame = self._frame(hwnd)
@@ -354,8 +360,9 @@ class Runner:
                 break
             signature = current
 
-        # 逐屏向下找
-        for _ in range(max(1, scrolls)):
+        # 逐屏向下找，一直翻到列表不动为止
+        limit = max(1, int(scrolls))
+        for index in range(1, limit + 1):
             winapi.scroll(point, 6)
             time.sleep(0.4)
             frame = self._frame(hwnd)
@@ -365,9 +372,12 @@ class Runner:
                 return frame, row
             current = tuple(item.text for item in rows)
             if current == signature:
+                self.log("info", f"已翻到列表底部，没有「{title}」。")
                 break
             signature = current
-            self.log("info", f"列表里没有「{title}」，往下翻一屏继续找。")
+            if index % 5 == 0:
+                # 列表很长时翻起来要一会儿，得让人看见还在动。
+                self.log("info", f"列表里暂时没有「{title}」，已往下翻 {index} 屏。")
         return frame, None
 
     def _open_search(self, hwnd: int, frame: locator.Frame, composer: Optional[Rect]) -> bool:
@@ -406,6 +416,11 @@ class Runner:
         frame = self._frame(hwnd)
         composer, _ = self._locator().composer(frame)
         self.log("info", f"切换对话：{title}")
+
+        # 侧边栏收着的时候列表区里只有图标，翻也翻不出标题。先展开；展不开
+        # 就别在图标上白翻，直接走搜索。
+        if not self.ensure_sidebar(hwnd):
+            self.log("warning", "侧边栏收着，列表里看不到对话，改用搜索框。")
 
         # 首选路径：侧边栏列表里本来就有这个对话，直接点它。
         # 这条路不依赖搜索框，也不用关心应用当前停在哪个对话上。
@@ -765,30 +780,128 @@ class Runner:
 
         return list(collected.values())
 
-    def sidebar_collapsed(self, frame: locator.Frame, composer: Optional[Rect] = None) -> bool:
-        """侧边栏是不是收起了。
+    # 判断侧边栏收没收起时看的那一竖条：图标栏大约 48~72 像素宽，展开后的
+    # 侧边栏有 240 以上，所以 90~190 这一段在"收起"时是纯背景，在"展开"时
+    # 一定压着标题文字。
+    SIDEBAR_BAND = (90, 190)
 
-        Codex 在窗口变窄时会把侧边栏收成一条图标栏。那时候列表区里根本没有
-        标题，OCR 只会从图标上读出几个乱码字符——与其把乱码当成对话列出来，
-        不如明确说"收起了"。
+    def sidebar_state(self, frame: locator.Frame) -> str:
+        """侧边栏现在是展开还是收起：expanded / collapsed / unknown。
+
+        以前是按"分隔线位置占窗口宽度的比例"判断，两个问题：分隔线经常检测
+        不到，代码就退回一个按比例估的值（2560 宽时估成 409），于是收起状态
+        被当成展开；窗口很宽时阈值也跟着水涨船高，展开的 300 像素侧边栏反而
+        被判成收起。改成看那一竖条里有没有字，和窗口宽度无关。
         """
 
-        edge = self._sidebar_right(frame, composer)
-        return edge < max(240, int(frame.width * 0.22))
+        left, right = self.SIDEBAR_BAND
+        if frame.width <= right + 40:
+            return "unknown"
+        top = max(60, int(frame.height * 0.12))
+        bottom = int(frame.height * 0.86)
+        if bottom - top < 40:
+            return "unknown"
+        ratio = vision.ink_ratio(frame.bitmap, Rect(left, top, right, bottom), step=3)
+        return "expanded" if ratio >= 0.012 else "collapsed"
 
-    def scan_conversations(self, hwnd: int, scrolls: int = 6) -> list[conversations.Conversation]:
-        frame, composer, _ = self._rows_once(hwnd)
-        if self.sidebar_collapsed(frame, composer):
-            # 先试一下 Ctrl+B：多数桌面应用用它开合侧边栏。展开没成功也没损失，
-            # 我们只是量一下宽度，不点任何东西。
-            self.log("info", "侧边栏是收起的，尝试用 Ctrl+B 展开。")
-            winapi.ctrl_b()
-            time.sleep(0.7)
-            frame, composer, _ = self._rows_once(hwnd)
-        if self.sidebar_collapsed(frame, composer):
+    def sidebar_collapsed(self, frame: locator.Frame, composer: Optional[Rect] = None) -> bool:
+        """侧边栏是不是收起了（保留给旧调用点，内部走 sidebar_state）。"""
+
+        return self.sidebar_state(frame) == "collapsed"
+
+    def ensure_sidebar(self, hwnd: int) -> bool:
+        """保证侧边栏是展开的，展开不了就明确失败。
+
+        收起时列表区里根本没有标题，OCR 只会从图标上读出几个乱码字符。与其
+        把乱码当成对话列出来，不如先把它展开——这本来就是用户自己会做的事。
+
+        两条路：先按 Ctrl+B（网页版认这个），不行再点标题栏那个方形开关。
+        Codex 桌面版不认快捷键，只认那个按钮。
+        """
+
+        frame = self._frame(hwnd)
+        state = self.sidebar_state(frame)
+        if state == "expanded":
+            return True
+        if state == "unknown":
+            self.log("warning", "判断不出侧边栏是展开还是收起，按展开处理。")
+            return True
+        if winapi.foreground_window() != int(hwnd):
+            # 点之前它必须在前台，否则这一下点到的是挡在它前面的程序。
+            self.log("warning", "目标窗口不在前台，没有动侧边栏。")
+            return False
+
+        self.log("info", "侧边栏是收起的，正在展开。")
+        winapi.ctrl_b()
+        time.sleep(0.6)
+        if self._sidebar_expanded(hwnd):
+            self.log("info", "侧边栏已展开。")
+            return True
+
+        for point in self._sidebar_toggle_points(frame):
+            winapi.click(frame.point_to_screen(point))
+            time.sleep(0.5)
+            if self._sidebar_expanded(hwnd):
+                self.log("info", "侧边栏已展开。")
+                return True
+        self.log("warning", "没能展开侧边栏，请手动点一下标题栏左上角那个开关。")
+        return False
+
+    def _sidebar_expanded(self, hwnd: int) -> bool:
+        try:
+            return self.sidebar_state(self._frame(hwnd)) == "expanded"
+        except AutomationError:
+            return False
+
+    # 标题栏里侧边栏开关的兜底坐标（150% 缩放、全宽窗口下量出来的）。
+    # 正常情况下用 _sidebar_toggle_points 现场找，这里只是找不到时的最后手段。
+    SIDEBAR_TOGGLE_HINT = (131, 27)
+
+    def _sidebar_toggle_points(self, frame: locator.Frame) -> list[tuple[int, int]]:
+        """标题栏里那几个图标的位置，从左往右，第一个候选就是侧边栏开关。
+
+        标题栏固定是：返回、前进、侧边栏开关，然后是 File/Edit/View 菜单。
+        所以数到第三个图标就是它。不写死坐标是因为窗口缩放比例不同时像素
+        位置会跟着变；万一图标没找到，退回量好的坐标。
+        """
+
+        top = 4
+        bottom = max(24, int(frame.height * 0.045))
+        if bottom - top < 10:
+            return [self.SIDEBAR_TOGGLE_HINT]
+        width = min(frame.width, 420)
+        inked = []
+        for x in range(0, width):
+            ratio = vision.ink_ratio(frame.bitmap, Rect(x, top, x + 1, bottom), step=1)
+            inked.append(ratio >= 0.06)
+
+        groups: list[tuple[int, int]] = []
+        start = None
+        for x, filled in enumerate(inked):
+            if filled and start is None:
+                start = x
+            elif not filled and start is not None:
+                groups.append((start, x))
+                start = None
+        if start is not None:
+            groups.append((start, len(inked)))
+        # 太窄的是噪点，太宽的是菜单文字（File/Edit/View 一整个连成一片）。
+        icons = [item for item in groups if 8 <= item[1] - item[0] <= 44]
+        points = [((left + right) // 2, (top + bottom) // 2) for left, right in icons[:3]]
+        if len(points) >= 3:
+            return [points[2]]
+        return [self.SIDEBAR_TOGGLE_HINT] + points
+
+    def scan_conversations(self, hwnd: int, scrolls: int = 30) -> list[conversations.Conversation]:
+        """把侧边栏里的对话标题读出来。
+
+        默认往下翻 30 屏，但真正停下来的是"列表不再变化"——历史长的账号
+        固定翻几屏根本到不了底，能不能扫全不该取决于这个数字。
+        """
+
+        if not self.ensure_sidebar(hwnd):
             raise AutomationError(
-                "目标应用的侧边栏是收起的，扫描不到对话标题。"
-                "点开侧边栏或把窗口拉宽后再试。"
+                "侧边栏是收起的，扫描不到对话标题。点一下标题栏左上角的侧边栏开关再试。"
             )
         return conversations.parse(self.sidebar_rows(hwnd, scrolls))
 

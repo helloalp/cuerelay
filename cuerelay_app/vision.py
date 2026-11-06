@@ -97,6 +97,32 @@ def _dist(a: Color, b: Color) -> int:
     return max(abs(a[0] - b[0]), abs(a[1] - b[1]), abs(a[2] - b[2]))
 
 
+def ink_ratio(bitmap: Bitmap, rect: "Rect", step: int = 3) -> float:
+    """一块区域里"不是背景色"的像素占多少。
+
+    用来判断侧边栏是展开还是收起：展开时那一竖条里有标题文字，收起时只剩
+    一条图标栏，同一块区域几乎是纯背景。比找分隔线可靠——分隔线本来就不
+    一定存在，找不到时退回按比例估宽度，结果就是"收起了却当成展开"。
+    """
+
+    left = max(0, int(rect.left))
+    right = min(bitmap.width, int(rect.right))
+    top = max(0, int(rect.top))
+    bottom = min(bitmap.height, int(rect.bottom))
+    if right - left < 4 or bottom - top < 4:
+        return 0.0
+    step = max(1, int(step))
+    points: list[Color] = []
+    for y in range(top, bottom, step):
+        for x in range(left, right, step):
+            points.append(bitmap.rgb(x, y))
+    if not points:
+        return 0.0
+    fill, _ = _modal(points)
+    ink = sum(1 for point in points if _dist(point, fill) >= 40)
+    return ink / len(points)
+
+
 def _modal(points: Sequence[Color]) -> tuple[Color, float]:
     """返回出现最多的颜色，以及落在该颜色附近的样本比例。"""
 

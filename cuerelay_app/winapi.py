@@ -128,6 +128,8 @@ if IS_WINDOWS:  # pragma: no branch - 只在 Windows 上真正执行
     user32.GetClipboardData.restype = ctypes.c_void_p
     user32.GetWindowThreadProcessId.argtypes = [HWND, ctypes.POINTER(DWORD)]
     user32.GetWindowThreadProcessId.restype = DWORD
+    user32.AttachThreadInput.argtypes = [DWORD, DWORD, wintypes.BOOL]
+    user32.AttachThreadInput.restype = wintypes.BOOL
     user32.SetWindowPos.argtypes = [
         HWND,
         HWND,
@@ -276,6 +278,7 @@ SWP_NOZORDER = 0x0004
 SWP_NOACTIVATE = 0x0010
 SWP_FRAMECHANGED = 0x0020
 SWP_SHOWWINDOW = 0x0040
+HWND_TOP = 0
 HWND_TOPMOST = -1
 HWND_NOTOPMOST = -2
 DWMWA_USE_IMMERSIVE_DARK_MODE = 20
@@ -889,10 +892,51 @@ def activate_window(hwnd: int, geometry: Optional[dict[str, Any]] = None) -> boo
         except Exception:
             pass
     time.sleep(0.12)
+    if foreground_window() != int(hwnd):
+        _attach_foreground(hwnd)
     if geometry and bool(geometry.get("maximized", False)) and not is_maximized(hwnd):
         user32.ShowWindow(HWND(hwnd), SW_MAXIMIZE)
         time.sleep(0.12)
     return foreground_window() == int(hwnd)
+
+
+def _attach_foreground(hwnd: int) -> bool:
+    """把自己临时接到前台窗口的输入队列上，再抢一次前台。
+
+    Windows 默认不允许后台进程抢前台。SetForegroundWindow 和
+    SwitchToThisWindow 在目标窗口"刚刚被用户切走"时都会直接失败，返回 0，
+    什么也不做——表现就是"程序说切换了，屏幕上没变"。
+
+    接到当前前台线程的输入队列之后，系统就把我们当成同一个输入上下文，
+    SetForegroundWindow 才会真的生效。只借一下，用完立刻断开。不注入任何
+    按键，所以不会像以前那样把输入漏到别的程序里。
+    """
+
+    fg = user32.GetForegroundWindow()
+    if not fg or int(fg) == int(hwnd):
+        return False
+    try:
+        fg_thread = user32.GetWindowThreadProcessId(HWND(int(fg)), None)
+        own = kernel32.GetCurrentThreadId()
+    except Exception:
+        return False
+    if not fg_thread or fg_thread == own:
+        return False
+    attached = False
+    try:
+        attached = bool(user32.AttachThreadInput(own, fg_thread, True))
+        user32.BringWindowToTop(HWND(int(hwnd)))
+        user32.SetForegroundWindow(HWND(int(hwnd)))
+        time.sleep(0.05)
+        return foreground_window() == int(hwnd)
+    except Exception:
+        return False
+    finally:
+        if attached:
+            try:
+                user32.AttachThreadInput(own, fg_thread, False)
+            except Exception:
+                pass
 
 
 def ensure_foreground(hwnd: int, geometry: Optional[dict[str, Any]] = None, attempts: int = 4) -> bool:
@@ -1123,6 +1167,33 @@ def repaint_window(hwnd: int) -> bool:
         return True
     except Exception:
         return False
+
+
+def raise_window(hwnd: int) -> bool:
+    """把窗口提到最前面，但不把键盘焦点给它。
+
+    Chromium 系的窗口被完全遮住时会停止出帧，这时候 PrintWindow 只会画出
+    一张全黑图——看不到画面，也就没法识别、没法确定该点哪儿。让它重新可见
+    是最省事的办法。
+
+    直接 SetWindowPos(HWND_TOP) 在这里是无效的：调用会返回成功，但窗口的
+    前后顺序一点没变（大概是 Chromium 自己接管了层级）。先临时置顶再取消
+    置顶就能把它挪到最前面。两步都用 SWP_NOACTIVATE，前台窗口不变，用户
+    正在打字的地方不会被打断。最后必须确认置顶标记真的清掉了——留着它就是
+    那种"看不见却吃点击"的幽灵窗口。
+    """
+
+    if not IS_WINDOWS or not hwnd or not is_window(hwnd):
+        return False
+    flags = SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW
+    try:
+        user32.SetWindowPos(HWND(int(hwnd)), HWND(HWND_TOPMOST), 0, 0, 0, 0, flags)
+        user32.SetWindowPos(HWND(int(hwnd)), HWND(HWND_NOTOPMOST), 0, 0, 0, 0, flags)
+    except Exception:
+        return False
+    if is_topmost(hwnd):
+        repair_window(hwnd, nudge=False)
+    return True
 
 
 def set_dark_frame(hwnd: int, enabled: bool) -> None:

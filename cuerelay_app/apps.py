@@ -92,12 +92,29 @@ class AppSpec:
             return []
         found = winapi.windows_for_process(self.process, self.path_contains, include_hidden)
         # 可见的排前面：收进托盘时句柄还在，但用户要的是那个能看见的窗口。
-        found.sort(key=lambda item: (not item.get("visible", True), -int(item["rect"]["width"])))
+        # 工具窗口排到最后：Codex 常驻一个 1225x2115 的 TOOLWINDOW，比主窗口
+        # 还大，按面积排序会把它当主窗口，之后每一步都在往空气里点。
+        found.sort(
+            key=lambda item: (
+                not item.get("visible", True),
+                winapi.is_tool_window(int(item["hwnd"])),
+                -int(item["rect"]["width"]),
+            )
+        )
         return found
 
     def window(self, include_hidden: bool = False) -> Optional[dict[str, Any]]:
-        found = self.windows(include_hidden)
-        return found[0] if found else None
+        """能真正操作的窗口。
+
+        工具窗口不算：它有标题、有尺寸，但用户看不见也点不进去，拿它当目标
+        只会一直失败。找不到主窗口时返回 None，界面上就会显示「在后台」，
+        而不是让用户以为程序好了。
+        """
+
+        for item in self.windows(include_hidden):
+            if not winapi.is_tool_window(int(item["hwnd"])):
+                return item
+        return None
 
     def status(self) -> str:
         if self.window() is not None:

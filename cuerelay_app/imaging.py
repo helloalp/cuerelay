@@ -8,6 +8,7 @@ Bitmap 只做最基础的像素读取；所有识别算法都在 vision.py 中�
 from __future__ import annotations
 
 import struct
+import time
 import zlib
 from typing import Optional
 
@@ -124,27 +125,46 @@ def _blank(bitmap: Bitmap) -> bool:
     return True
 
 
-def capture_client(hwnd: int) -> Optional[tuple[Bitmap, dict[str, int]]]:
+def _render(hwnd: int, rect: dict[str, int]) -> Optional[Bitmap]:
+    """让窗口把自己画到离屏位图上；画出来是纯色就当作没拿到。"""
+
+    try:
+        data = winapi.capture_window_bgra(hwnd, rect["width"], rect["height"])
+    except Exception:
+        return None
+    if not data:
+        return None
+    bitmap = Bitmap(rect["width"], rect["height"], data)
+    return None if _blank(bitmap) else bitmap
+
+
+def capture_client(hwnd: int, allow_raise: bool = True) -> Optional[tuple[Bitmap, dict[str, int]]]:
     """抓取窗口客户区，返回位图与客户区的屏幕矩形。
 
     优先让窗口把自己画到离屏位图上（PrintWindow）：被别的窗口挡住也能拿到
-    它自己的画面。只有离屏渲染失败时才退回截屏，而截屏前必须确认这个位置
-    最上面确实是目标窗口——不然截到的是别人，后面的识别全是错的。
+    它自己的画面。这条路对 Chromium 系的窗口有个前提——它得在出帧。被完全
+    遮住时浏览器会停掉合成，PrintWindow 照样"成功"，但画出来是全黑。
+
+    所以全黑时先把它提到最前面再重试一次（不抢键盘焦点），仍然拿不到就退回
+    截屏；截屏之前必须确认这个位置最上面确实是目标窗口，否则截到的是别人，
+    后面的识别全是错的。
     """
 
     rect = winapi.get_client_rect(hwnd)
     if not rect or rect["width"] <= 0 or rect["height"] <= 0:
         return None
-    try:
-        data = winapi.capture_window_bgra(hwnd, rect["width"], rect["height"])
-    except Exception:
-        data = None
-    if data:
-        bitmap = Bitmap(rect["width"], rect["height"], data)
-        if not _blank(bitmap):
-            return bitmap, rect
+    bitmap = _render(hwnd, rect)
     center = (rect["left"] + rect["width"] // 2, rect["top"] + rect["height"] // 2)
-    if winapi.point_to_root_window(*center) != int(hwnd):
+    on_top = winapi.point_to_root_window(*center) == int(hwnd)
+    if bitmap is None and allow_raise and not on_top:
+        # 看不见它，它也画不出自己。提上来（不动焦点）再试一次。
+        if winapi.raise_window(hwnd):
+            time.sleep(0.25)
+            bitmap = _render(hwnd, rect)
+            on_top = winapi.point_to_root_window(*center) == int(hwnd)
+    if bitmap is not None:
+        return bitmap, rect
+    if not on_top:
         # 目标窗口不在这个位置的最上层，截屏只会截到挡着它的那个程序。
         return None
     bitmap = capture_screen(rect["left"], rect["top"], rect["width"], rect["height"])
