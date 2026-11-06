@@ -442,3 +442,68 @@ def tidy_path(text: str) -> str:
 
     value = str(text or "").strip().strip('"').strip("'")
     return re.sub(r"\s+", " ", value) if "\n" in value else value
+
+
+# ---------------------------------------------------------------------------
+# 开机自启
+# ---------------------------------------------------------------------------
+
+AUTOSTART_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
+AUTOSTART_NAME = "CueRelay"
+
+
+def autostart_command() -> str:
+    """开机启动的命令行。
+
+    优先用 pythonw.exe：用 python.exe 的话每次开机都会多一个黑色控制台窗口，
+    而这个程序本来就不需要控制台。
+    """
+
+    import sys
+
+    exe = Path(sys.executable)
+    windowless = exe.with_name("pythonw.exe")
+    launcher = windowless if windowless.exists() else exe
+    script = Path(__file__).resolve().parent.parent / "cuerelay.py"
+    return f'"{launcher}" "{script}"'
+
+
+def autostart_enabled() -> bool:
+    try:
+        import winreg
+    except ImportError:
+        return False
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, AUTOSTART_KEY) as key:
+            value, _kind = winreg.QueryValueEx(key, AUTOSTART_NAME)
+            return bool(str(value or "").strip())
+    except OSError:
+        return False
+
+
+def set_autostart(enabled: bool) -> tuple[bool, str]:
+    """写 / 删 HKCU 的 Run 项。返回 (是否成功, 失败原因)。
+
+    用 HKCU 而不是 HKLM：不需要管理员权限，也只影响当前用户。
+    """
+
+    try:
+        import winreg
+    except ImportError:
+        return False, "当前系统没有 winreg 模块"
+    try:
+        with winreg.OpenKey(
+            winreg.HKEY_CURRENT_USER, AUTOSTART_KEY, 0, winreg.KEY_SET_VALUE
+        ) as key:
+            if enabled:
+                winreg.SetValueEx(
+                    key, AUTOSTART_NAME, 0, winreg.REG_SZ, autostart_command()
+                )
+            else:
+                try:
+                    winreg.DeleteValue(key, AUTOSTART_NAME)
+                except FileNotFoundError:
+                    pass
+        return True, ""
+    except OSError as exc:
+        return False, str(exc)

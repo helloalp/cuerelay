@@ -182,6 +182,7 @@ class App:
         self.auto_launch_var = tk.BooleanVar(value=bool(settings.get("auto_launch_target", True)))
         self.v2ray_path_var = tk.StringVar(value=str(settings.get("v2ray_path") or ""))
         self.launch_v2ray_var = tk.BooleanVar(value=bool(settings.get("launch_v2ray_first", True)))
+        self.autostart_var = tk.BooleanVar(value=apps_module.autostart_enabled())
         self.catch_up_var = tk.StringVar(value=str(int(settings.get("catch_up_seconds", 300) or 300) // 60))
         try:
             saved_delay = float(settings.get("step_delay_seconds", 1.2))
@@ -1656,6 +1657,22 @@ class App:
             command=self._save_launch_v2ray,
             bg_key="surface",
         ).pack(fill="x", pady=(theme.px(14), 0))
+        Switch(
+            inner,
+            theme,
+            "开机自动启动 CueRelay",
+            self.autostart_var,
+            command=self._save_autostart,
+            bg_key="surface",
+        ).pack(fill="x", pady=(theme.px(10), 0))
+        tk.Label(
+            inner,
+            text="定时任务只有在 CueRelay 运行时才会执行。",
+            bg=theme.c("surface"),
+            fg=theme.c("text_3"),
+            font=theme.font("tiny"),
+            anchor="w",
+        ).pack(fill="x", pady=(theme.px(5), 0))
 
         # 识别与校准
         card_body = self._settings_card(body, "识别与校准")
@@ -2542,6 +2559,17 @@ class App:
         self.v2ray_path_var.set(path)
         self.store.update_settings(v2ray_path=path)
         self._refresh_apps()
+
+    def _save_autostart(self) -> None:
+        enabled = bool(self.autostart_var.get())
+        ok, reason = apps_module.set_autostart(enabled)
+        if not ok:
+            self.autostart_var.set(apps_module.autostart_enabled())
+            messagebox.showwarning(
+                "开机自启", f"设置失败：{reason}", parent=self.root
+            )
+            return
+        self._set_status("已设为开机自动启动" if enabled else "已取消开机自动启动")
 
     def _save_launch_v2ray(self) -> None:
         self.store.update_settings(launch_v2ray_first=bool(self.launch_v2ray_var.get()))

@@ -766,6 +766,27 @@ def test_palette_filter() -> None:
     assert ranked[0].label == "任务"
 
 
+def test_autostart_command() -> None:
+    """开机启动的命令行要能被 Run 项直接执行。
+
+    路径里带空格是常态（Program Files 下面），所以两个参数都要带引号；
+    用 python.exe 会在每次开机时弹一个黑色控制台。
+    """
+
+    command = apps.autostart_command()
+    assert command.count('"') == 4, command
+    assert "cuerelay.py" in command
+    assert "pythonw" in command.lower(), command
+
+
+def test_tidy_path() -> None:
+    """用户粘贴的路径常常带引号或前后空格。"""
+
+    assert apps.tidy_path('  "C:/tools/v2rayN.exe"  ') == "C:/tools/v2rayN.exe"
+    assert apps.tidy_path("  'D:/x.exe' ") == "D:/x.exe"
+    assert apps.tidy_path("") == ""
+
+
 def test_panels_near_right_edge() -> None:
     """分隔线贴到窗口右边界时不能越界。
 
@@ -821,6 +842,8 @@ TESTS: List[Tuple[str, Callable[[], None]]] = [
     ("布尔设置纠正", test_bool_settings_are_real_bools),
     ("命令面板过滤", test_palette_filter),
     ("右边界分隔线", test_panels_near_right_edge),
+    ("开机自启命令", test_autostart_command),
+    ("路径清理", test_tidy_path),
 ]
 
 
